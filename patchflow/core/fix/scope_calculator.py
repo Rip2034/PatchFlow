@@ -7,13 +7,22 @@
 依赖图构建：
   - 按项目语言选择合适的 import 解析器
   - 每个节点是一个文件，每条边是一个 import 关系
-  - Python 用 AST 解析，JS/TS 用正则解析，其他语言通用解析
+  - Python：AST 解析（最精确）
+  - JS/TS：正则解析（处理 import/require）
+  - 其他语言：通用解析
 
 Scope 计算公式（来自设计文档）：
   Scope(files) = crash_node
     ∪ backward_reach(crash_node, depth=K)
     ∪ type_def_chain(crash_node)
     ∪ forward_reach(crash_node, depth=0)
+
+实际计算时：
+  - 语法错误 → 只需修复出问题的文件（单文件）
+  - 类型错误 → 追溯类型定义链（2-3 文件）
+  - 运行时异常 → 调用链上所有相关文件
+  - 名称错误 → 单文件单行
+  - 测试失败 → 以测试文件为锚点反推
 """
 
 from pathlib import Path
@@ -58,7 +67,7 @@ class DepGraph:
         if extensions is None and lang:
             extensions = lang.extensions
         if extensions is None:
-            extensions = {".py"}
+            extensions = {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".rb", ".php", ".cs", ".swift", ".kt"}
 
         for filepath in self.work_dir.rglob("*"):
             if filepath.suffix.lower() not in extensions:

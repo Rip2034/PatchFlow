@@ -1,12 +1,33 @@
 """Orchestrator — 核心调度器，PatchFlow 的"心脏"
 
-串联所有子模块：
+这是 PatchFlow 最重要的模块。它串联整个"生成→验证→修复"闭环：
+
   "项目感知 → 生成 → 验证 → 精准分析 → 策略选择 → 约束修复 → 再验证"
 
-Phase 4 增强（V0.4）：
-  5. FixLoopBreaker — 独立熔断器（同错误重复/策略失败/超限熔断）
-  6. Diff 报告 — 修复完成后展示变更
-  7. LLM 重试 — 指数退避，网络/限流错误自动重试
+整个流程不需要人工介入（但用户随时可以中断）。
+
+流程详解：
+  Phase 1: 生成代码
+    - 收集项目上下文（技术栈、依赖、代码风格）
+    - 调用 LLM Generator 生成代码文件
+  
+  Phase 2: 保存快照
+    - 记录修改前的文件内容（安全网，失败后回滚）
+    - 生成原始/修改后的 diff 报告
+  
+  Phase 3: 验证 + 修复循环（核心）
+    1. 运行代码 → 如果通过 → 成功结束
+    2. 报错 → ErrorAnalyzer 分析根因
+    3. FixLoopBreaker 检查是否应该熔断
+    4. ScopeCalculator 计算修复范围
+    5. StrategySelector 选择修复策略
+    6. Fixer 调用 LLM 修复代码
+    7. 回到第 1 步
+
+V0.4 增强特性：
+  - FixLoopBreaker — 独立熔断器（同错误重复/策略失败/超限熔断）
+  - Diff 报告 — 修复完成后展示变更
+  - LLM 重试 — 指数退避，网络/限流错误自动重试
 """
 
 from pathlib import Path
@@ -61,7 +82,23 @@ class Orchestrator:
         return "; ".join(self._diff_report) if self._diff_report else "no changes"
 
     def run(self, task: str) -> bool:
-        """执行完整的"项目感知 → 生成 → 验证 → 修复"闭环"""
+        """执行完整的"项目感知 → 生成 → 验证 → 修复"闭环
+
+        这就是 Orchestrator 的核心流程：
+
+        Phase 1: 项目感知 + 代码生成
+          - 收集项目上下文（技术栈、依赖、代码风格）
+          - 调用 LLM Generator 生成初始代码
+
+        Phase 2: 快照保存
+          - 记录原始文件内容，用于 diff 和回滚
+
+        Phase 3: 验证 + 修复循环
+          - 循环执行直到：
+            a) 代码通过验证 → 成功
+            b) 熔断器触发 → 回滚失败
+            c) 所有策略用完 → 回滚失败
+        """
         logger.info("=" * 50)
         logger.info("PatchFlow Orchestrator V0.4 启动")
         logger.info(f"  任务: {task}")
@@ -72,7 +109,7 @@ class Orchestrator:
         context_prompt = self._get_context_prompt()
         logger.info(f"  Context: {self.work_dir}")
 
-        # ── Phase 1: 生成代码（注入上下文）──
+        # ── Phase 1: 生成代码（注入项目上下文，让 AI 了解技术栈和代码风格）──
         files = generate(task, model=self.model, project_context=context_prompt)
         if files is None:
             logger.error("代码生成失败，终止")
@@ -81,7 +118,7 @@ class Orchestrator:
         written = write_files(files, work_dir=self.work_dir)
         self.state["files_written"] = written
 
-        # ── Phase 2: 保存快照（记录原始文件内容用于 diff）──
+        # ── Phase 2: 保存快照（记录原始文件内容，用于后续 diff 和回滚）──
         self.state["snapshot_id"] = self.snapshot.save(written)
         original_files = {}
         for f in written:
@@ -89,11 +126,15 @@ class Orchestrator:
             if p.exists():
                 original_files[f] = p.read_text(encoding="utf-8")
 
-        # ── Phase 3: 验证 + 修复循环 ──
+        # ── Phase 3: 验证 + 修复循环（核心逻辑）──
+        # 循环条件：熔断器 turn < max_retries
+        # 每次循环：验证 → 分析 → 策略选择 → 修复 → 再验证
         while self.breaker.turn < self.max_retries:
 
+            # Step 1: 运行代码验证（真正执行，不是静态检查）
             result = validate(work_dir=self.work_dir)
 
+            # 验证通过 → 提交快照、生成 diff 报告、成功结束
             if result.ok:
                 self.snapshot.commit(self.state["snapshot_id"])
                 self._generate_diff_report(original_files)
@@ -104,18 +145,21 @@ class Orchestrator:
 
             logger.warn(f"第 {self.breaker.turn + 1} 轮验证失败")
 
+            # 验证失败但没有错误信息 → 无法继续修复
             error = result.error
             if error is None:
                 logger.error("验证失败但没有错误信息，无法继续")
                 self.snapshot.rollback(self.state["snapshot_id"])
                 return False
 
-            # ── 精准分析 ──
+            # Step 2: 精准错误分析（ErrorAnalyzer）
+            # 解析 traceback → 定位错误类型 + 根因 + 影响文件
             analysis = analyze_error(error.raw, work_dir=self.work_dir)
             logger.info(f"  ErrorAnalyzer: {analysis.type} (置信度: {analysis.confidence})")
             logger.info(f"  根因: {analysis.root_cause}")
 
-            # ── 熔断检查（FixLoopBreaker）──
+            # Step 3: 熔断检查（FixLoopBreaker）
+            # 检查是否进入死循环（同一错误重复出现 / 策略连续失败）
             should_retry, reason = self.breaker.should_retry(
                 analysis.type, analysis.root_cause
             )
@@ -124,10 +168,12 @@ class Orchestrator:
                 self.snapshot.rollback(self.state["snapshot_id"])
                 return False
 
-            # ── 计算范围 + 选择策略 ──
+            # Step 4: 计算修复范围 + 选择修复策略
+            # strategy_sequence 返回策略升级序列（从窄到宽：line → chain → callchain → business）
             scope_strategies = strategy_sequence(analysis.type)
             current_strategy_scope = self.state.get("strategy_level", 0)
 
+            # 所有策略都已尝试过 → 放弃修复
             if current_strategy_scope >= len(scope_strategies):
                 logger.error("所有策略都已尝试，放弃修复")
                 self.snapshot.rollback(self.state["snapshot_id"])
@@ -135,20 +181,23 @@ class Orchestrator:
 
             preferred_scope = scope_strategies[current_strategy_scope]
 
+            # 首次循环时构建依赖图（用于 Scope 计算）
             if self.state["turn"] == 0:
                 try:
                     self.dep_graph.build()
                 except Exception:
                     pass
 
+            # 计算受影响的文件范围
             scope_result = calculate_scope(analysis, dep_graph=self.dep_graph)
             logger.info(f"  ScopeCalculator: {scope_result.strategy} ({len(scope_result.files)} 文件)")
 
+            # 选择具体的修复策略
             strategy = select_strategy(analysis.type, impact_file_count=len(scope_result.files))
             strategy_name = f"{preferred_scope}/{strategy['scope']}"
             logger.info(f"  StrategySelector: {strategy['scope']} 范围")
 
-            # ── 确定修复目标 ──
+            # 确定修复目标文件（优先级：Scope > ErrorAnalyzer > 生成的文件）
             target_file = ""
             if scope_result.files:
                 target_file = scope_result.files[0]
@@ -162,7 +211,8 @@ class Orchestrator:
                 self.snapshot.rollback(self.state["snapshot_id"])
                 return False
 
-            # ── 执行修复（注入上下文 + Scope 硬约束）──
+            # Step 5: 执行修复（Fixer）
+            # 注入项目上下文 + Scope 硬约束（LLM 只能修改范围内的文件）
             fix_result = fix(
                 error_text=analysis.raw,
                 file_path=target_file,
@@ -171,6 +221,7 @@ class Orchestrator:
                 project_context=context_prompt,
             )
 
+            # 修复生成失败 → 升级策略（尝试更广的修复范围）
             if fix_result is None:
                 logger.warn(f"修复生成失败，升级策略 [{strategy_name}]")
                 self.state["strategy_level"] = current_strategy_scope + 1
@@ -180,6 +231,7 @@ class Orchestrator:
                 self.state["snapshot_id"] = self.snapshot.save(written)
                 continue
 
+            # 修复写入磁盘失败 → 升级策略
             if not apply_fix(fix_result, work_dir=self.work_dir):
                 logger.warn(f"修复应用失败，升级策略 [{strategy_name}]")
                 self.state["strategy_level"] = current_strategy_scope + 1
@@ -189,6 +241,7 @@ class Orchestrator:
                 self.state["snapshot_id"] = self.snapshot.save(written)
                 continue
 
+            # 本轮修复成功 → 进入下一轮验证
             self.state["turn"] += 1
             self.state["transition"] = "next_turn"
             self.state["strategy_tried"].append(strategy_name)

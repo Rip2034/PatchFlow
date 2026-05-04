@@ -1,10 +1,19 @@
 """项目语义索引 — embedding + 符号提取 + 语义搜索
 
-为 PatchFlow 提供大项目的"理解"能力：
-  1. 启动时扫描项目 → 提取符号 → 生成 embedding → 持久化到 .patchflow/index/
-  2. search_files(query) → 语义搜索，返回最相关的文件
-  3. search_code(pattern) → 正则搜索代码内容，返回匹配行
+为 PatchFlow 提供大项目的"理解"能力。
+当项目有上百个文件时，AI 需要快速找到相关代码。
+
+核心功能：
+  1. 启动时扫描项目 → 提取符号（类名、函数名）→ 生成 embedding → 持久化
+  2. search_files(query) → 语义搜索（embedding 相似度），返回最相关的文件
+  3. search_code(pattern) → 正则搜索代码内容，返回匹配行及行号
   4. get_file_meta(path) → 快速获取文件摘要（类名、方法签名）
+
+设计要点：
+  - embedding 可用则用语义搜索，不可用自动降级为关键词匹配
+  - embedding API 失败后，当前 session 不再重试（_mark_embed_unavailable）
+  - 符号提取用正则（纯 Python 实现，不依赖语言服务器）
+  - 索引持久化到 .patchflow/index/ 目录，下次启动直接加载
 """
 
 import json

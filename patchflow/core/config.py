@@ -1,15 +1,19 @@
 """配置系统 — 多模型管理
 
-借鉴 Claude Code 的 Settings 多层配置模式。
+PatchFlow 的配置系统借鉴了 Claude Code 的 Settings 多层配置模式（override 模式）。
 
 核心概念：
   models:  { "别名": {provider, model, api_key, api_base}, ... }
-  active:  "别名" — 当前使用哪个模型
+  active:  "别名" — 当前使用哪个模型别名
 
 配置来源（优先级从高到低）：
-  1. 项目级: .patchflow/config.json
-  2. 用户级: ~/.patchflow/config.json
-  3. 默认值（兜底）
+  1. 项目级: .patchflow/config.json（只覆盖当前项目）
+  2. 用户级: ~/.patchflow/config.json（全局配置，所有项目共享）
+  3. 默认值（内置兜底）
+
+多模型策略：
+  - 可以为不同 Agent 角色（analyzer/fixer/reviewer）配置不同模型
+  - 分析用便宜模型（如 deepseek-chat），修复用强模型（如 claude）
 
 示例 ~/.patchflow/config.json：
 {
@@ -63,10 +67,12 @@ PROVIDER_ALIASES = {"claude": "anthropic"}
 
 
 def _user_config_dir() -> Path:
+    """用户级配置目录：~/.patchflow/（全局生效）"""
     return Path.home() / ".patchflow"
 
 
 def _project_config_dir() -> Path:
+    """项目级配置目录：当前项目下的 .patchflow/（仅当前项目生效）"""
     return Path.cwd() / ".patchflow"
 
 
@@ -191,17 +197,23 @@ def get_config() -> dict:
 
     合并顺序（后覆盖前）：
       provider_defaults → env → user models[active] → project
+    
+    这意味着：
+      1. 先加载内置的 provider 默认值
+      2. 用 ~/.patchflow/config.json 中的 active 模型配置覆盖
+      3. 最后用项目级 .patchflow/config.json 覆盖（最高优先级）
     """
     user_raw = _load_json(_user_config_dir() / "config.json")
     project_raw = _load_json(_project_config_dir() / "config.json")
     models = user_raw.get("models", {})
+    # 确定当前使用的模型别名：项目级 > 用户级 > 第一个可用模型
     active_alias = (
         project_raw.get("active") or
         user_raw.get("active") or
         next(iter(models), "") if models else ""
     )
 
-    # 兜底默认值
+    # 内置默认值（兜底）：避免任何配置缺失时崩溃
     config = {
         "active": active_alias or "default",
         "provider": "anthropic",
@@ -211,14 +223,14 @@ def get_config() -> dict:
         "max_retries": 3,
     }
 
-    # 从活跃模型配置读取 provider/api_key/model/api_base
+    # 从活跃模型别名读取完整配置（provider / api_key / model / api_base）
     model_cfg = models.get(active_alias, {}) if active_alias else {}
 
     for key in ("provider", "api_key", "model", "api_base"):
         if key in model_cfg:
             config[key] = model_cfg[key]
 
-    # 简单模式：用户配置在顶层（非 models 字典）
+    # 兼容旧版：如果用户在 config.json 顶层直接写了 api_key 等字段
     for key in ("api_key", "provider", "model", "api_base"):
         if key in user_raw and user_raw[key]:
             config[key] = user_raw[key]
@@ -226,13 +238,14 @@ def get_config() -> dict:
     if "max_retries" in user_raw:
         config["max_retries"] = user_raw["max_retries"]
 
+    # token 预算：控制 LLM 上下文窗口大小
     token_budget = user_raw.get("token_budget", 0) or project_raw.get("token_budget", 0)
     config["token_budget"] = int(token_budget) if token_budget else 80000
 
-    # 项目级覆盖
+    # 项目级配置覆盖（最高优先级，但不能覆盖 models / active / provider）
     config.update({k: v for k, v in project_raw.items() if v and k not in ("models", "active", "provider")})
 
-    # ── embedding 配置 ──
+    # embedding 配置（语义搜索用，默认关闭）
     embed_defaults = {"provider": "none", "model": "", "api_key": "", "api_base": ""}
     embed_cfg = dict(embed_defaults)
 
@@ -241,7 +254,7 @@ def get_config() -> dict:
 
     config["embedding"] = embed_cfg
 
-    # ── 多 Agent 角色-模型映射 ──
+    # 多 Agent 角色-模型映射（analyzer / fixer / reviewer 可选不同模型）
     agents_raw = user_raw.get("agents", {}) or project_raw.get("agents", {})
     config["agents"] = dict(agents_raw)
 
@@ -281,9 +294,13 @@ def get_agent_model_config(role: str) -> dict:
     """获取指定 Agent 角色的模型配置
 
     解析顺序：
-      1. config.json 中 agents -> {role} 映射到某个模型别名
-      2. 从 models 中查找该别名的完整配置
-      3. 如果角色未配置，回退到活跃模型
+      1. 检查 config.json 中 agents -> {role} 是否映射到某个模型别名
+      2. 从 models 中查找该别名的完整配置（provider / api_key / model / api_base）
+      3. 如果角色未配置，回退到当前的活跃模型
+
+    这样设计的好处：
+      - 分析用便宜模型（deepseek），修复用强模型（claude）
+      - 不配置则所有角色共用活跃模型，简化上手
 
     Returns:
         dict: {"provider": "...", "model": "...", "api_key": "...", "api_base": "..."}

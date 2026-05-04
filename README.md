@@ -1,215 +1,188 @@
 # PatchFlow
 
 > AI 驱动的代码生成与自动修复 CLI 工具
+>
+> AI-powered code generation and auto-fix CLI tool
 
----
+[中文文档](README.zh.md) · [English Documentation](README.en.md)
 
-## 简介
+***
 
-PatchFlow 是一个 AI 驱动的 CLI 工具，实现了从「需求描述」到「可用代码输出」的完整闭环。它的核心理念是：**自动化「写代码 → 运行 → 报错 → 分析 → 修复 → 再运行」这个枯燥的迭代循环**。
+## 核心理念 / Core Philosophy
 
-与 Cursor / Claude Code 等同类工具相比，PatchFlow 的核心差异在于**用确定性算法控制 LLM 的行为**——通过 AST 解析、依赖图分析和策略选择器，精确限定 LLM 的修改范围，而不是让 AI 自由发挥。
+**让工具代替开发者做最枯燥的事，而不是替代开发者本身。**
 
-## 特性
+PatchFlow 的出发点不是"让 AI 写代码"，而是"让 AI 自动执行『写代码 → 运行 → 报错 → 分析 → 修复 → 再运行』这个循环"。开发者只需要描述需求、审查结果、做关键决策。
 
-- **交互式 REPL** — 像 Claude Code 一样对话式编程，支持工具调用
-- **`/build` 一次性生成** — 从需求描述直接生成可运行代码，自动验证+修复
-- **`/fix` 多 Agent 协作** — Analyzer → Fixer → Reviewer 三 Agent 流水线，可为每个角色指定不同模型
-- **多模型管理** — 同时配置多个 LLM（Anthropic / OpenAI / DeepSeek），一键切换
-- **自动快照与回滚** — 每次修复前自动保存快照，失败自动回滚
-- **硬约束修复** — Strategy Selector 根据错误类型算法圈定可修改的文件范围，LLM 无法接触圈外文件
-- **项目感知** — 通过 AST 解析构建模块依赖图和函数签名图谱，精确计算修复影响面
-- **跨会话记忆** — 自动压缩历史对话为摘要，下次启动时恢复上下文
-- **跨平台** — Windows / macOS / Linux
+与 Cursor / Claude Code / GitHub Copilot 等工具相比，PatchFlow 走了一条完全不同的路——**用确定性算法控制 LLM，而不是让 LLM 自由发挥**。
 
-## 快速开始
+***
 
-```bash
-# 安装
-pip install patchflow
+## 核心差异化 / Key Differentiators
 
-# 首次配置（交互式）
-patchflow config init
+### 1. 算法驱动，而非 LLM 驱动
 
-# 启动交互式对话
-patchflow
+![与传统编程工具核心差异化](A:\Fixly\patchflow\staticResource\与传统编程工具核心差异化.png)
 
-# 一次性生成
-patchflow build "创建一个命令行计算器"
+关键区别：**PatchFlow 不信任 LLM 的判断力，而是用算法搭建护栏。**
 
-# 多 Agent 修复
-patchflow fix "修复 app.py 中的语法错误"
+### 2. 三层硬约束体系
+
+PatchFlow 构建了三层互不信任的检查机制：
+
+![三层硬约束体系架构](A:\Fixly\patchflow\staticResource\三层硬约束体系架构.png)
+
+**LLM 的任务是"在圈定的范围内写代码"，而不是"判断应该改什么"。**
+
+### 3. Blackboard 多 Agent 协作
+
+三个职责单一的 Agent 通过共享黑板数据交换（彼此不直接通信）：
+
+```
+          ┌──────────────────────────┐
+          │      Blackboard           │
+          │  ┌─────────┬───────────┐  │
+          │  │ analysis│ fix_plan  │  │
+          │  └─────────┴───────────┘  │
+          │  ┌──────────────────────┐ │
+          │  │  review / feedback  │ │
+          │  └──────────────────────┘ │
+          └──────────────────────────┘
+                ▲          ▲
+        写入    │          │  写入
+      ┌────────┴──┐    ┌──┴────────┐
+      │ Analyzer  │ → │   Fixer   │ → Reviewer →
+      │ 只分析不提  │    │ 只修复不评估│   独立审查
+      │ 修复方案   │    │           │   可驳回重做
+      └───────────┘    └───────────┘
 ```
 
-## 配置
+- **Analyzer**：只说问题在哪，不提修复方案。职责单一防止"自我审查放水"
+- **Fixer**：根据分析结果和策略约束执行修复，只能在算法圈定范围内行动
+- **Reviewer**：独立审查修复方案，可以驳回让 Fixer 重做（最多一次重试）
 
-配置文件位于 `~/.patchflow/config.json`，支持多模型配置：
+每个 Agent 的输出格式固定（`schema.py`），包含 `summary`（≤150 字符）、`language`（LLM 自动识别）等字段。支持为不同角色配置不同模型。CLI 面板实时显示每个 Agent 对 Blackboard 的读写活动。
 
-```json
-{
-  "active": "deepseek",
-  "models": {
-    "deepseek": {
-      "provider": "deepseek",
-      "model": "deepseek-chat",
-      "api_key": "sk-xxx",
-      "api_base": "https://api.deepseek.com"
-    },
-    "claude": {
-      "provider": "anthropic",
-      "model": "claude-sonnet-4-20250514",
-      "api_key": "sk-ant-xxx"
-    },
-    "gpt4": {
-      "provider": "openai",
-      "model": "gpt-4o",
-      "api_key": "sk-xxx"
-    }
-  },
-  "max_retries": 3,
-  "agents": {
-    "analyzer": "deepseek",
-    "fixer": "claude",
-    "reviewer": "deepseek"
-  }
+### 4. 计划驱动（Plan Mode）
+
+用户输入任务 → AI 输出结构化分步计划 → 用户确认 → 逐步骤执行 → 每步可见进度：
+
+```
+$ patchflow plan "创建一个 FastAPI TODO 应用"
+┌────────────────────────────────────────────────────┐
+│ Plan: FastAPI TODO 应用                             │
+├────┬────────────────────┬──────────────────────────┤
+│ #  │ Step               │ Description               │
+├────┼────────────────────┼──────────────────────────┤
+│ 1  │ 项目初始化         │ 创建项目骨架 (pyproject.toml, app.py) │
+│ 2  │ 数据库模型         │ 创建 SQLAlchemy 模型 (models.py)    │
+│ 3  │ API 路由           │ 创建 CRUD 路由 (routes.py)          │
+│ 4  │ 入口整合           │ 整合所有模块 (main.py)               │
+└────┴────────────────────┴──────────────────────────┘
+是否按此计划执行? (y/n) > y
+[1/4] ✓ 项目初始化 → pyproject.toml, app.py
+[2/4] ✓ 数据库模型 → models.py
+[3/4] ✓ API 路由   → routes.py
+[4/4] ✓ 入口整合   → main.py
+✓ 验证通过 | 成功完成! (4 步)
+```
+
+### 5. 多语言抽象层
+
+通过 `LanguageRegistry` 注册器模式统一管理语言特质，新增语言只需注册一个 `LanguageDescriptor`：
+
+```python
+# 语言注册：一行声明该语言的全部特质
+_BUILTINS["python"] = LanguageDescriptor(
+    name="python",
+    extensions={".py"},
+    project_files=["pyproject.toml", "setup.py"],
+    traceback_patterns=[re.compile(r'File "(.+?)", line (\d+)')],
+    error_classifiers={"SyntaxError": "syntax", "TypeError": "type", ...},
+    run_command="python",
+)
+```
+
+各模块通过注册中心委派工作，不再硬编码 Python 格式：
+
+| 模块                 | 之前（硬编码 Python）                | 之后（委派给 LanguageRegistry）             |
+| ------------------ | ----------------------------- | ------------------------------------ |
+| error\_analyzer    | 正则匹配 `File "xxx.py"`          | 按语言选择 traceback 模式                   |
+| scope\_calculator  | `rglob("*.py")` + `ast.parse` | 按语言选择 import 解析器                     |
+| context\_collector | 只认 `pyproject.toml`           | 覆盖 6 种语言的包配置                         |
+| validator          | 只跑 `python xxx.py`            | 按语言选 `node` / `javac` / `go build` 等 |
+
+### 6. 跨会话智能记忆
+
+历史对话不原样存储，而是压缩为结构化摘要：
+
+```
+存磁盘：                       下次启动 LLM 看到：
+{                              === 之前会话摘要 ===
+  "summary": [                 - 帮我写一个登录模块, 用JWT认证
+    "帮我写一个登录模块...",      - 文件: auth.py, app.py
+    "修复数据库查询慢...",       - 修复数据库查询慢; 建议加索引
+    "为文章列表添加分页..."      - 为文章列表添加分页; 文件: views.py
+  ],                             === new session ===
+  "messages": [...]              (继续新的对话...)
 }
 ```
 
-```bash
-# 命令行配置
-patchflow config set api_key sk-ant-xxx
-patchflow config set model claude-sonnet-4-20250514
+- 过程中的读写、报错、重试全部丢弃，只保留"做了什么 + 结果"
+- 500KB 自动裁剪，最近 3 轮保持完整原始消息
 
-# 多模型管理
-patchflow model add my-ds deepseek deepseek-chat sk-xxx
-patchflow model use my-ds
-patchflow model list
-```
+***
 
-## 命令
-
-### CLI 命令
-
-| 命令 | 说明 |
-|------|------|
-| `patchflow` | 进入交互式 REPL 模式 |
-| `patchflow chat` | 同上 |
-| `patchflow build <任务>` | 一次性生成代码并自动验证修复 |
-| `patchflow fix <任务>` | 多 Agent 协作修复代码问题 |
-| `patchflow analyze` | 分析当前项目结构 |
-| `patchflow status` | 查看缓存状态 |
-| `patchflow config set/show/init` | 配置管理 |
-| `patchflow model add/use/list/remove` | 多模型管理 |
-
-### REPL 内部命令
-
-| 命令 | 说明 |
-|------|------|
-| `/help` | 显示帮助 |
-| `/exit` 或 `/quit` | 退出 |
-| `/clear` | 清空对话历史 |
-| `/history` | 显示对话统计 |
-| `/memory` | 显示记忆状态（跨会话记忆） |
-| `/model` | 列出/切换可用模型 |
-| `/build` | 生成代码并自动验证 |
-| `/fix` | 多 Agent 协作修复 |
-| `/context` | 查看上下文统计 |
-| `/init` | 创建项目级规则文件 |
-| `/stop <pid>` | 停止后台进程 |
-| `/ps` | 查看后台进程 |
-
-## 多 Agent 协作架构
-
-PatchFlow 使用 **Blackboard（黑板）模式** 实现多 Agent 协作。三个 Agent **不直接通信**，而是通过共享的 Blackboard 数据结构交换信息：
-
-```
-┌──────────────────────────────────────────────┐
-│                 Blackboard                     │
-│  ┌──────────┬──────────┬──────────┐           │
-│  │ analysis │ fix_plan │  review  │           │
-│  │ (写入:   │ (写入:   │ (写入:   │           │
-│  │ Analyzer)│  Fixer)  │ Reviewer)│           │
-│  └──────────┴──────────┴──────────┘           │
-└──────────────────────────────────────────────┘
-        ▲            ▲            ▲
-        │            │            │
-   ┌────┴───┐   ┌───┴────┐   ┌──┴──────┐
-   │Analyzer│ → │ Fixer  │ → │Reviewer │
-   │ 定位问题│   │ 执行修复│   │ 审查方案│
-   └────────┘   └────────┘   └─────────┘
-```
-
-- **Analyzer** — 只说问题在哪，不提修复方案。职责单一防止思维污染
-- **Fixer** — 根据分析结果和策略约束执行修复，只能在圈定范围内行动
-- **Reviewer** — 独立审查修复方案，可以驳回让 Fixer 重做（最多一次重试）
-
-每个 Agent 的输出格式固定（定义在 `schema.py`），包含 `summary`（≤150 字符）等字段供其他 Agent 快速阅读。支持为不同角色配置不同模型（如 Analyzer 用便宜的 DeepSeek，Fixer 用更强的 Claude）。
-
-## 架构概览
+## 架构 / Architecture
 
 ```
 patchflow/
-├── cli.py                    # CLI 入口（click 框架）
-├── core/
-│   ├── orchestrator.py       # 单 Agent 调度器（生成→验证→修复）
-│   ├── agent_orchestrator.py # 多 Agent Blackboard 调度器
-│   ├── repl.py               # 交互式 REPL 循环
-│   ├── chat_client.py        # LLM 对话客户端（流式+工具调用）
-│   ├── generator.py          # 代码生成
-│   ├── validator.py          # 编译/运行/测试验证
-│   ├── fixer.py              # 自动修复执行
-│   ├── error_parser.py       # 正则级别错误提取
-│   ├── error_analyzer.py     # 精准错误分析（traceback 解析+调用链）
-│   ├── context_collector.py  # 项目上下文收集（确定性扫描）
-│   ├── context_manager.py    # 上下文压缩（三层压缩策略）
-│   ├── strategy_selector.py  # 修复策略选择（硬约束）
-│   ├── scope_calculator.py   # 代码依赖图 + 影响面计算
-│   ├── snapshot_manager.py   # 快照回滚管理
-│   ├── conflict_detector.py  # Lazy Diff 冲突检测
-│   ├── agent_sandbox.py      # Agent 隔离沙箱
-│   ├── breaker.py            # 修复循环熔断器
-│   ├── llm_client.py         # LLM API 调用封装
-│   ├── codebase_index.py     # 代码索引（AST + 向量嵌入）
-│   └── config.py             # 配置系统（多模型管理）
-├── agents/
-│   ├── analyzer.py           # 问题定位 Agent
-│   ├── fixer_agent.py        # 修复执行 Agent
-│   ├── reviewer.py           # 审查 Agent
-│   ├── blackboard.py         # 共享黑板数据结构（含活动追踪）
-│   └── schema.py             # Agent 输出合约校验
+├── cli.py
+├── core/                           # 核心调度 + 基础设施
+│   ├── orchestrator.py             # 单 Agent 调度器
+│   ├── agent_orchestrator.py       # 多 Agent Blackboard 调度器
+│   ├── planner.py                  # Plan 计划驱动生成
+│   ├── repl.py                     # 交互式 REPL
+│   ├── chat_client.py              # LLM 对话客户端（跨会话记忆）
+│   ├── config.py                   # 多模型配置
+│   ├── llm_client.py               # LLM 调用封装
+│   └── language_registry.py        # 多语言注册中心
+├── core/analysis/                  # 错误分析
+│   ├── error_parser.py             # 多语言错误解析
+│   ├── error_analyzer.py           # 精准分析（traceback + 调用链）
+│   └── strategy_selector.py        # 12种错误 → 策略映射
+├── core/fix/                       # 修复执行
+│   ├── fixer.py / generator.py / validator.py
+│   ├── scope_calculator.py         # 依赖图 + 影响面计算
+│   ├── snapshot_manager.py         # 快照回滚
+│   └── breaker.py                  # 熔断器
+├── core/project/                   # 项目理解
+│   ├── context_collector.py        # 多语言上下文收集
+│   ├── context_manager.py          # 三层压缩
+│   └── codebase_index.py           # 代码索引
+├── agents/                         # 多 Agent
+│   ├── analyzer.py / fixer_agent.py / reviewer.py
+│   ├── blackboard.py               # 黑板数据结构（活动追踪）
+│   └── schema.py                   # 通信合约
 └── utils/
-    ├── runner.py             # subprocess 封装
-    ├── logger.py             # 日志系统
-    ├── diff.py               # 代码 diff 工具
-    └── agent_display.py      # 多 Agent 流水线可视化面板
+    ├── runner.py / logger.py / diff.py
+    ├── agent_display.py            # 流水线可视化
+    └── code_reviewer.py
 ```
 
-## 技术栈
+***
 
-| 模块 | 技术 |
-|------|------|
-| CLI | click |
-| LLM | OpenAI / Anthropic / DeepSeek |
-| 执行 | subprocess |
-| 终端渲染 | rich |
-| 项目分析 | Python AST（标准库）|
-| 向量嵌入 | numpy |
-| 配置 | JSON（多层合并）|
+## 技术栈 / Tech Stack
 
-## 开发
+| 模块   | 技术                            |
+| ---- | ----------------------------- |
+| CLI  | click                         |
+| LLM  | OpenAI / Anthropic / DeepSeek |
+| 终端渲染 | rich                          |
+| 项目分析 | Python AST                    |
+| 语言抽象 | LanguageRegistry（注册器模式）       |
+| 配置   | JSON 多层合并                     |
 
-```bash
-# 克隆
-git clone https://github.com/your-org/patchflow.git
-cd patchflow
-
-# 安装开发依赖
-pip install -e ".[dev]"
-
-# 运行测试
-pytest
-```
-
----
+***
 
 [MIT License](LICENSE)

@@ -1,10 +1,25 @@
 """语言注册中心 — 多语言支持抽象层
 
-所有语言相关的特质（扩展名、traceback 格式、项目文件、构建命令等）
-集中注册到这里。各模块通过 LanguageRegistry 获取当前项目语言能力，
-不再硬编码 Python。
+这是 PatchFlow 多语言支持的基石。所有语言相关的特质
+（扩展名、traceback 格式、项目文件、构建命令、错误分类等）
+集中注册到这里。各模块通过 LanguageRegistry 获取当前项目语言能力。
 
-新增语言只需在 _BUILTINS 中注册一个 LanguageDescriptor 即可。
+设计思路：
+  不再硬编码 Python 是第一公民。
+  新增语言只需在 _BUILTINS 中注册一个 LanguageDescriptor 即可。
+
+内置支持的语言：
+  - Python（完整支持：AST 解析、compile + run 验证）
+  - JavaScript / TypeScript（V8 traceback 解析、node 运行验证）
+  - Java（JVM traceback 解析、javac + java 验证）
+  - Go（go mod 检测、go run/build 验证）
+  - Rust（cargo 检测、cargo build 验证）
+
+LanguageDescriptor 的核心能力：
+  - match_file(): 判断文件是否属于该语言
+  - parse_traceback(): 解析该语言的错误栈
+  - classify_error(): 识别错误类型（syntax/type/runtime/...）
+  - 提供运行/编译命令
 """
 
 import re
@@ -366,7 +381,13 @@ class LanguageRegistry:
     def detect(self, work_dir: str = ".") -> LanguageDescriptor | None:
         """Auto-detect project language by scanning project files
 
-        Returns None if no language can be determined — let LLM decide.
+        检测逻辑（优先级）：
+          1. 通过 project_files 匹配（如 pyproject.toml → Python）
+          2. 按文件扩展名出现频率判断
+          3. 都检测不到 → 返回 None（让 LLM 自己判断）
+
+        Returns:
+            LanguageDescriptor | None — None 表示无法确定语言
         """
         wd = Path(work_dir).resolve()
 

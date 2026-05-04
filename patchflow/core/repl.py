@@ -1,9 +1,26 @@
 """REPL — 交互式对话循环
 
-风格要点：
-  - Markdown 渲染 → 代码块语法高亮
-  - 工具调用摘要 → [$ command] 风格，紧凑单行
-  - 确认弹窗 → 交互式选择器，方向键/数字选择
+这是用户与 PatchFlow 交互的主界面。类似 Claude Code 的 CLI 风格。
+
+核心功能：
+  1. Markdown 渲染 → 代码块语法高亮（用 Rich 库）
+  2. 工具调用摘要 → [$ command] 风格，紧凑单行显示
+  3. 确认弹窗 → 交互式选择器（方向键/数字选择）
+  4. 流式输出 → AI 回复逐字显示，不是等完了才一起出来
+  5. 后台进程管理 → /stop /ps 命令
+  6. 跨会话记忆 → 退出后重启能恢复之前的对话
+
+可用命令：
+  /help    显示帮助
+  /exit    退出
+  /clear   清空对话历史
+  /plan    分步骤生成代码
+  /build   一次性生成代码
+  /fix     多 Agent 修复
+  /context 查看上下文状态
+  /model   切换模型
+  /stop    停止后台进程
+  /ps      查看后台进程
 """
 
 import sys
@@ -189,7 +206,20 @@ class REPL:
         self._hist_idx: int = 0
 
     def run(self):
-        """启动 REPL 主循环"""
+        """启动 REPL 主循环
+
+        流程：
+          1. 首次运行检查（没有 API Key 则显示引导信息）
+          2. 设置终端标题
+          3. 确保 .patchflow/ 被 Git 忽略
+          4. 显示欢迎面板（Logo + 模型信息 + 提示）
+          5. 进入 while True 循环：
+             - 读取用户输入
+             - 检查是否是命令（以 / 开头）
+             - 命令 → _handle_cmd()
+             - 普通输入 → _chat()
+          6. KeyboardInterrupt / EOFError → 退出
+        """
         try:
             sys.stdin.reconfigure(encoding="utf-8")
         except (AttributeError, OSError):
@@ -471,6 +501,21 @@ class REPL:
         return False
 
     def _chat(self, user_input: str):
+        """处理用户输入，启动流式对话
+
+        这是 REPL 的核心方法。处理流程：
+          1. 首次对话时创建 ChatClient 实例
+          2. 启动 spinner 动画（表示"思考中"）
+          3. 消费 chat_stream() 的事件流：
+             - text → 流式输出文本
+             - tool_start → 显示工具调用摘要（如 [read file.py]）
+             - tool_result → 显示工具调用结果（成功/失败/行数）
+             - usage → 更新 token 用量统计
+             - hint → 轮数限制提示（用户选择继续/停止）
+             - done → 对话结束
+          4. 显示最终结果：Markdown 渲染、diff、搜索等
+          5. 自动修复：如果检测到运行失败且有写文件，启动多 Agent 修复
+        """
         _CANCELLED.clear()
         if self.client is None:
             try:

@@ -33,22 +33,28 @@ def call_llm(
     max_tokens: int = 4096,
     model_alias: str | None = None,
 ) -> dict | None:
-    """调用 LLM API（自动根据 provider 选择底层）
+    """调用 LLM API（自动根据 provider 选择底层 SDK）
 
-    内置指数退避重试：
-      - 网络/限流错：最多 3 次（2s, 4s, 8s 等待）
-      - JSON 解析错：最多 2 次
-      - 认证错：不重试
+    这是 Generator / Fixer / Planner 等模块的统一 LLM 入口。
+    调用方只需提供 prompt，不需要关心底层是 OpenAI 还是 Anthropic。
+
+    内置指数退避重试机制（借鉴分布式系统的容错设计）：
+      - 网络/限流错（如 429 Too Many Requests）：最多重试 3 次
+        等待时间：2s → 4s → 8s（2^attempt 秒）
+      - JSON 解析错：最多重试 2 次
+      - 认证错（API Key 无效等）：不重试，立即返回
 
     Args:
-        system_prompt: 系统提示词
-        user_message:  用户消息
-        model:         模型名称（不传则从配置读取）
+        system_prompt: 系统提示词，定义 AI 的角色和行为规则
+        user_message:  用户消息，即具体的任务描述
+        model:         模型名称（不传则从配置读取当前活跃模型）
         max_tokens:    最大输出 token 数
-        model_alias:   模型别名（如 "deepseek"、"claude"），指定后覆盖 provider/api_key/api_base
+        model_alias:   模型别名（如 "deepseek"、"claude"），
+                       指定后覆盖 provider/api_key/api_base
+                       用于多 Agent 场景：不同角色用不同模型
 
     Returns:
-        dict: 解析后的 JSON 结果，或 None
+        dict: 解析后的 JSON 结果，或 None（所有重试都失败时）
     """
     # 如果指定了别名，从别名配置读取 provider/api_key/api_base
     if model_alias:
@@ -95,6 +101,7 @@ def call_llm(
             last_error = e
             error_str = str(e).lower()
 
+            # 认证类错误不重试（API Key 无效、未授权等），立即返回
             if "api_key" in error_str or "unauthorized" in error_str or "invalid" in error_str or "auth" in error_str:
                 logger.error(f"LLM 认证失败（不重试）: {e}")
                 return None
@@ -167,12 +174,20 @@ def _call_openai_compat(system_prompt, user_message, model, max_tokens, api_key,
 
 
 def _parse_json(text: str) -> dict | None:
-    """从 LLM 回复中提取 JSON，失败时尝试修复截断"""
+    """从 LLM 回复中提取 JSON，失败时尝试修复截断
+
+    LLM 输出 JSON 时经常出现的两个问题：
+      1. 用 ```json ... ``` 代码块包裹（Markdown 格式）
+      2. JSON 被截断（输出达到 max_tokens 限制）
+
+    Returns:
+        dict 或 None
+    """
     if not text or not text.strip():
         logger.warn("LLM 返回空内容")
         return None
 
-    # 先尝试提取代码块
+    # 第一步：先尝试提取 markdown 代码块中的 JSON
     if "```json" in text:
         start = text.index("```json") + 7
         end = text.index("```", start)
@@ -191,7 +206,7 @@ def _parse_json(text: str) -> dict | None:
     except json.JSONDecodeError:
         pass
 
-    # ── 尝试修复截断的 JSON ──
+    # 第二步：如果标准 JSON 解析失败，尝试修复截断
     repaired = _repair_truncated_json(text)
     if repaired is not None:
         return repaired
@@ -202,10 +217,17 @@ def _parse_json(text: str) -> dict | None:
 
 
 def _repair_truncated_json(text: str) -> dict | None:
-    """尝试修复被截断的 JSON"""
+    """尝试修复被截断的 JSON
+
+    截断通常发生在：
+      - LLM 输出达到 max_tokens 上限
+      - 网络传输中断
+
+    修复策略：依次尝试追加各种闭合符号，看哪个能解析成功。
+    从最简单的 } 开始，逐步尝试更复杂的闭合组合。
+    """
     stripped = text.rstrip().rstrip(",")
 
-    # 尝试补全 }
     for closer in ("\n}", "}", "]}"):
         test = stripped + closer
         try:
@@ -213,7 +235,6 @@ def _repair_truncated_json(text: str) -> dict | None:
         except json.JSONDecodeError:
             continue
 
-    # 尝试补全 "}
     for closer in ('"\n}', '"}', '"\n]}'):
         test = stripped + closer
         try:

@@ -1,7 +1,14 @@
 """错误分析器 — 精准定位问题根因和调用链（多语言支持）
 
-通过 LanguageRegistry 将原生 traceback 解析委托给对应语言的处理器，
-不再硬编码 Python traceback 格式。
+这是"验证 → 修复"闭环中的"诊断"环节。
+当 Validator 发现代码报错时，ErrorAnalyzer 负责解析错误信息，
+定位根因和影响范围。
+
+设计要点：
+  1. 通过 LanguageRegistry 将原生 traceback 解析委托给对应语言的处理器
+  2. 不再硬编码 Python traceback 格式（支持 Python / JS / TS / Java / Go / Rust）
+  3. 结构化输出 ErrorAnalysis，包含：错误类型、根因、调用链、影响文件
+  4. 兜底机制：如果语言特定解析失败，回退到通用解析器
 
 支持的语言：Python / JavaScript / TypeScript / Java / Go / Rust
 """
