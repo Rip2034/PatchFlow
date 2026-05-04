@@ -38,7 +38,7 @@ PatchFlow 构建了三层互不信任的检查机制：
 
 三个职责单一的 Agent 通过共享黑板数据交换（彼此不直接通信）：
 
-![Blackboard多Agent 协作](staticResource/Blackboard多Agent 协作.png)
+![Blackboard多Agent协作](staticResource/Blackboard多Agent协作.png)
 
 - **Analyzer**：只说问题在哪，不提修复方案。职责单一防止"自我审查放水"
 - **Fixer**：根据分析结果和策略约束执行修复，只能在算法圈定范围内行动
