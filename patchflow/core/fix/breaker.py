@@ -74,5 +74,13 @@ class FixLoopBreaker:
 
     @property
     def is_broken(self) -> bool:
-        ok, _ = self.should_retry("", "")
-        return not ok
+        """判断熔断器是否已触发（无副作用，不改变内部状态）"""
+        if self.turn > self.max_retries:
+            return True
+        # 检查是否有同一错误重复出现超过阈值
+        from collections import Counter
+        key_counts = Counter(e.get("key") for e in self.error_history)
+        for count in key_counts.values():
+            if count > self.SIMILAR_FAILURES_THRESHOLD:
+                return True
+        return False
