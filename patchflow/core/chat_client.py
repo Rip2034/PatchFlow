@@ -17,8 +17,15 @@ from patchflow.core.project.context_manager import compress
 from patchflow.utils import logger
 
 # ═══════════════════════════════════════════════════════════
-# 工具定义
+# 开发任务意图检测 — 用于智能记忆
+#
+# 核心思想：不猜用户说了什么，看 LLM 做了什么。
+#   - LLM 调用了工具（write/run/delete/rename）→ 开发任务 → 持久化
+#   - LLM 只回复文本（没调工具）→ 查询 → 跳过
+#   - 用户粘贴了代码块（```）→ 代码相关 → 保留
 # ═══════════════════════════════════════════════════════════
+
+_log_tag = "[SmartMemory]"
 
 TOOLS = [
     {
@@ -979,7 +986,7 @@ ToolUse = dict
 
 class ChatClient:
 
-    def __init__(self, model: str | None = None, work_dir: str = "."):
+    def __init__(self, model: str | None = None, work_dir: str = ".", memory_enabled: bool = True):
         cfg = get_config()
         self.provider = get_normalized_provider()
         self.api_key = cfg["api_key"]
@@ -990,24 +997,35 @@ class ChatClient:
             raise ValueError("未配置 API Key")
 
         if self.provider == "anthropic":
-            self._anthropic = Anthropic(api_key=self.api_key, timeout=120)
+            base_url = self.api_base or None
+            if base_url:
+                base_url = base_url.rstrip("/")
+                if base_url.endswith("/v1/messages"):
+                    base_url = base_url[:-len("/v1/messages")]
+                elif base_url.endswith("/v1"):
+                    base_url = base_url[:-len("/v1")]
+            self._anthropic = Anthropic(api_key=self.api_key, timeout=120, base_url=base_url)
             self._openai = None
         else:
+            base_url = self.api_base or None
             self._openai = OpenAI(
                 api_key=self.api_key,
-                base_url=self.api_base,
+                base_url=base_url,
                 timeout=120,
                 max_retries=2,
             )
             self._anthropic = None
 
         self.messages: list[dict] = []
+        self._memory_enabled = memory_enabled
+        self._has_dev_activity = False
         self._max_rounds = 30
         self._work_dir = Path(work_dir).resolve()
         self._memory_path = self._work_dir / ".patchflow" / "memory.json"
         self._session_boundary_added = False
         self._memory_summary: list[str] = []
-        self._load_memory()
+        if self._memory_enabled:
+            self._load_memory()
 
     # ── streaming chat（给 REPL 用）──
 
@@ -1023,8 +1041,8 @@ class ChatClient:
             if rules_file.exists():
                 try:
                     rules_text = rules_file.read_text(encoding="utf-8").strip()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"读取规则文件失败: {e}")
             if rules_text:
                 enhanced_input = f"{skeleton}\n\nProject Rules:\n{rules_text}\n\n{user_input}"
             else:
@@ -1038,8 +1056,8 @@ class ChatClient:
                 running = [p for p in list_processes() if p.running]
                 if running:
                     bg_info = "\n[Background processes running: " + ", ".join(f"PID {p.pid}: {p.command[:40]}" for p in running) + "]\n"
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"后台进程列表获取失败: {e}")
             self.messages.append({"role": "user", "content": bg_info + user_input})
             self._save_memory()
         all_tool_calls = []
@@ -1302,6 +1320,7 @@ class ChatClient:
 
     def clear_history(self):
         self.messages = []
+        self._has_dev_activity = False
         self._save_memory()
         logger.info("对话历史已清空")
 
@@ -1321,6 +1340,28 @@ class ChatClient:
 
     _MAX_MEMORY_BYTES = 512_000  # 500 KB，超过这个大小会压缩旧消息
     _MIN_KEEP_TURNS = 3          # 压缩时最少保留最近 3 个完整对话回合
+
+    def _check_dev_activity(self) -> bool:
+        """扫描当前对话，判断是否有开发活动
+
+        不猜测用户意图，而是观察 LLM 的实际行为：
+          - LLM 调用了写/运行/删除/重命名工具 → 明确是开发任务
+          - 用户消息中包含代码块（```）→ 代码相关
+        一旦检测到，标记 _has_dev_activity = True（后续不再重新扫描）
+        """
+        if self._has_dev_activity:
+            return True
+        for msg in self.messages:
+            if msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    name = tc.get("function", {}).get("name", "")
+                    if name in ("write_file", "delete_file", "rename_file", "run_code"):
+                        self._has_dev_activity = True
+                        return True
+            if not self._has_dev_activity and "```" in str(msg.get("content", "")):
+                self._has_dev_activity = True
+                return True
+        return False
 
     def _load_memory(self):
         """从磁盘加载记忆
@@ -1360,10 +1401,18 @@ class ChatClient:
             logger.warn(f"记忆加载失败: {e}")
 
     def _save_memory(self):
-        """将当前对话持久化到磁盘
+        """将当前对话持久化到磁盘（仅当检测到开发活动时）
 
         保存前自动压缩旧消息为摘要，只保留最近 N 轮原始消息。
+        如果对话不涉及开发任务（纯查询/闲聊），跳过磁盘写入。
         """
+        if not self._memory_enabled:
+            return
+        if not self._check_dev_activity():
+            logger.debug(f"{_log_tag} 非开发任务，跳过持久化")
+            self._compress_old_messages()
+            return
+
         try:
             self._compress_old_messages()
             self._memory_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1374,6 +1423,7 @@ class ChatClient:
             }
             raw = json.dumps(data, ensure_ascii=False, indent=2)
             self._memory_path.write_text(raw, encoding="utf-8")
+            logger.info(f"{_log_tag} 已持久化 ({len(self._memory_summary)} 摘要 + {len(self.messages)} 消息)")
         except OSError as e:
             logger.warn(f"记忆保存失败: {e}")
 
