@@ -186,8 +186,8 @@ class AgentOrchestrator:
         # ── 构建依赖图（用于 Scope 计算和冲突检测）──
         try:
             self.dep_graph.build()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Dep graph 构建失败（非致命）: {e}")
 
         # ── Step 1: Analyzer 分析错误 ──
         # 调用分析 Agent 定位问题根因，返回错误类型、置信度、影响文件等
