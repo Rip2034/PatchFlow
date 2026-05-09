@@ -202,7 +202,6 @@ def _collect_js_imports(filepath: str, work_dir: str) -> list[str]:
 
     imports = []
     wd = Path(work_dir).resolve()
-    # import x from 'y' / import 'y'
     for m in re.finditer(r"""(?:import|require)\s*\(?['"]([^'"]+)['"]\)?""", content):
         raw = m.group(1)
         if raw.startswith(".") or raw.startswith("/"):
@@ -216,6 +215,105 @@ def _collect_js_imports(filepath: str, work_dir: str) -> list[str]:
                         imports.append(str(rel).replace("\\", "/"))
                 except (ValueError, OSError):
                     pass
+    return imports
+
+
+def _collect_java_imports(filepath: str, work_dir: str) -> list[str]:
+    """正则解析 Java 文件的 import 语句"""
+    try:
+        content = Path(filepath).read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return []
+
+    imports = []
+    wd = Path(work_dir).resolve()
+    for m in re.finditer(r'^import\s+([\w.]+)', content, re.MULTILINE):
+        fqcn = m.group(1)
+        # 转换 com.example.utils.StringUtil → src/main/java/com/example/utils/StringUtil.java
+        path = fqcn.replace(".", "/") + ".java"
+        for src_dir in ("src/main/java", "src/test/java", "src"):
+            candidate = wd / src_dir / path
+            if candidate.exists():
+                try:
+                    rel = candidate.relative_to(wd)
+                    imports.append(str(rel).replace("\\", "/"))
+                except ValueError:
+                    pass
+        # 同包内的类引用也添加
+        pkg_match = re.search(r'^package\s+([\w.]+)', content, re.MULTILINE)
+        if pkg_match:
+            pkg = pkg_match.group(1).replace(".", "/")
+            simple_name = fqcn.split(".")[-1] + ".java"
+            candidate = Path(filepath).parent / simple_name
+            if candidate.exists():
+                try:
+                    rel = candidate.resolve().relative_to(wd)
+                    imports.append(str(rel).replace("\\", "/"))
+                except (ValueError, OSError):
+                    pass
+    return imports
+
+
+def _collect_go_imports(filepath: str, work_dir: str) -> list[str]:
+    """正则解析 Go 文件的 import 语句"""
+    try:
+        content = Path(filepath).read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return []
+
+    imports = []
+    wd = Path(work_dir).resolve()
+    for m in re.finditer(r'"([^"]+)"', content):
+        pkg = m.group(1)
+        if not pkg.startswith("github.") and not pkg.startswith("golang.") and "/" not in pkg:
+            continue
+        # 本地包引用 → 映射为文件路径
+        for candidate_dir in wd.rglob(f"*{pkg.split('/')[-1]}"):
+            if candidate_dir.is_dir() and any(candidate_dir.glob("*.go")):
+                for gf in candidate_dir.glob("*.go"):
+                    try:
+                        rel = gf.relative_to(wd)
+                        imports.append(str(rel).replace("\\", "/"))
+                    except ValueError:
+                        pass
+    return imports
+
+
+def _collect_rust_imports(filepath: str, work_dir: str) -> list[str]:
+    """解析 Rust 文件的 mod/use 声明"""
+    try:
+        content = Path(filepath).read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return []
+
+    imports = []
+    wd = Path(work_dir).resolve()
+    file_dir = Path(filepath).parent
+
+    # mod xxx; → 同目录下的 xxx.rs 或 xxx/mod.rs
+    for m in re.finditer(r'^\s*(?:pub\s+)?mod\s+(\w+)', content, re.MULTILINE):
+        mod_name = m.group(1)
+        for candidate in (
+            file_dir / f"{mod_name}.rs",
+            file_dir / mod_name / "mod.rs",
+        ):
+            try:
+                if candidate.resolve().is_file():
+                    rel = candidate.resolve().relative_to(wd)
+                    imports.append(str(rel).replace("\\", "/"))
+            except (ValueError, OSError):
+                pass
+
+    # use crate::xxx::yyy → 映射为文件路径
+    for m in re.finditer(r'use\s+crate::([\w:]+)', content):
+        crate_path = m.group(1).replace("::", "/")
+        candidate = wd / "src" / f"{crate_path}.rs"
+        if candidate.exists():
+            try:
+                rel = candidate.relative_to(wd)
+                imports.append(str(rel).replace("\\", "/"))
+            except ValueError:
+                pass
     return imports
 
 
@@ -480,5 +578,8 @@ class LanguageRegistry:
             "python": _collect_python_imports,
             "javascript": _collect_js_imports,
             "typescript": _collect_js_imports,
+            "java": _collect_java_imports,
+            "go": _collect_go_imports,
+            "rust": _collect_rust_imports,
         }
-        return parsers.get(lang.name, _collect_python_imports)
+        return parsers.get(lang.name, lambda fp, wd: [])
