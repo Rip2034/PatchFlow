@@ -101,7 +101,10 @@ def is_whitelisted(command: str) -> bool:
         _load_safe_list()
     norm = _normalize_cmd(command)
     for wl in _whitelist:
-        if norm.startswith(wl):
+        wl_norm = wl.strip()
+        if not wl_norm:
+            continue
+        if norm == wl_norm or norm.startswith(wl_norm + " "):
             return True
     return False
 
@@ -111,7 +114,10 @@ def is_blacklisted(command: str) -> bool:
         _load_safe_list()
     norm = _normalize_cmd(command)
     for bl in _blacklist:
-        if norm == bl or norm.startswith(bl):
+        bl_norm = bl.strip()
+        if not bl_norm:
+            continue
+        if norm == bl_norm or norm.startswith(bl_norm + " "):
             return True
     return False
 
