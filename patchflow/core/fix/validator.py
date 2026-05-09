@@ -68,42 +68,20 @@ def validate(work_dir: str = ".") -> ValidationResult:
 
     logger.info(f"项目类型: {lang_name}，使用 {lang.run_command or lang.compile_command or 'N/A'} 验证")
 
-    entry = _find_entry(wd, lang_name)
-    if entry is None:
-        return ValidationResult(
-            ok=False,
-            error=parse(f"No entry point found for {lang_name}"),
-            language=lang_name,
-        )
+    # Rust: cargo build / cargo run 不接受文件参数，直接运行
+    if lang_name == "rust":
+        return _validate_rust(wd, lang)
 
-    logger.step(f"验证入口文件: {entry.name}")
+    # Java: 编译用文件名(javac Main.java)，运行用类名(java Main)
+    if lang_name == "java":
+        return _validate_java(wd, lang)
 
-    # 编译验证
-    if lang.compile_command:
-        compile_cmd = f"{lang.compile_command} {entry.name}"
-        logger.info(f"编译: {compile_cmd}")
-        result = run(compile_cmd, cwd=str(wd))
-        if not result.ok:
-            error_text = result.stderr.strip() or result.stdout.strip() or "Compilation failed"
-            logger.error(f"编译验证失败")
-            return ValidationResult(ok=False, error=parse(error_text, lang_name=lang_name), language=lang_name)
+    # TypeScript: 编译 .ts → .js，然后 node 运行 .js
+    if lang_name == "typescript":
+        return _validate_typescript(wd, lang)
 
-    # 运行验证
-    if lang.run_command:
-        run_cmd = f"{lang.run_command} {entry.name}"
-        logger.info(f"运行: {run_cmd}")
-        result = run(run_cmd, cwd=str(wd))
-
-        if result.ok:
-            logger.success("运行验证通过")
-            return ValidationResult(ok=True, language=lang_name)
-
-        error_text = result.stderr.strip() or result.stdout.strip() or f"Runtime error (exit={result.exit_code})"
-        logger.error(f"运行验证失败 (exit={result.exit_code})")
-        return ValidationResult(ok=False, error=parse(error_text, lang_name=lang_name), language=lang_name)
-
-    logger.success(f"验证通过（仅编译检查，无需运行）")
-    return ValidationResult(ok=True, language=lang_name)
+    # JavaScript / Go: 通用方式
+    return _validate_generic(wd, lang, lang_name)
 
 
 def _validate_python(wd: Path, lang) -> ValidationResult:
@@ -152,3 +130,136 @@ def _find_entry(work_dir: Path, lang_name: str) -> Path | None:
         if candidate.exists():
             return candidate
     return None
+
+
+def _validate_rust(wd: Path, lang) -> ValidationResult:
+    """Rust 验证：cargo build + cargo run（不接受文件参数）"""
+    if lang.compile_command:
+        logger.info(f"编译: {lang.compile_command}")
+        result = run(lang.compile_command, cwd=str(wd))
+        if not result.ok:
+            error_text = result.stderr.strip() or result.stdout.strip() or "Compilation failed"
+            logger.error("编译验证失败")
+            return ValidationResult(ok=False, error=parse(error_text, lang_name="rust"), language="rust")
+
+    if lang.run_command:
+        logger.info(f"运行: {lang.run_command}")
+        result = run(lang.run_command, cwd=str(wd))
+        if result.ok:
+            logger.success("运行验证通过")
+            return ValidationResult(ok=True, language="rust")
+        error_text = result.stderr.strip() or result.stdout.strip() or f"Runtime error (exit={result.exit_code})"
+        logger.error(f"运行验证失败 (exit={result.exit_code})")
+        return ValidationResult(ok=False, error=parse(error_text, lang_name="rust"), language="rust")
+
+    logger.success("验证通过（仅编译检查，无需运行）")
+    return ValidationResult(ok=True, language="rust")
+
+
+def _validate_java(wd: Path, lang) -> ValidationResult:
+    """Java 验证：javac Main.java 编译，java Main 运行（类名不带 .java）"""
+    entry = _find_entry(wd, "java")
+    if entry is None:
+        return ValidationResult(
+            ok=False,
+            error=parse("No entry point found for Java"),
+            language="java",
+        )
+
+    logger.step(f"验证入口文件: {entry.name}")
+
+    if lang.compile_command:
+        compile_cmd = f"{lang.compile_command} {entry.name}"
+        logger.info(f"编译: {compile_cmd}")
+        result = run(compile_cmd, cwd=str(wd))
+        if not result.ok:
+            error_text = result.stderr.strip() or result.stdout.strip() or "Compilation failed"
+            logger.error("编译验证失败")
+            return ValidationResult(ok=False, error=parse(error_text, lang_name="java"), language="java")
+
+    if lang.run_command:
+        run_cmd = f"{lang.run_command} {entry.stem}"
+        logger.info(f"运行: {run_cmd}")
+        result = run(run_cmd, cwd=str(wd))
+        if result.ok:
+            logger.success("运行验证通过")
+            return ValidationResult(ok=True, language="java")
+        error_text = result.stderr.strip() or result.stdout.strip() or f"Runtime error (exit={result.exit_code})"
+        logger.error(f"运行验证失败 (exit={result.exit_code})")
+        return ValidationResult(ok=False, error=parse(error_text, lang_name="java"), language="java")
+
+    logger.success("验证通过（仅编译检查，无需运行）")
+    return ValidationResult(ok=True, language="java")
+
+
+def _validate_typescript(wd: Path, lang) -> ValidationResult:
+    """TypeScript 验证：tsc 编译 .ts → .js，然后 node 运行 .js"""
+    entry = _find_entry(wd, "typescript")
+    if entry is None:
+        return ValidationResult(
+            ok=False,
+            error=parse("No entry point found for TypeScript"),
+            language="typescript",
+        )
+
+    logger.step(f"验证入口文件: {entry.name}")
+
+    if lang.compile_command:
+        compile_cmd = f"{lang.compile_command} {entry.name}"
+        logger.info(f"编译: {compile_cmd}")
+        result = run(compile_cmd, cwd=str(wd))
+        if not result.ok:
+            error_text = result.stderr.strip() or result.stdout.strip() or "Compilation failed"
+            logger.error("编译验证失败")
+            return ValidationResult(ok=False, error=parse(error_text, lang_name="typescript"), language="typescript")
+
+    if lang.run_command:
+        js_entry = entry.stem + ".js"
+        run_cmd = f"{lang.run_command} {js_entry}"
+        logger.info(f"运行: {run_cmd}")
+        result = run(run_cmd, cwd=str(wd))
+        if result.ok:
+            logger.success("运行验证通过")
+            return ValidationResult(ok=True, language="typescript")
+        error_text = result.stderr.strip() or result.stdout.strip() or f"Runtime error (exit={result.exit_code})"
+        logger.error(f"运行验证失败 (exit={result.exit_code})")
+        return ValidationResult(ok=False, error=parse(error_text, lang_name="typescript"), language="typescript")
+
+    logger.success("验证通过（仅编译检查，无需运行）")
+    return ValidationResult(ok=True, language="typescript")
+
+
+def _validate_generic(wd: Path, lang, lang_name: str) -> ValidationResult:
+    """通用验证（JavaScript / Go 等）—— 编译 + 运行入口文件"""
+    entry = _find_entry(wd, lang_name)
+    if entry is None:
+        return ValidationResult(
+            ok=False,
+            error=parse(f"No entry point found for {lang_name}"),
+            language=lang_name,
+        )
+
+    logger.step(f"验证入口文件: {entry.name}")
+
+    if lang.compile_command:
+        compile_cmd = f"{lang.compile_command} {entry.name}"
+        logger.info(f"编译: {compile_cmd}")
+        result = run(compile_cmd, cwd=str(wd))
+        if not result.ok:
+            error_text = result.stderr.strip() or result.stdout.strip() or "Compilation failed"
+            logger.error("编译验证失败")
+            return ValidationResult(ok=False, error=parse(error_text, lang_name=lang_name), language=lang_name)
+
+    if lang.run_command:
+        run_cmd = f"{lang.run_command} {entry.name}"
+        logger.info(f"运行: {run_cmd}")
+        result = run(run_cmd, cwd=str(wd))
+        if result.ok:
+            logger.success("运行验证通过")
+            return ValidationResult(ok=True, language=lang_name)
+        error_text = result.stderr.strip() or result.stdout.strip() or f"Runtime error (exit={result.exit_code})"
+        logger.error(f"运行验证失败 (exit={result.exit_code})")
+        return ValidationResult(ok=False, error=parse(error_text, lang_name=lang_name), language=lang_name)
+
+    logger.success("验证通过（仅编译检查，无需运行）")
+    return ValidationResult(ok=True, language=lang_name)
