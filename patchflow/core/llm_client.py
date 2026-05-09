@@ -32,6 +32,7 @@ def call_llm(
     model: str | None = None,
     max_tokens: int = 4096,
     model_alias: str | None = None,
+    budget=None,
 ) -> dict | None:
     """调用 LLM API（自动根据 provider 选择底层 SDK）
 
@@ -52,6 +53,7 @@ def call_llm(
         model_alias:   模型别名（如 "deepseek"、"claude"），
                        指定后覆盖 provider/api_key/api_base
                        用于多 Agent 场景：不同角色用不同模型
+        budget:        可选的 TokenBudget 实例，用于追踪和限制 token 消耗
 
     Returns:
         dict: 解析后的 JSON 结果，或 None（所有重试都失败时）
@@ -79,6 +81,34 @@ def call_llm(
         logger.error("设置方式: patchflow config set api_key <your-key>")
         return None
 
+    # Token 预算检查 — 优先使用传入的 budget，否则检查会话级全局预算
+    if budget is None:
+        try:
+            from patchflow.core.fix.budget import get_session_budget
+            budget = get_session_budget()
+        except Exception:
+            pass
+    agent_name = model_alias or "llm"
+    if budget is not None:
+        estimated_input = (len(system_prompt) + len(user_message)) // 4 + max_tokens
+        blocked = budget.check(estimated_input)
+        if blocked:
+            logger.error(f"[TokenBudget] 调用被预算拦截: {blocked}")
+            return None
+
+    # Prompt 注入防御 — 扫描 user_message
+    try:
+        from patchflow.core.fix.prompt_guard import scan as scan_injection
+        injection = scan_injection(user_message, source="llm_user_message")
+        if injection.blocked:
+            logger.error(f"[PromptGuard] 用户消息被拦截: {injection.reason}")
+            return None
+        if injection.suspicious and injection.sanitized:
+            logger.warn(f"[PromptGuard] 用户消息已清洗: {injection.reason}")
+            user_message = injection.sanitized
+    except Exception:
+        pass
+
     last_error = None
     max_attempts = 3
 
@@ -87,9 +117,14 @@ def call_llm(
             if provider in ("deepseek", "openai"):
                 result = _call_openai_compat(system_prompt, user_message, model, max_tokens, api_key, api_base, provider)
             else:
-                result = _call_anthropic(system_prompt, user_message, model, max_tokens, api_key)
+                result = _call_anthropic(system_prompt, user_message, model, max_tokens, api_key, api_base)
 
             if result is not None:
+                if budget is not None:
+                    estimated_input = (len(system_prompt) + len(user_message)) // 4
+                    estimated_output = len(str(result)) // 4
+                    budget.track_call(agent_name, estimated_input,
+                                     estimated_output, model or "")
                 return result
 
             if attempt < max_attempts - 1:
@@ -116,9 +151,16 @@ def call_llm(
     return None
 
 
-def _call_anthropic(system_prompt, user_message, model, max_tokens, api_key) -> dict | None:
+def _call_anthropic(system_prompt, user_message, model, max_tokens, api_key, api_base="") -> dict | None:
     """通过 Anthropic 原生 SDK 调用"""
-    client = Anthropic(api_key=api_key)
+    base_url = api_base or None
+    if base_url:
+        base_url = base_url.rstrip("/")
+        if base_url.endswith("/v1/messages"):
+            base_url = base_url[:-len("/v1/messages")]
+        elif base_url.endswith("/v1"):
+            base_url = base_url[:-len("/v1")]
+    client = Anthropic(api_key=api_key, base_url=base_url)
 
     try:
         logger.llm(f"[anthropic] 调用 {model}...")
