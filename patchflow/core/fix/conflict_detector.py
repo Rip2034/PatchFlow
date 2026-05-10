@@ -28,8 +28,6 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
-import tree_sitter
-
 # 语言名 → (grammar 模块名, 备选模块名)
 _TS_GRAMMAR_PACKAGES: dict[str, tuple[str, ...]] = {
     "python": ("tree_sitter_python",),
@@ -46,7 +44,7 @@ _TS_GRAMMAR_PACKAGES: dict[str, tuple[str, ...]] = {
 }
 
 # Parser 缓存：避免每次解析都重建 Parser
-_TS_PARSER_CACHE: dict[str, "tree_sitter.Parser"] = {}
+_TS_PARSER_CACHE: dict = {}
 
 
 def _get_ts_parser(lang_name: str):
@@ -59,6 +57,11 @@ def _get_ts_parser(lang_name: str):
         return None
 
     import importlib
+
+    try:
+        import tree_sitter
+    except ImportError:
+        return None
 
     for pkg_name in pkg_names:
         try:
