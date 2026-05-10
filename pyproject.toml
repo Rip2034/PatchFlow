@@ -20,6 +20,9 @@ dependencies = [
     "numpy>=1.24",
 ]
 
+[tool.setuptools.packages.find]
+include = ["patchflow*"]
+
 [project.scripts]
 patchflow = "patchflow.cli:main"
 
