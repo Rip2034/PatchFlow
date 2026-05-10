@@ -13,10 +13,9 @@
   - 敏感路径阻断 — .env、credentials、系统目录等直接拦截
 """
 
-import os
 import re
-from pathlib import Path
 from copy import deepcopy
+from pathlib import Path
 
 from patchflow.utils import logger
 

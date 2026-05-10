@@ -14,9 +14,8 @@
   修坏了 → rollback → 回到修之前的状态。
 """
 
-import os
-import shutil
 import json
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -79,7 +78,7 @@ class SnapshotManager:
 
         # 读取元数据
         meta_file = snapshot_path / "meta.json"
-        with open(meta_file, "r", encoding="utf-8") as f:
+        with open(meta_file, encoding="utf-8") as f:
             meta = json.load(f)
 
         for file_path in meta["files"]:

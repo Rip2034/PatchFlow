@@ -22,8 +22,8 @@ LanguageDescriptor 的核心能力：
   - 提供运行/编译命令
 """
 
-import re
 import ast
+import re
 from pathlib import Path
 
 
@@ -242,7 +242,7 @@ def _collect_java_imports(filepath: str, work_dir: str) -> list[str]:
         # 同包内的类引用也添加
         pkg_match = re.search(r'^package\s+([\w.]+)', content, re.MULTILINE)
         if pkg_match:
-            pkg = pkg_match.group(1).replace(".", "/")
+            pkg_match.group(1).replace(".", "/")
             simple_name = fqcn.split(".")[-1] + ".java"
             candidate = Path(filepath).parent / simple_name
             if candidate.exists():
@@ -543,10 +543,10 @@ class LanguageRegistry:
             if frames:
                 return _parse_generic_traceback(frames)
 
-        for l in self._languages.values():
-            if lang and l.name == lang.name:
+        for lang in self._languages.values():
+            if lang and lang.name == lang.name:
                 continue
-            frames = l.parse_traceback(error_text)
+            frames = lang.parse_traceback(error_text)
             if frames:
                 return _parse_generic_traceback(frames)
         return None
@@ -559,10 +559,10 @@ class LanguageRegistry:
                 return (etype, msg)
 
         # 兜底：尝试所有语言
-        for l in self._languages.values():
-            if lang and l.name == lang.name:
+        for lang in self._languages.values():
+            if lang and lang.name == lang.name:
                 continue
-            etype, msg = l.classify_error(error_text)
+            etype, msg = lang.classify_error(error_text)
             if etype != "unknown":
                 return (etype, msg)
         return ("unknown", error_text.strip().split("\n")[-1][:200])

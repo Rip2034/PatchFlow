@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """对话客户端 — 工具调用 + 流式输出(Claude Code 风格)
 
 AI 可以直接 write_file，read_file，run_code，list_files，search_files，search_code。
@@ -7,10 +6,11 @@ AI 可以直接 write_file，read_file，run_code，list_files，search_files，
 
 import json
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
-from openai import OpenAI
+
 from anthropic import Anthropic
+from openai import OpenAI
 
 from patchflow.core.config import get_config, get_normalized_provider
 from patchflow.core.project.context_manager import compress
@@ -305,7 +305,7 @@ def _get_project_skeleton(work_dir: str = ".") -> str:
 
     lines = ["Project Skeleton:"]
     line_count = 0
-    MAX_LINES = 30
+    max_lines = 30
 
     def _should_skip(name: str, is_dir: bool) -> bool:
         if name.startswith("."):
@@ -325,7 +325,6 @@ def _get_project_skeleton(work_dir: str = ".") -> str:
     for e in entries:
         if e.is_dir() and not _should_skip(e.name, True):
             # 只看子目录的第一层
-            sub_files = []
             try:
                 sub_entries = sorted(e.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
             except PermissionError:
@@ -338,7 +337,7 @@ def _get_project_skeleton(work_dir: str = ".") -> str:
 
             lines.append(f"  📁 {e.name}/")
             line_count += 1
-            if line_count >= MAX_LINES:
+            if line_count >= max_lines:
                 break
 
             # 最多再列两层
@@ -350,13 +349,13 @@ def _get_project_skeleton(work_dir: str = ".") -> str:
                 else:
                     lines.append(f"      📄 {sub.name}")
                 line_count += 1
-                if line_count >= MAX_LINES:
+                if line_count >= max_lines:
                     break
 
         elif e.is_file() and e.suffix in (".json", ".toml", ".yml", ".yaml", ".xml", ".gradle", ".properties"):
             lines.append(f"  📄 {e.name}")
             line_count += 1
-            if line_count >= MAX_LINES:
+            if line_count >= max_lines:
                 break
 
     # 根部 README
@@ -369,8 +368,8 @@ def _get_project_skeleton(work_dir: str = ".") -> str:
         lines.insert(1, f"  ({', '.join(project_type_hints)})")
         lines.insert(2, "")
 
-    if line_count >= MAX_LINES:
-        lines.append(f"  ... (truncated, use list_files for details)")
+    if line_count >= max_lines:
+        lines.append("  ... (truncated, use list_files for details)")
 
     return "\n".join(lines)
 
@@ -584,9 +583,14 @@ def set_confirm_callback(cb: Callable[[str, str], str] | None):
 
 def _execute_tool(name: str, args: dict,
                   on_run_output: Callable[[str], None] | None = None) -> str:
-    from patchflow.utils.runner import (run, run_live, classify_command,
-                                         is_long_running, start_background,
-                                         add_to_whitelist, add_to_blacklist)
+    from patchflow.utils.runner import (
+        add_to_blacklist,
+        add_to_whitelist,
+        classify_command,
+        is_long_running,
+        run_live,
+        start_background,
+    )
 
     # ── 工具已耗尽 → 静默跳过，不再给 LLM 反复提示 ──
     if _is_tool_exhausted(name):
@@ -649,7 +653,7 @@ def _execute_tool(name: str, args: dict,
         if not src.exists():
             return f"ERROR: source not found: {source}"
         if ".." in source or ".." in dest:
-            return f"ERROR: path traversal blocked"
+            return "ERROR: path traversal blocked"
         dst.parent.mkdir(parents=True, exist_ok=True)
         src.rename(dst)
         logger.info(f"rename_file: {source} -> {dest}")
@@ -696,24 +700,24 @@ def _execute_tool(name: str, args: dict,
             header = f"[lines {offset}-{end-1} of {total_lines}]\n" if offset > 0 or end < total_lines else ""
             return f"{header}{sliced}"
 
-        READ_MAX = 5000
-        if len(content) <= READ_MAX:
+        read_max = 5000
+        if len(content) <= read_max:
             return content
 
-        HEAD = 150
-        TAIL = 50
+        head_lines = 150
+        tail_lines = 50
 
-        if total_lines <= HEAD + TAIL:
+        if total_lines <= head_lines + tail_lines:
             return content
 
-        head = "\n".join(lines[:HEAD])
-        tail = "\n".join(lines[-TAIL:])
-        omitted = total_lines - HEAD - TAIL
+        head = "\n".join(lines[:head_lines])
+        tail = "\n".join(lines[-tail_lines:])
+        omitted = total_lines - head_lines - tail_lines
         return (
-            f"[lines 0-{HEAD-1} of {total_lines}]\n"
+            f"[lines 0-{head_lines-1} of {total_lines}]\n"
             f"{head}\n\n"
-            f"# ... [truncated {omitted} lines — use read_file with offset={HEAD},limit=N to continue] ...\n\n"
-            f"[lines {total_lines-TAIL}-{total_lines-1} of {total_lines}]\n"
+            f"# ... [truncated {omitted} lines — use read_file with offset={head_lines},limit=N to continue] ...\n\n"
+            f"[lines {total_lines-tail_lines}-{total_lines-1} of {total_lines}]\n"
             f"{tail}"
         )
 
@@ -760,7 +764,7 @@ def _execute_tool(name: str, args: dict,
                 elif decision == "blacklist":
                     add_to_blacklist(command)
                     logger.info(f"run_code BLACKLISTED: {command}")
-                    return f"BLOCKED: 已将该命令加入黑名单，后续自动拦截"
+                    return "BLOCKED: 已将该命令加入黑名单，后续自动拦截"
         # 长驻命令 → 后台运行
         if is_long_running(command):
             logger.info(f"run_code (background): {command}")
@@ -805,7 +809,7 @@ def _execute_tool(name: str, args: dict,
         if not p.exists():
             return f"ERROR: path not found: {dirpath}"
 
-        IGNORE_DIRS = {
+        ignore_dirs = {
             ".git", "node_modules", "__pycache__", ".idea", ".vscode",
             ".venv", "venv", ".env", "build", "dist", ".next", ".nuxt",
             ".turbo", "target", ".tox", ".eggs", "*.egg-info",
@@ -814,15 +818,15 @@ def _execute_tool(name: str, args: dict,
         def _should_ignore(name: str, is_dir: bool) -> bool:
             if name.startswith(".") and name not in (".env", ".gitignore", ".gitattributes"):
                 return True
-            if is_dir and name in IGNORE_DIRS:
+            if is_dir and name in ignore_dirs:
                 return True
             return False
 
         tree_lines = []
-        DIR_LIMIT = 5
-        FILE_HEAD = 3
-        FILE_TAIL = 2
-        MAX_TREE_LINES = 25
+        dir_limit = 5
+        file_head_var = 3
+        file_tail_var = 2
+        max_tree_lines = 25
         line_count = [0]
 
         def _add(line: str):
@@ -830,7 +834,7 @@ def _execute_tool(name: str, args: dict,
             line_count[0] += 1
 
         def _walk(d: Path, prefix: str, depth: int):
-            if depth > max_depth or line_count[0] >= MAX_TREE_LINES:
+            if depth > max_depth or line_count[0] >= max_tree_lines:
                 return
 
             try:
@@ -872,17 +876,17 @@ def _execute_tool(name: str, args: dict,
                     _walk(cur, prefix + "    ", cur_depth + 1)
                 return
 
-            items = list(dirs[:DIR_LIMIT])
-            omitted_dirs = len(dirs) - DIR_LIMIT if len(dirs) > DIR_LIMIT else 0
+            items = list(dirs[:dir_limit])
+            omitted_dirs = len(dirs) - dir_limit if len(dirs) > dir_limit else 0
 
-            if len(files) <= FILE_HEAD + FILE_TAIL:
+            if len(files) <= file_head_var + file_tail_var:
                 items.extend(files)
                 omitted_files = 0
             else:
-                items.extend(files[:FILE_HEAD])
-                omitted_files = len(files) - FILE_HEAD - FILE_TAIL
+                items.extend(files[:file_head_var])
+                omitted_files = len(files) - file_head_var - file_tail_var
                 items.append("__OMIT__")
-                items.extend(files[-FILE_TAIL:])
+                items.extend(files[-file_tail_var:])
 
             last_real = len(items) - 1
             while last_real >= 0 and isinstance(items[last_real], str):
@@ -909,8 +913,8 @@ def _execute_tool(name: str, args: dict,
                 _add(f"{prefix}  ... ({omitted_dirs} dirs omitted)")
 
         _walk(p, "", 0)
-        if line_count[0] >= MAX_TREE_LINES:
-            tree_lines.append(f"  ... ({line_count[0] - 1}+ items, showing first {MAX_TREE_LINES})")
+        if line_count[0] >= max_tree_lines:
+            tree_lines.append(f"  ... ({line_count[0] - 1}+ items, showing first {max_tree_lines})")
         return "\n".join(tree_lines)
 
     elif name == "search_files":
@@ -936,6 +940,7 @@ def _execute_tool(name: str, args: dict,
     elif name == "review_code":
         filepath = args.get("filepath", "")
         import threading
+
         from patchflow.utils.code_reviewer import review_file
         review_result = []
         t = threading.Thread(target=lambda: review_result.append(review_file(filepath)))
@@ -1124,14 +1129,14 @@ class ChatClient:
 
     def _append_assistant(self, text, tcs):
         """把 assistant 回复 + 工具结果追加到消息历史"""
-        MAX_RESULT_CHARS = 1000
+        max_result_chars = 1000
 
         def _truncate(content: str) -> str:
-            if len(content) <= MAX_RESULT_CHARS:
+            if len(content) <= max_result_chars:
                 return content
             head = content[:500]
             tail = content[-250:]
-            return f"{head}\n\n... [truncated {len(content) - MAX_RESULT_CHARS} chars, full result in REPL] ...\n\n{tail}"
+            return f"{head}\n\n... [truncated {len(content) - max_result_chars} chars, full result in REPL] ...\n\n{tail}"
 
         if self._openai:
             # OpenAI 格式
@@ -1257,7 +1262,7 @@ class ChatClient:
                 stream_options={"include_usage": True},
             )
 
-            stream_start = time.time()
+            time.time()
             for chunk in response:
                 if time.time() - stream_deadline > 0:
                     logger.warning("OpenAI streaming total time > 45s, breaking out")
@@ -1626,8 +1631,3 @@ class ChatClient:
             lines.append(f"  #{round_idx:<2}  {round_tok:>5} tok  {user_preview}{tool_str}")
 
         return "\n".join(lines)
-
-    def get_summary(self) -> str:
-        user_count = sum(1 for m in self.messages if m["role"] == "user")
-        assistant_count = sum(1 for m in self.messages if m["role"] == "assistant")        
-        return f"对话: {user_count} 用户消息, {assistant_count} AI 回复"

@@ -10,11 +10,11 @@
   Phase 1: 生成代码
     - 收集项目上下文（技术栈、依赖、代码风格）
     - 调用 LLM Generator 生成代码文件
-  
+
   Phase 2: 保存快照
     - 记录修改前的文件内容（安全网，失败后回滚）
     - 生成原始/修改后的 diff 报告
-  
+
   Phase 3: 验证 + 修复循环（核心）
     1. 运行代码 → 如果通过 → 成功结束
     2. 报错 → ErrorAnalyzer 分析根因
@@ -32,15 +32,16 @@ V0.4 增强特性：
 
 from pathlib import Path
 
-from patchflow.core.fix.generator import generate, write_files
-from patchflow.core.fix.validator import validate
 from patchflow.core.analysis.error_analyzer import analyze as analyze_error
-from patchflow.core.fix.scope_calculator import DepGraph, calculate as calculate_scope
 from patchflow.core.analysis.strategy_selector import select_strategy, strategy_sequence
-from patchflow.core.fix.fixer import fix, apply_fix
-from patchflow.core.fix.snapshot_manager import SnapshotManager
-from patchflow.core.project.context_collector import ContextCollector, build_context_prompt
 from patchflow.core.fix.breaker import FixLoopBreaker
+from patchflow.core.fix.fixer import apply_fix, fix
+from patchflow.core.fix.generator import generate, write_files
+from patchflow.core.fix.scope_calculator import DepGraph
+from patchflow.core.fix.scope_calculator import calculate as calculate_scope
+from patchflow.core.fix.snapshot_manager import SnapshotManager
+from patchflow.core.fix.validator import validate
+from patchflow.core.project.context_collector import ContextCollector, build_context_prompt
 from patchflow.utils import logger
 from patchflow.utils.diff import diff_text, format_summary
 
@@ -106,6 +107,27 @@ class Orchestrator:
         logger.info(f"  最大重试: {self.max_retries}")
         logger.info("=" * 50)
 
+        # Prompt 注入扫描
+        try:
+            from patchflow.core.fix.prompt_guard import scan as scan_injection
+            injection = scan_injection(task, source="orchestrator_task")
+            if injection.blocked:
+                logger.error(f"[PromptGuard] 任务被拦截: {injection.reason}")
+                return False
+            if injection.suspicious and injection.sanitized:
+                logger.warn(f"[PromptGuard] 任务已清洗: {injection.reason}")
+                task = injection.sanitized
+        except Exception:
+            pass
+
+        # 启动会话级 Token 预算追踪
+        try:
+            from patchflow.core.fix.budget import start_session_budget
+            self._budget = start_session_budget()
+            logger.info(f"  Token Budget: {self._budget.limit}")
+        except Exception:
+            self._budget = None
+
         context_prompt = self._get_context_prompt()
         logger.info(f"  Context: {self.work_dir}")
 
@@ -141,6 +163,8 @@ class Orchestrator:
                 logger.success(f"验证通过！经过 {self.breaker.turn} 轮修复")
                 if self._diff_report:
                     logger.info(f"  变更: {self.diff_summary}")
+                if self._budget:
+                    logger.info(f"  {self._budget.summary()}")
                 return True
 
             logger.warn(f"第 {self.breaker.turn + 1} 轮验证失败")
@@ -185,8 +209,8 @@ class Orchestrator:
             if self.state["turn"] == 0:
                 try:
                     self.dep_graph.build()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Dep graph 构建失败（非致命）: {e}")
 
             # 计算受影响的文件范围
             scope_result = calculate_scope(analysis, dep_graph=self.dep_graph)
@@ -252,6 +276,8 @@ class Orchestrator:
         if self.state.get("strategy_tried"):
             logger.info(f"已尝试策略: {', '.join(self.state['strategy_tried'])}")
         self.snapshot.rollback(self.state["snapshot_id"])
+        if self._budget:
+            logger.info(f"  {self._budget.summary()}")
         return False
 
     def _generate_diff_report(self, original_files: dict[str, str]):

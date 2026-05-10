@@ -143,5 +143,6 @@ def validate_review(data: dict) -> dict:
   }
   if not result["summary"]:
     status = "approved" if result["approved"] else "rejected"
-    result["summary"] = f"{status} ({result['score']}/10): {result['issues'][0][:80] if result['issues'] else 'no issues'}"
+    issue_text = result['issues'][0][:80] if result['issues'] else 'no issues'
+    result["summary"] = f"{status} ({result['score']}/10): {issue_text}"
   return result

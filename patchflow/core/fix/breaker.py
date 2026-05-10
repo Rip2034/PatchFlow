@@ -9,7 +9,6 @@
   3. 同一策略连续失败 M 次 → 自动升级策略
 """
 
-from patchflow.utils import logger
 
 
 class FixLoopBreaker:

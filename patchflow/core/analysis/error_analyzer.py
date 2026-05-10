@@ -13,8 +13,8 @@
 支持的语言：Python / JavaScript / TypeScript / Java / Go / Rust
 """
 
-from patchflow.core.language_registry import LanguageRegistry
 from patchflow.core.analysis.error_parser import parse as fallback_parse
+from patchflow.core.language_registry import LanguageRegistry
 
 
 class ErrorAnalysis:

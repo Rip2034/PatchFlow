@@ -6,9 +6,9 @@
 输出格式统一用 schema.py 定义的标准合约。
 """
 
+from patchflow.agents.schema import ANALYZER_PROMPT, validate_analysis
 from patchflow.core.llm_client import call_llm
 from patchflow.utils import logger
-from patchflow.agents.schema import ANALYZER_PROMPT, validate_analysis
 
 
 def agent_analyze(blackboard, model: str | None = None, model_alias: str | None = None) -> dict:

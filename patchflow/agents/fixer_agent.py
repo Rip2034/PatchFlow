@@ -8,12 +8,12 @@
 
 from pathlib import Path
 
-from patchflow.core.llm_client import call_llm
-from patchflow.core.fix.scope_calculator import calculate as calculate_scope
-from patchflow.core.analysis.strategy_selector import select_strategy
-from patchflow.core.analysis.error_analyzer import ErrorAnalysis
-from patchflow.utils import logger
 from patchflow.agents.schema import FIXER_PROMPT, validate_fix_plan
+from patchflow.core.analysis.error_analyzer import ErrorAnalysis
+from patchflow.core.analysis.strategy_selector import select_strategy
+from patchflow.core.fix.scope_calculator import calculate as calculate_scope
+from patchflow.core.llm_client import call_llm
+from patchflow.utils import logger
 
 
 def agent_fix(blackboard, dep_graph=None, model: str | None = None, model_alias: str | None = None) -> dict:

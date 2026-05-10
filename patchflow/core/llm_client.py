@@ -19,8 +19,9 @@ V0.4 增强：指数退避重试机制
 
 import json
 import time
-from openai import OpenAI
+
 from anthropic import Anthropic
+from openai import OpenAI
 
 from patchflow.core.config import get_config
 from patchflow.utils import logger
@@ -60,7 +61,7 @@ def call_llm(
     """
     # 如果指定了别名，从别名配置读取 provider/api_key/api_base
     if model_alias:
-        from patchflow.core.config import _user_config_dir, _load_json
+        from patchflow.core.config import _load_json, _user_config_dir
         user_cfg = _load_json(_user_config_dir() / "config.json")
         alias_cfg = user_cfg.get("models", {}).get(model_alias, {})
         provider = alias_cfg.get("provider", "")
@@ -109,13 +110,14 @@ def call_llm(
     except Exception:
         pass
 
-    last_error = None
     max_attempts = 3
 
     for attempt in range(max_attempts):
         try:
             if provider in ("deepseek", "openai"):
-                result = _call_openai_compat(system_prompt, user_message, model, max_tokens, api_key, api_base, provider)
+                result = _call_openai_compat(
+                    system_prompt, user_message, model, max_tokens, api_key, api_base, provider
+                )
             else:
                 result = _call_anthropic(system_prompt, user_message, model, max_tokens, api_key, api_base)
 
@@ -133,7 +135,6 @@ def call_llm(
                 time.sleep(wait)
 
         except Exception as e:
-            last_error = e
             error_str = str(e).lower()
 
             # 认证类错误不重试（API Key 无效、未授权等），立即返回
@@ -253,7 +254,7 @@ def _parse_json(text: str) -> dict | None:
     if repaired is not None:
         return repaired
 
-    logger.error(f"LLM 返回的不是有效 JSON")
+    logger.error("LLM 返回的不是有效 JSON")
     logger.error(f"原始返回: {text[:500]}")
     return None
 

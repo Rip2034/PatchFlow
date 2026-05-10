@@ -10,11 +10,9 @@ AI 可以在阅读代码后主动调用，而不是等运行报错。
 
 import re
 from pathlib import Path
-from typing import Optional
 
-from patchflow.utils.runner import run
 from patchflow.utils import logger
-
+from patchflow.utils.runner import run
 
 LINT_CACHE: dict[str, list[dict]] = {}
 REVIEW_ISSUES: list[dict] = []
@@ -35,7 +33,7 @@ def review_file(filepath: str, work_dir: str = ".") -> str:
 
     content = fp.read_text(encoding="utf-8", errors="replace")
     ext = fp.suffix.lower()
-    lang = _detect_lang(ext)
+    _detect_lang(ext)
     issues: list[dict] = []
 
     # 1. Linter 检查（尽力而为，失败不阻断）
@@ -50,9 +48,9 @@ def review_file(filepath: str, work_dir: str = ".") -> str:
         return f"review_code: {filepath} — 未发现明显问题"
 
     # 格式化输出（最多显示 5 个问题，防止上下文爆炸）
-    MAX_SHOWN = 5
+    max_shown = 5
     lines = [f"{filepath} — 发现 {len(issues)} 个问题:"]
-    for i, issue in enumerate(issues[:MAX_SHOWN], 1):
+    for i, issue in enumerate(issues[:max_shown], 1):
         severity = issue.get("severity", "info")
         sev_mark = "🔴" if severity == "error" else "🟡" if severity == "warning" else "🔵"
         line = issue.get("line", "?")
@@ -63,8 +61,8 @@ def review_file(filepath: str, work_dir: str = ".") -> str:
             lines.append(f"      建议: {suggestion}")
         if issue.get("code"):
             lines.append(f"      代码: {issue['code']}")
-    if len(issues) > MAX_SHOWN:
-        lines.append(f"  ... 还有 {len(issues) - MAX_SHOWN} 个问题（已截断）")
+    if len(issues) > max_shown:
+        lines.append(f"  ... 还有 {len(issues) - max_shown} 个问题（已截断）")
 
     return "\n".join(lines)
 
@@ -122,7 +120,9 @@ def _run_linter(filepath: str, ext: str, work_dir: str) -> list[dict]:
 def _run_pylint(filepath: str, work_dir: str) -> list[dict]:
     """运行 pylint，失败则静默降级"""
     try:
-        import pylint
+        import importlib.util
+        if importlib.util.find_spec('pylint') is None:
+            raise ImportError
     except ImportError:
         return _basic_python_check(filepath, work_dir)
 

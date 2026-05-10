@@ -17,16 +17,13 @@ Planner 先让 LLM 输出分步计划，用户确认后逐步执行。
   5. 全部完成后最终验证
 """
 
-import time
 from dataclasses import dataclass, field
-from pathlib import Path
 
-from patchflow.core.llm_client import call_llm
 from patchflow.core.fix.generator import generate, write_files
 from patchflow.core.fix.validator import validate
+from patchflow.core.llm_client import call_llm
 from patchflow.core.project.context_collector import ContextCollector, build_context_prompt
 from patchflow.utils import logger
-
 
 PLANNER_PROMPT = """You are a software architect. Given a task description, break it down into a structured, step-by-step plan.
 
@@ -87,7 +84,6 @@ def _format_plan_preview(plan: Plan) -> str:
     lines.append(f"  [dim]共 {len(plan.steps)} 步[/dim]")
     lines.append("")
     for s in plan.steps:
-        status_icon = "o" if s.status == "pending" else "v" if s.status == "completed" else "x" if s.status == "failed" else ""
         files_hint = f"  → {', '.join(s.files_expected[:3])}" if s.files_expected else ""
         lines.append(f"  {s.step}. {s.title}{files_hint}")
         lines.append(f"     [dim]{s.description}[/dim]")

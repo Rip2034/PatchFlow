@@ -16,7 +16,6 @@ from pathlib import Path
 from patchflow.core.llm_client import call_llm
 from patchflow.utils import logger
 
-
 GENERATE_SYSTEM_PROMPT = """You are a coding agent. Your task is to generate code that fits into an existing project.
 
 RULES:

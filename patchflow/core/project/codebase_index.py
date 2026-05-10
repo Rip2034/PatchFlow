@@ -20,7 +20,6 @@ import json
 import re
 import time
 from pathlib import Path
-from collections import defaultdict
 
 from patchflow.core.config import get_config
 from patchflow.utils import logger
@@ -314,7 +313,7 @@ def _ensure_gitignore(work_dir: str = "."):
         return
     if not gitignore.exists():
         gitignore.write_text(".patchflow/\n", encoding="utf-8")
-        logger.info(f"已创建 .gitignore 并添加 .patchflow/")
+        logger.info("已创建 .gitignore 并添加 .patchflow/")
         return
     content = gitignore.read_text(encoding="utf-8")
     for line in content.split("\n"):
@@ -322,7 +321,7 @@ def _ensure_gitignore(work_dir: str = "."):
             return
     with open(gitignore, "a", encoding="utf-8") as f:
         f.write("\n.patchflow/\n")
-    logger.info(f"已添加 .patchflow/ 到 .gitignore")
+    logger.info("已添加 .patchflow/ 到 .gitignore")
 
 
 # ═══════════════════════════════════════════════════════════

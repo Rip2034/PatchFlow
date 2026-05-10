@@ -24,12 +24,10 @@
   所有 get() / set_*() 调用自动打日志，用于 CLI 可视化。
 """
 
-import json
 import time
 from copy import deepcopy
 
-from patchflow.agents.schema import validate_analysis, validate_fix_plan, validate_review
-from patchflow.agents.schema import ANALYSIS_KEYS, FIX_PLAN_KEYS, REVIEW_KEYS
+from patchflow.agents.schema import ANALYSIS_KEYS, validate_analysis, validate_fix_plan, validate_review
 
 
 class Blackboard:

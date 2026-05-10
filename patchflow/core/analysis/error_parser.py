@@ -53,8 +53,8 @@ def parse(raw_error: str, lang_name: str | None = None) -> ParsedError:
         detected_lang = lang.name
     else:
         detected_lang = ""
-        for name, l in reg.all().items():
-            for pf in l.project_files:
+        for name, lang in reg.all().items():
+            for pf in lang.project_files:
                 from pathlib import Path
                 if Path(pf).exists():
                     detected_lang = name
@@ -70,6 +70,10 @@ def parse(raw_error: str, lang_name: str | None = None) -> ParsedError:
         line=error_line,
         error_type=error_type,
         message=message,
-        call_chain=traceback_frames or [{"file": error_file, "line": error_line, "function": "", "role": "crash_site"}] if error_file else [],
+        call_chain=(
+            traceback_frames
+            or [{"file": error_file, "line": error_line, "function": "", "role": "crash_site"}]
+            if error_file else []
+        ),
         language=detected_lang,
     )

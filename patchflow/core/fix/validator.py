@@ -8,10 +8,10 @@
 
 from pathlib import Path
 
+from patchflow.core.analysis.error_parser import ParsedError, parse
 from patchflow.core.language_registry import LanguageRegistry
-from patchflow.utils.runner import run
-from patchflow.core.analysis.error_parser import parse, ParsedError
 from patchflow.utils import logger
+from patchflow.utils.runner import run
 
 
 class ValidationResult:
@@ -60,8 +60,8 @@ def validate(work_dir: str = ".") -> ValidationResult:
     lang_name = lang.name if lang else "unknown"
 
     if lang_name == "unknown":
-        logger.info(f"项目类型: unknown，无法确定语言，跳过验证")
-        return ValidationResult(ok=True, message=f"未知项目类型，跳过验证", language=lang_name)
+        logger.info("项目类型: unknown，无法确定语言，跳过验证")
+        return ValidationResult(ok=True, message="未知项目类型，跳过验证", language=lang_name)
 
     if lang_name == "python":
         return _validate_python(wd, lang)

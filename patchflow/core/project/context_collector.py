@@ -23,12 +23,11 @@
 当前实现只做了 Layer 1（确定性扫描），Layer 2/3 预留接口。
 """
 
-import json
-import os
-import re
 import ast
-from pathlib import Path
+import json
+import re
 from datetime import datetime
+from pathlib import Path
 
 from patchflow.core.language_registry import LanguageRegistry
 from patchflow.utils import logger
@@ -599,7 +598,6 @@ class ContextCollector:
 
 def build_context_prompt(context: ProjectContext) -> str:
     """把项目上下文格式化为 LLM prompt 段"""
-    parts = []
     p = context.project
 
     lines = ["=== Project Context ==="]

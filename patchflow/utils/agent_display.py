@@ -4,12 +4,11 @@
 """
 
 import time
+
+from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
-from rich.console import Group, Console
-from patchflow.utils import logger
-
 
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 

@@ -67,7 +67,9 @@ class DepGraph:
         if extensions is None and lang:
             extensions = lang.extensions
         if extensions is None:
-            extensions = {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".rb", ".php", ".cs", ".swift", ".kt"}
+            extensions = {
+                ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".rb", ".php", ".cs", ".swift", ".kt"
+            }
 
         for filepath in self.work_dir.rglob("*"):
             if filepath.suffix.lower() not in extensions:

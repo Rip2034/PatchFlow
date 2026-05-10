@@ -25,8 +25,8 @@
 import ast
 import json
 import re
-from pathlib import Path
 from collections import defaultdict
+from pathlib import Path
 
 import tree_sitter
 
@@ -425,7 +425,8 @@ class LazyConflictDetector:
             return entities
 
         # 2. Python 内置 AST（回退，无需 tree-sitter）
-        if ext in ("py", "pyw"):
+        # 当 ext 为空或为 Python 扩展名时尝试
+        if ext in ("py", "pyw", ""):
             try:
                 tree = ast.parse(content)
                 result: list[tuple[str, str]] = []
@@ -469,7 +470,7 @@ class LazyConflictDetector:
             r'^\s*type\s+(\w+)\s+(struct|interface)',
             content, re.MULTILINE,
         ):
-            key = (m.group(1), m.group(2))
+            key = (m.group(1), f"go_{m.group(2)}")
             if key not in entities:
                 entities.append(key)
 
@@ -478,7 +479,7 @@ class LazyConflictDetector:
             r'^\s*(?:pub\s+)?(struct|enum|trait|impl)\s+(\w+)',
             content, re.MULTILINE,
         ):
-            key = (m.group(2), m.group(1))
+            key = (m.group(2), f"rust_{m.group(1)}")
             if key not in entities:
                 entities.append(key)
 

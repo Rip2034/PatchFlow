@@ -28,14 +28,13 @@ AgentOrchestrator 使用多个独立 Agent 协作完成修复：
   - 降低耦合，方便将来替换或增加新的 Agent
 """
 
-import os
 from pathlib import Path
 
-from patchflow.utils import logger
-from patchflow.utils.diff import diff_text, format_summary
-from patchflow.utils.agent_display import AgentPipelineDisplay, _get_model_display
-from patchflow.core.fix.snapshot_manager import SnapshotManager
 from patchflow.core.fix.scope_calculator import DepGraph
+from patchflow.core.fix.snapshot_manager import SnapshotManager
+from patchflow.utils import logger
+from patchflow.utils.agent_display import AgentPipelineDisplay, _get_model_display
+from patchflow.utils.diff import diff_text, format_summary
 
 
 class AgentOrchestrator:
@@ -72,11 +71,11 @@ class AgentOrchestrator:
             True → 修复通过，False → 修复失败
         """
         wd = work_dir or self.work_dir
-        logger.info(f"[AgentOrch] run_from_task: 自动收集项目上下文...")
+        logger.info("[AgentOrch] run_from_task: 自动收集项目上下文...")
 
         # 1. 收集项目上下文
-        from patchflow.core.project.context_collector import ContextCollector
         from patchflow.core.language_registry import LanguageRegistry
+        from patchflow.core.project.context_collector import ContextCollector
         collector = ContextCollector(wd)
         ctx = collector.collect(use_cache=True)
 
@@ -163,7 +162,7 @@ class AgentOrchestrator:
 
         # ── 提取关键信息用于显示 ──
         error_text = blackboard.get("error", "")
-        error_first_line = error_text.split("\n")[0][:80] if error_text else "N/A"
+        error_text.split("\n")[0][:80] if error_text else "N/A"
         task_text = blackboard.get("task", "")[:60]
         code_files = list(blackboard.get("code", {}).keys())
         files_preview = ", ".join(code_files[:5]) if code_files else "(none)"
@@ -324,7 +323,7 @@ class AgentOrchestrator:
             return True
 
         # 验证失败 → 回滚
-        logger.error(f"[AgentOrch] 验证失败，回滚")
+        logger.error("[AgentOrch] 验证失败，回滚")
         display.finish(False)
         self.snapshot.rollback(snap_id)
         return False

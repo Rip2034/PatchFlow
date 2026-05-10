@@ -14,15 +14,12 @@
   - 黑名单命令直接拦截，无需询问
 """
 
+import signal
 import subprocess
 import sys
 import threading
 import time
-import signal
-from typing import Callable
-
-from patchflow.utils import logger
-
+from collections.abc import Callable
 
 DANGEROUS_LEVEL_1 = [
     "rm -rf /", "rm -rf /*",
@@ -71,7 +68,7 @@ def _load_safe_list():
     import json
     f = _get_safe_file()
     try:
-        with open(f, "r", encoding="utf-8") as fp:
+        with open(f, encoding="utf-8") as fp:
             data = json.load(fp)
             _whitelist.clear()
             _whitelist.update(data.get("whitelist", []))
@@ -190,7 +187,7 @@ def classify_command(command: str) -> tuple[str, str | None]:
     """
     # 黑名单优先
     if is_blacklisted(command):
-        return ("block", f"该命令已被用户加入黑名单")
+        return ("block", "该命令已被用户加入黑名单")
 
     # 白名单跳过检查
     if is_whitelisted(command):
@@ -375,10 +372,10 @@ class BackgroundProcess:
     def get_logs(self, tail: int = 20) -> str:
         with self._lock:
             lines = []
-            for l in self.stdout_log:
-                lines.append(l)
-            for l in self.stderr_log:
-                lines.append(f"[stderr] {l}")
+            for line in self.stdout_log:
+                lines.append(line)
+            for line in self.stderr_log:
+                lines.append(f"[stderr] {line}")
             if tail and len(lines) > tail:
                 lines = lines[-tail:]
             return "\n".join(lines)

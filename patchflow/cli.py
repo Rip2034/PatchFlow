@@ -16,7 +16,6 @@
   patchflow config set ...     → 管理配置
 """
 
-import sys
 import click
 
 from patchflow.utils import logger
@@ -109,8 +108,8 @@ def build(task: str, model: str | None, max_retries: int | None, work_dir: str):
       patchflow build "创建一个 FastAPI 登录 API"
       patchflow build "写一个 Python 爬虫抓取网页标题" -m claude-sonnet-4-20250514
     """
-    from patchflow.core.orchestrator import Orchestrator
     from patchflow.core.config import get_config
+    from patchflow.core.orchestrator import Orchestrator
 
     cfg = get_config()
 
@@ -164,11 +163,12 @@ def plan(task: str, model: str | None, work_dir: str, yes: bool):
       patchflow plan "创建一个 FastAPI TODO 应用"
       patchflow plan "搭建 React+Express 全栈项目" -y
     """
-    from patchflow.core.planner import PlanExecutor
-    from patchflow.core.fix.validator import validate
     from rich.console import Console
     from rich.table import Table
+
     from patchflow.core.config import get_config
+    from patchflow.core.fix.validator import validate
+    from patchflow.core.planner import PlanExecutor
 
     cfg = get_config()
     model = model or cfg["model"]
@@ -327,7 +327,7 @@ def config_set(key: str, value: str):
     try:
         set_user_config(key, value)
         logger.success(f"已设置 {key} = {display_value}")
-        logger.info(f"配置文件位置: ~/.patchflow/config.json")
+        logger.info("配置文件位置: ~/.patchflow/config.json")
     except ValueError as e:
         logger.error(str(e))
 
@@ -335,7 +335,7 @@ def config_set(key: str, value: str):
 @config.command("show")
 def config_show():
     """查看当前配置"""
-    from patchflow.core.config import list_models, get_config
+    from patchflow.core.config import get_config, list_models
 
     cfg = get_config()
     models = list_models()
@@ -356,7 +356,7 @@ def config_show():
     if agents_cfg:
         any_mapped = any(v for v in agents_cfg.values())
         if any_mapped:
-            click.echo(f"  多 Agent 角色映射:")
+            click.echo("  多 Agent 角色映射:")
             for role, alias in agents_cfg.items():
                 if alias:
                     click.echo(f"    {role}: [{alias}]")
@@ -378,7 +378,7 @@ def config_show():
 @config.command("init")
 def config_init():
     """交互式首次配置 — 设置模型和 Agent"""
-    from patchflow.core.config import _user_config_dir, _save_json, _load_json, PROVIDER_DEFAULTS
+    from patchflow.core.config import PROVIDER_DEFAULTS, _load_json, _save_json, _user_config_dir
 
     click.echo()
     click.echo("  PatchFlow 首次配置")
@@ -436,20 +436,20 @@ def config_init():
     _save_json(user_path, cfg)
 
     click.echo()
-    click.echo(f"  [green]配置完成![/green]")
+    click.echo("  [green]配置完成![/green]")
     click.echo(f"    服务商: {provider}")
     click.echo(f"    模型:   [{alias}] {model_name}")
     click.echo(f"    API 地址: {api_base or '（默认）'}")
     click.echo(f"    最大重试: {max_retries} 次")
     click.echo()
     click.echo(f"  三个 Agent（分析/修复/审查）默认都使用 [{alias}] 模型")
-    click.echo(f"  如需为不同 Agent 指定不同模型：")
-    click.echo(f"    [cyan]patchflow config set agents.analyzer <别名>[/cyan]")
-    click.echo(f"    [cyan]patchflow config set agents.fixer <别名>[/cyan]")
-    click.echo(f"    [cyan]patchflow config set agents.reviewer <别名>[/cyan]")
+    click.echo("  如需为不同 Agent 指定不同模型：")
+    click.echo("    [cyan]patchflow config set agents.analyzer <别名>[/cyan]")
+    click.echo("    [cyan]patchflow config set agents.fixer <别名>[/cyan]")
+    click.echo("    [cyan]patchflow config set agents.reviewer <别名>[/cyan]")
     click.echo()
-    click.echo(f"  运行 [cyan]patchflow config show[/cyan] 查看配置")
-    click.echo(f"  运行 [cyan]patchflow[/cyan] 开始使用")
+    click.echo("  运行 [cyan]patchflow config show[/cyan] 查看配置")
+    click.echo("  运行 [cyan]patchflow[/cyan] 开始使用")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -465,7 +465,7 @@ def model():
 @model.command("list")
 def model_list():
     """列出所有已配置的模型"""
-    from patchflow.core.config import list_models, get_config
+    from patchflow.core.config import get_config, list_models
 
     models = list_models()
     active = get_config()["active"]
@@ -579,10 +579,11 @@ def analyze(work_dir: str, module: str | None):
       patchflow analyze
       patchflow analyze --module auth
     """
-    from patchflow.core.project.context_collector import ContextCollector, build_context_prompt
     from rich.console import Console
-    from rich.table import Table
     from rich.panel import Panel
+    from rich.table import Table
+
+    from patchflow.core.project.context_collector import ContextCollector
 
     console = Console()
     collector = ContextCollector(work_dir)
@@ -644,9 +645,9 @@ def status(work_dir: str):
       patchflow status
     """
     from pathlib import Path
+
     from rich.console import Console
     from rich.panel import Panel
-    from datetime import datetime
 
     console = Console()
     wd = Path(work_dir)
@@ -677,7 +678,6 @@ def status(work_dir: str):
 
 
 def _dir_size(path) -> int:
-    from pathlib import Path
     total = 0
     if path.exists():
         for f in path.rglob("*"):

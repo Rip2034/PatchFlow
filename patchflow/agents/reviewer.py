@@ -6,9 +6,9 @@
 输出格式统一用 schema.py 定义的标准合约。
 """
 
+from patchflow.agents.schema import REVIEWER_PROMPT, validate_review
 from patchflow.core.llm_client import call_llm
 from patchflow.utils import logger
-from patchflow.agents.schema import REVIEWER_PROMPT, validate_review
 
 
 def agent_review(blackboard, model: str | None = None, model_alias: str | None = None) -> dict:
@@ -55,7 +55,10 @@ Review this fix. Output ONLY the JSON."""
 
     if result is None:
         logger.error("[Agent Reviewer] LLM 调用失败，默认通过")
-        result = {"approved": True, "score": 5, "issues": [], "summary": "LLM call failed, auto-approved", "feedback": ""}
+        result = {
+            "approved": True, "score": 5, "issues": [],
+            "summary": "LLM call failed, auto-approved", "feedback": "",
+        }
 
     validated = validate_review(result)
     blackboard.set_review(validated)

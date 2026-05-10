@@ -15,7 +15,6 @@ from pathlib import Path
 from patchflow.core.llm_client import call_llm
 from patchflow.utils import logger
 
-
 FIX_SYSTEM_PROMPT = """You are a debugging agent. Your ONLY job is to fix the specific error in the code.
 
 RULES:
