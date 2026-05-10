@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from os import kill as os_kill_pid
 
 DANGEROUS_LEVEL_1 = [
     "rm -rf /", "rm -rf /*",
@@ -472,10 +473,3 @@ def _kill_process_tree(pid: int):
             os_kill_pid(pid, os_kill)
         except Exception:
             pass
-
-
-try:
-    from os import kill as os_kill_pid
-except ImportError:
-    def os_kill_pid(pid, sig):
-        pass

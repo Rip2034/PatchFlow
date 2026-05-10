@@ -60,9 +60,9 @@ class Orchestrator:
         self.dep_graph = DepGraph(work_dir)
         self._context_prompt = None
         self.breaker = FixLoopBreaker(max_retries=max_retries)
-        self._diff_report = []
+        self._diff_report: list[str] = []
 
-        self.state = {
+        self.state: dict = {
             "turn": 0,
             "transition": None,
             "snapshot_id": None,

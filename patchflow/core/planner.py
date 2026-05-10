@@ -139,7 +139,7 @@ Output ONLY the JSON plan."""
             logger.error("Planner: 未生成有效步骤")
             return None
 
-        steps = []
+        steps: list = []
         for s in raw_steps:
             steps.append(PlanStep(
                 step=s.get("step", len(steps) + 1),

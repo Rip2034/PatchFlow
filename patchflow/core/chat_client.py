@@ -1065,7 +1065,7 @@ class ChatClient:
                 logger.debug(f"后台进程列表获取失败: {e}")
             self.messages.append({"role": "user", "content": bg_info + user_input})
             self._save_memory()
-        all_tool_calls = []
+        all_tool_calls: list = []
         session_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "calls": 0}
         _reset_tool_budget()
 
@@ -1313,7 +1313,7 @@ class ChatClient:
     # ── 非流式 chat（给 build 命令用）──
 
     def chat(self, user_input: str) -> tuple[str, list[ToolUse]]:
-        all_tool_calls = []
+        all_tool_calls: list = []
         for evt, data in self.chat_stream(user_input):
             if evt == "text":
                 final_text = data
@@ -1569,7 +1569,7 @@ class ChatClient:
 
         # 按 user 消息切分逻辑回合
         rounds: list[list[dict]] = []
-        current = []
+        current: list[dict] = []
         for msg in raw:
             role = msg.get("role", "")
             content = msg.get("content", "")
