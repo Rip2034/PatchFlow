@@ -23,11 +23,12 @@
   /ps      查看后台进程
 """
 
-import sys
+import json
 import os
-import time
-import threading
 import shutil
+import sys
+import threading
+import time
 from pathlib import Path
 
 if sys.platform == "win32":
@@ -42,13 +43,13 @@ if sys.platform == "win32":
 
 from rich.console import Console
 from rich.markdown import Markdown
-from rich.text import Text
 from rich.panel import Panel
+from rich.text import Text
+
 from patchflow.core.chat_client import ChatClient, set_confirm_callback
 from patchflow.core.config import get_config
 from patchflow.utils import logger
 from patchflow.utils.runner import _CANCELLED
-
 
 _term_w, _ = shutil.get_terminal_size((80, 24))
 _console_width = min(_term_w, 100)
@@ -62,7 +63,7 @@ HELP_TEXT = """[bold bright_white]可用命令:[/bold bright_white]
   [cyan]/quit[/cyan]    同上
   [cyan]/clear[/cyan]   清空对话历史
   [cyan]/history[/cyan] 显示对话统计
-  [cyan]/memory[/cyan]  显示记忆状态（跨会话记忆）
+  [cyan]/memory[/cyan]  显示记忆状态（智能检测，自动记忆开发任务）
   [cyan]/model[/cyan]   列出/切换可用模型
   [cyan]/plan[/cyan]    制定计划后分步骤生成代码（AI 先出计划，用户确认后执行）
   [cyan]/build[/cyan]   一次性生成代码并自动验证
@@ -88,12 +89,12 @@ def _interactive_select(options: list[tuple[str, str, str]]) -> str:
     """
     # 非交互终端 → 直接选第一个
     if not sys.stdin.isatty():
-        print(f"  [dim]（非交互终端，自动继续）[/dim]")
+        print("  [dim]（非交互终端，自动继续）[/dim]")
         return options[0][0]
 
     selected = 0
     _first_render = [True]
-    N = len(options)
+    n_opts = len(options)
     start = time.time()
 
     def _render():
@@ -102,7 +103,7 @@ def _interactive_select(options: list[tuple[str, str, str]]) -> str:
             for i, (_, label, color) in enumerate(options):
                 _print_option(i, label, color, i == selected)
         else:
-            print(f"\033[{N}A", end="", flush=True)
+            print(f"\033[{n_opts}A", end="", flush=True)
             for i, (_, label, color) in enumerate(options):
                 _print_option(i, label, color, i == selected)
 
@@ -118,25 +119,25 @@ def _interactive_select(options: list[tuple[str, str, str]]) -> str:
     while True:
         # 30 秒无输入自动继续
         if time.time() - start > 30:
-            print(f"\n  [dim]（等待超时 30s，自动继续）[/dim]")
+            print("\n  [dim]（等待超时 30s，自动继续）[/dim]")
             return options[0][0]
 
         key = _getch(timeout=1)
         if key is None:
             continue
         if key == "UP":
-            selected = (selected - 1) % N
+            selected = (selected - 1) % n_opts
             _render()
             start = time.time()
         elif key == "DOWN":
-            selected = (selected + 1) % N
+            selected = (selected + 1) % n_opts
             _render()
             start = time.time()
         elif key == "ENTER":
             return options[selected][0]
         elif key in ("1", "2", "3", "4", "5", "6", "7", "8", "9"):
             idx = int(key) - 1
-            if 0 <= idx < N:
+            if 0 <= idx < n_opts:
                 return options[idx][0]
 
 def _getch(timeout: float = 0) -> str | None:
@@ -168,9 +169,9 @@ def _getch(timeout: float = 0) -> str | None:
                     return ch.decode()
             time.sleep(0.05)
     else:
-        import tty
-        import termios
         import select
+        import termios
+        import tty
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
         try:
@@ -266,8 +267,8 @@ class REPL:
         try:
             from patchflow.core.project.codebase_index import _ensure_gitignore
             _ensure_gitignore()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Gitignore 设置失败: {e}")
 
         console.print()
 
@@ -283,11 +284,13 @@ class REPL:
             "  [bold cyan]╚═╝     ╚═╝  ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝╚═╝     [/bold cyan]\n"
             "\n"
             f"  [cyan]模型:[/cyan] {cfg.get('model', 'deepseek-chat')}\n"
+            "  [dim]记忆: 智能模式（自动记忆开发任务）[/dim]\n"
             f"  [dim]{os.getcwd()}[/dim]\n"
             "\n"
             "  [bold]Tips for getting started[/bold]\n"
             "  Run [bold]/init[/bold] to create instructions for PatchFlow in your project\n"
             "  Run [bold]/ps[/bold] to see running servers, [bold]/stop <pid>[/bold] to stop them\n"
+            "  Run [bold]/memory[/bold] to check memory status\n"
             f"  [dim]{'-' * (inner_w - 4)}[/dim]\n"
             "  [bold]What's new[/bold]\n"
             "  Check the changelog for updates\n"
@@ -333,8 +336,8 @@ class REPL:
             except (KeyboardInterrupt, EOFError):
                 return None
 
-        PROMPT = "\033[36mPatchFlow >>\033[0m "
-        PROMPT_W = 13
+        prompt_str = "\033[36mPatchFlow >>\033[0m "
+        prompt_w = 13
 
         def _width(s: str) -> int:
             return sum(2 if ord(c) > 0x2e80 else 1 for c in s)
@@ -343,7 +346,7 @@ class REPL:
         cursor = 0
         hist_idx = self._hist_idx
         last_w = 0
-        sys.stdout.write(PROMPT)
+        sys.stdout.write(prompt_str)
         sys.stdout.flush()
         while True:
             ch = msvcrt.getwch()
@@ -356,7 +359,7 @@ class REPL:
                     chars.pop(cursor)
                     text = "".join(chars)
                     w = _width(text)
-                    sys.stdout.write("\r" + " " * max(PROMPT_W + w, PROMPT_W + last_w) + "\r" + PROMPT + text)
+                    sys.stdout.write("\r" + " " * max(prompt_w + w, prompt_w + last_w) + "\r" + prompt_str + text)
                     last_w = w
                     after = _width(text[cursor:])
                     if after:
@@ -386,7 +389,7 @@ class REPL:
                         cursor = len(chars)
                         text = "".join(chars)
                         w = _width(text)
-                        sys.stdout.write("\r" + " " * max(PROMPT_W + w, PROMPT_W + last_w) + "\r" + PROMPT + text)
+                        sys.stdout.write("\r" + " " * max(prompt_w + w, prompt_w + last_w) + "\r" + prompt_str + text)
                         last_w = w
                         sys.stdout.flush()
                 elif nxt == "P":
@@ -399,7 +402,7 @@ class REPL:
                     cursor = len(chars)
                     text = "".join(chars)
                     w = _width(text)
-                    sys.stdout.write("\r" + " " * max(PROMPT_W + w, PROMPT_W + last_w) + "\r" + PROMPT + text)
+                    sys.stdout.write("\r" + " " * max(prompt_w + w, prompt_w + last_w) + "\r" + prompt_str + text)
                     last_w = w
                     sys.stdout.flush()
                 continue
@@ -407,7 +410,7 @@ class REPL:
             cursor += 1
             text = "".join(chars)
             w = _width(text)
-            sys.stdout.write("\r" + " " * max(PROMPT_W + w, PROMPT_W + last_w) + "\r" + PROMPT + text)
+            sys.stdout.write("\r" + " " * max(prompt_w + w, prompt_w + last_w) + "\r" + prompt_str + text)
             last_w = w
             after = _width(text[cursor:])
             if after:
@@ -642,9 +645,9 @@ class REPL:
                             continue
                         if name == "read_file":
                             if result.startswith("ERROR"):
-                                console.print(f"    [red]✘[/red] [dim]read failed[/dim]")
+                                console.print("    [red]✘[/red] [dim]read failed[/dim]")
                             elif result == "(tool skipped — budget exhausted)":
-                                console.print(f"    [dim](skipped — budget exhausted)[/dim]")
+                                console.print("    [dim](skipped — budget exhausted)[/dim]")
                             elif result.startswith("(already read"):
                                 console.print(f"    [dim]{result}[/dim]")
                             else:
@@ -655,7 +658,7 @@ class REPL:
                             n = len(content.split("\n"))
                             console.print(f"    [dim]{n} lines[/dim]")
                         elif name == "list_files":
-                            n = sum(1 for l in result.split("\n") if l.strip().startswith(("├", "└")))
+                            n = sum(1 for line in result.split("\n") if line.strip().startswith(("├", "└")))
                             if n:
                                 console.print(f"    [dim]{n} items[/dim]")
                             tree_outputs.append(result)
@@ -664,7 +667,7 @@ class REPL:
                                 reason = result[len("BLOCKED: "):]
                                 console.print(f"    [red]✘ blocked[/red] [dim]{reason}[/dim]")
                             elif result.startswith("USER_REJECTED:"):
-                                console.print(f"    [yellow]✘ rejected[/yellow]")
+                                console.print("    [yellow]✘ rejected[/yellow]")
                             elif result.startswith("BACKGROUND_STARTED:"):
                                 pid_line = result.split("\n")[0]
                                 pid = pid_line.split("=")[-1]
@@ -673,11 +676,11 @@ class REPL:
                                 if cmd:
                                     console.print(f"      [dim]/stop {pid} 停止进程[/dim]")
                             elif result == "(tool skipped — budget exhausted)":
-                                console.print(f"    [dim](skipped — budget exhausted)[/dim]")
+                                console.print("    [dim](skipped — budget exhausted)[/dim]")
                             else:
                                 ok = result.startswith("exit: 0")
                                 if ok:
-                                    console.print(f"    [green]✔ success[/green]")
+                                    console.print("    [green]✔ success[/green]")
                                 else:
                                     exit_code = result.split("\n")[0].replace("exit: ", "") if result.startswith("exit:") else "?"
                                     stderr_part = result.split("stderr:")[-1].strip() if "stderr:" in result else ""
@@ -690,14 +693,14 @@ class REPL:
                         elif name == "search_files":
                             n = result.count("\n") + 1 if result.strip() else 0
                             if "未找到" in result:
-                                console.print(f"    [yellow]no results[/yellow]")
+                                console.print("    [yellow]no results[/yellow]")
                             else:
                                 console.print(f"    [magenta]{n}[/magenta] [dim]files[/dim]")
                                 search_outputs.append((f"  search: {data['args'].get('query', '')}", result))
                         elif name == "search_code":
                             n = result.count("\n") + 1 if result.strip() else 0
                             if "no matches" in result:
-                                console.print(f"    [yellow]no matches[/yellow]")
+                                console.print("    [yellow]no matches[/yellow]")
                             else:
                                 console.print(f"    [magenta]{n}[/magenta] [dim]matches[/dim]")
                                 preview = "\n".join(result.split("\n")[:8])
@@ -711,11 +714,11 @@ class REPL:
                             run_failures.append(data)
                         elif name == "review_code":
                             if result.startswith("ERROR"):
-                                console.print(f"    [red]✘ review failed[/red]")
+                                console.print("    [red]✘ review failed[/red]")
                             elif result == "(tool skipped — budget exhausted)":
-                                console.print(f"    [dim](skipped — budget exhausted)[/dim]")
+                                console.print("    [dim](skipped — budget exhausted)[/dim]")
                             elif "未发现明显问题" in result:
-                                console.print(f"    [green]✔ 无问题[/green]")
+                                console.print("    [green]✔ 无问题[/green]")
                             else:
                                 first = result.split("\n")[0]
                                 console.print(f"    [yellow]{first}[/yellow]")
@@ -824,8 +827,8 @@ class REPL:
             console.print()
 
     def _auto_fix(self, run_failures: list[dict], files_written: list[str], task: str):
-        from patchflow.core.agent_orchestrator import AgentOrchestrator
         from patchflow.agents.blackboard import Blackboard
+        from patchflow.core.agent_orchestrator import AgentOrchestrator
 
         error_summary = "\n".join(
             f"$ {tc['args'].get('command', '')}\n{tc['result'][:500]}"
@@ -840,8 +843,8 @@ class REPL:
             if p.exists():
                 try:
                     file_contents[fp] = p.read_text(encoding="utf-8")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"读取文件失败 {fp}: {e}")
 
         console.print(f"  [bold yellow]⚡ 启动多 Agent 修复: {task[:80]}[/bold yellow]")
 
@@ -858,7 +861,7 @@ class REPL:
         if success:
             console.print(f"  [green]  ✅ 多 Agent 修复成功 (共 {orch.turn_count} 步)[/green]")
         else:
-            console.print(f"  [red]  ❌ 多 Agent 修复失败，已回滚[/red]")
+            console.print("  [red]  ❌ 多 Agent 修复失败，已回滚[/red]")
 
     def _do_exit(self):
         console.print("[dim]再见![/dim]")
@@ -918,8 +921,9 @@ class REPL:
 
     def _do_plan(self, task: str):
         """制定计划后分步骤生成代码"""
-        from patchflow.core.planner import PlanExecutor
         from rich.table import Table
+
+        from patchflow.core.planner import PlanExecutor
 
         console.print(f"[dim]任务: {task}[/dim]")
         console.print(f"[dim]模型: {self.model}[/dim]")
@@ -975,7 +979,7 @@ class REPL:
             step_num = f"[{i + 1}/{total}]"
             console.print(f"  {step_num} [bold]{step.title}[/bold]")
             console.print(f"       [dim]{step.description}[/dim]")
-            console.print(f"       [cyan]⠋ 生成中...[/cyan]")
+            console.print("       [cyan]⠋ 生成中...[/cyan]")
 
             ok = executor.execute_step(i)
 
@@ -999,7 +1003,7 @@ class REPL:
             from patchflow.core.fix.validator import validate
             result = validate(work_dir=".")
             if result.ok:
-                console.print(f"[green]v 验证通过[/green]")
+                console.print("[green]v 验证通过[/green]")
                 console.print(f"[green bold]成功完成! ({total} 步)[/green bold]")
             else:
                 console.print(f"[yellow]验证: {result.message or '未通过'}[/yellow]")
@@ -1044,14 +1048,27 @@ class REPL:
         console.print()
 
     def _cmd_memory(self):
-        """显示记忆状态"""
+        """显示记忆状态（智能检测模式）"""
         if not self.client:
-            console.print("[dim]还没有对话历史[/dim]")
+            console.print("  [dim]记忆: 智能模式（开始对话后自动检测）[/dim]")
             return
+
         memory_path = Path(".patchflow/memory.json")
-        console.print(f"  [bold]记忆状态[/bold]")
+        has_dev = self.client._has_dev_activity
+        has_file = memory_path.exists()
+        is_persisted = has_file and has_dev
+
+        console.print("  [bold]记忆状态: 智能模式[/bold]")
+        if is_persisted:
+            console.print("  [green]● 已记忆[/green] [dim]— 检测到开发任务，对话已持久化[/dim]")
+        elif has_file and not has_dev:
+            console.print("  [yellow]○ 历史记忆存在[/yellow] [dim]— 当前会话尚未触发开发任务[/dim]")
+        else:
+            console.print("  [dim]○ 待检测 — 开始对话后将自动识别开发任务[/dim]")
+
         console.print(f"  {self.client.get_summary()}")
-        if memory_path.exists():
+
+        if has_file:
             size = len(memory_path.read_bytes())
             limit_kb = self.client._MAX_MEMORY_BYTES // 1024
             if size > 1024:
@@ -1063,21 +1080,22 @@ class REPL:
                 console.print(f"  状态: [yellow]已用 {pct:.0f}%，旧消息将被自动压缩为摘要[/yellow]")
             else:
                 console.print(f"  状态: [green]{pct:.0f}% 已使用[/green]")
-            # 显示摘要预览
             summaries = self.client._memory_summary
             if summaries:
                 console.print(f"  [bold]摘要预览 (最近 {min(3, len(summaries))} 条):[/bold]")
                 for s in summaries[-3:]:
                     short = s[:80] + "..." if len(s) > 80 else s
                     console.print(f"    [dim]▪[/dim] {short}")
-            # 显示消息构成
             boundary_count = sum(1 for m in self.client.messages if m.get("_session_boundary"))
             if boundary_count:
                 console.print(f"  会话: {boundary_count} 次跨会话续聊")
         else:
-            console.print(f"  文件: [dim](尚未持久化)[/dim]")
+            console.print("  文件: [dim](尚无持久化记忆)[/dim]")
+
         if getattr(self.client, '_session_boundary_added', False):
-            console.print(f"  会话: [yellow]跨会话续聊（恢复自之前保存的记忆）[/yellow]")
+            console.print("  会话: [yellow]跨会话续聊（恢复自之前保存的记忆）[/yellow]")
+
+        console.print("  [dim]说明: 系统自动检测开发意图（写代码/修bug/调试等），仅开发任务会被持久化[/dim]")
 
     def _cmd_init(self):
         """创建项目级 PatchFlow 指令文件"""
@@ -1093,7 +1111,7 @@ class REPL:
         if rules_file.exists():
             console.print(f"  [yellow]规则文件已存在: {rules_file}[/yellow]")
             content = rules_file.read_text(encoding="utf-8")
-            console.print(f"  [dim]当前内容:[/dim]")
+            console.print("  [dim]当前内容:[/dim]")
             for line in content.strip().split("\n"):
                 console.print(f"    [dim]{line}[/dim]")
             console.print()
@@ -1109,7 +1127,7 @@ class REPL:
                 desc = pkg.get("description", "")
                 deps = list(pkg.get("dependencies", {}).keys())[:5]
                 dev_deps = list(pkg.get("devDependencies", {}).keys())[:5]
-                project_info.append(f"- 类型: Node.js/JavaScript 项目")
+                project_info.append("- 类型: Node.js/JavaScript 项目")
                 if name:
                     project_info.append(f"- 名称: {name}")
                 if desc:
@@ -1152,7 +1170,7 @@ class REPL:
         rules_dir.mkdir(parents=True, exist_ok=True)
         rules_file.write_text(rules_content, encoding="utf-8")
         console.print(f"  [green]规则文件已创建: {rules_file}[/green]")
-        console.print(f"  [dim]内容:[/dim]")
+        console.print("  [dim]内容:[/dim]")
         for line in rules_content.strip().split("\n"):
             if line.startswith("#"):
                 console.print(f"    [cyan]{line}[/cyan]")
@@ -1162,10 +1180,10 @@ class REPL:
                 console.print(f"    [dim]{line}[/dim]")
         console.print()
         console.print(f"  [yellow]编辑 {rules_file} 可以自定义项目规则[/yellow]")
-        console.print(f"  [yellow]PatchFlow 每次对话会自动注入这些规则[/yellow]")
+        console.print("  [yellow]PatchFlow 每次对话会自动注入这些规则[/yellow]")
 
     def _cmd_stop(self, arg: str):
-        from patchflow.utils.runner import stop_background, list_processes
+        from patchflow.utils.runner import list_processes, stop_background
         if not arg:
             procs = [p for p in list_processes() if p.running]
             if not procs:
@@ -1192,7 +1210,7 @@ class REPL:
         if not procs:
             console.print("  [yellow]没有后台进程[/yellow]")
             return
-        console.print(f"  [bold]后台进程列表[/bold]")
+        console.print("  [bold]后台进程列表[/bold]")
         for p in procs:
             status = "[green]运行中[/green]" if p.running else "[dim]已结束[/dim]"
             cmd_short = p.command[:60] + "..." if len(p.command) > 60 else p.command
@@ -1202,6 +1220,10 @@ class REPL:
 
 
 def start_repl(model: str | None = None):
-    """启动 REPL — 给 CLI 入口调用"""
+    """启动 REPL — 给 CLI 入口调用
+
+    Args:
+        model: 使用的 LLM 模型别名
+    """
     repl = REPL(model=model)
     repl.run()
