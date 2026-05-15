@@ -86,7 +86,7 @@ def generate(task: str, model: str | None = None,
 
 
 def write_files(files: list[dict], work_dir: str = ".") -> list[str]:
-    """把 Generator 生成的文件写入磁盘
+    """把 Generator 生成的文件写入磁盘（文件级并发安全）
 
     Args:
         files:    [{"file": "app.py", "content": "..."}, ...]
@@ -95,16 +95,19 @@ def write_files(files: list[dict], work_dir: str = ".") -> list[str]:
     Returns:
         list[str]: 写入的文件路径列表
     """
+    from patchflow.core.concurrency import AtomicWrite, get_file_lock_manager
+
     written = []
     wd = Path(work_dir)
+    flm = get_file_lock_manager()
 
     for f in files:
         file_path = wd / f["file"]
-        # 确保父目录存在
         file_path.parent.mkdir(parents=True, exist_ok=True)
 
         content = f["content"]
-        file_path.write_text(content, encoding="utf-8")
+        with flm.lock(f["file"]):
+            AtomicWrite.write(str(file_path), content)
         logger.info(f"写入文件: {file_path} ({len(content)} 字符)")
         written.append(str(file_path))
 
