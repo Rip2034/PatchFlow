@@ -465,6 +465,7 @@ class LanguageRegistry:
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._languages = dict(_BUILTINS)
+            cls._instance._detect_cache: dict[str, LanguageDescriptor | None] = {}
         return cls._instance
 
     def register(self, lang: LanguageDescriptor):
@@ -488,6 +489,9 @@ class LanguageRegistry:
             LanguageDescriptor | None — None 表示无法确定语言
         """
         wd = Path(work_dir).resolve()
+        cache_key = str(wd)
+        if cache_key in self._detect_cache:
+            return self._detect_cache[cache_key]
 
         scored = []
         for name, lang in self._languages.items():
@@ -500,7 +504,9 @@ class LanguageRegistry:
 
         if scored:
             scored.sort(key=lambda x: -x[0])
-            return scored[0][2]
+            result = scored[0][2]
+            self._detect_cache[cache_key] = result
+            return result
 
         ext_count: dict[str, int] = {}
         for f in wd.rglob("*"):
@@ -513,9 +519,15 @@ class LanguageRegistry:
             best_ext = max(ext_count, key=ext_count.get)
             for lang in self._languages.values():
                 if best_ext in lang.extensions:
+                    self._detect_cache[cache_key] = lang
                     return lang
 
+        self._detect_cache[cache_key] = None
         return None
+
+    def clear_detect_cache(self):
+        """清除 detect() 结果缓存（项目文件变化后调用）"""
+        self._detect_cache.clear()
 
     def detect_from_files(self, files: list[str]) -> LanguageDescriptor | None:
         """从文件列表检测语言"""
@@ -543,10 +555,11 @@ class LanguageRegistry:
             if frames:
                 return _parse_generic_traceback(frames)
 
-        for lang in self._languages.values():
-            if lang and lang.name == lang.name:
+        skip_name = lang.name if lang else None
+        for other_lang in self._languages.values():
+            if skip_name and other_lang.name == skip_name:
                 continue
-            frames = lang.parse_traceback(error_text)
+            frames = other_lang.parse_traceback(error_text)
             if frames:
                 return _parse_generic_traceback(frames)
         return None
@@ -556,16 +569,17 @@ class LanguageRegistry:
         if lang:
             etype, msg = lang.classify_error(error_text)
             if etype != "unknown":
-                return (etype, msg)
+                return etype, msg
 
         # 兜底：尝试所有语言
-        for lang in self._languages.values():
-            if lang and lang.name == lang.name:
+        skip_name = lang.name if lang else None
+        for other_lang in self._languages.values():
+            if skip_name and other_lang.name == skip_name:
                 continue
-            etype, msg = lang.classify_error(error_text)
+            etype, msg = other_lang.classify_error(error_text)
             if etype != "unknown":
-                return (etype, msg)
-        return ("unknown", error_text.strip().split("\n")[-1][:200])
+                return etype, msg
+        return "unknown", error_text.strip().split("\n")[-1][:200]
 
     def get_import_parser(self, lang: LanguageDescriptor | None):
         """获取对应语言的 import 解析函数
