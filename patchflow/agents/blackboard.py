@@ -24,6 +24,7 @@
   所有 get() / set_*() 调用自动打日志，用于 CLI 可视化。
 """
 
+import threading
 import time
 from copy import deepcopy
 
@@ -31,11 +32,12 @@ from patchflow.agents.schema import ANALYSIS_KEYS, validate_analysis, validate_f
 
 
 class Blackboard:
-    """多 Agent 共享黑板"""
+    """多 Agent 共享黑板（线程安全）"""
 
     def __init__(self, task: str = "", context: dict | None = None,
                  code: dict[str, str] | None = None,
                  error: str = ""):
+        self._lock = threading.RLock()
         self.data = {
             "task": task,
             "context": context or {},
@@ -53,43 +55,52 @@ class Blackboard:
 
     def set_current_agent(self, agent: str):
         """声明当前操作的 Agent 身份，后续所有 get/set 自动追踪到此 Agent"""
-        self._current_agent = agent
-        self._read_set.clear()
-        self._write_set.clear()
-        self._log("enter", agent)
+        with self._lock:
+            self._current_agent = agent
+            self._read_set.clear()
+            self._write_set.clear()
+            self._log("enter", agent)
 
     def get_current_agent(self) -> str | None:
-        return self._current_agent
+        with self._lock:
+            return self._current_agent
 
     def __getitem__(self, key):
-        self._log("read", key)
-        return self.data[key]
+        with self._lock:
+            self._log("read", key)
+            return self.data[key]
 
     def __setitem__(self, key, value):
-        self.data[key] = value
-        self._log("write", key)
+        with self._lock:
+            self.data[key] = value
+            self._log("write", key)
 
     def __contains__(self, key):
-        return key in self.data
+        with self._lock:
+            return key in self.data
 
     def get(self, key, default=None):
-        self._log("read", key)
-        return self.data.get(key, default)
+        with self._lock:
+            self._log("read", key)
+            return self.data.get(key, default)
 
     def set_analysis(self, raw: dict):
         """写入并校验 Analyzer 输出"""
-        self._log("write", "analysis")
-        self.data["analysis"] = validate_analysis(raw)
+        with self._lock:
+            self._log("write", "analysis")
+            self.data["analysis"] = validate_analysis(raw)
 
     def set_fix_plan(self, raw: dict):
         """写入并校验 Fixer 输出"""
-        self._log("write", "fix_plan")
-        self.data["fix_plan"] = validate_fix_plan(raw)
+        with self._lock:
+            self._log("write", "fix_plan")
+            self.data["fix_plan"] = validate_fix_plan(raw)
 
     def set_review(self, raw: dict):
         """写入并校验 Reviewer 输出"""
-        self._log("write", "review")
-        self.data["review"] = validate_review(raw)
+        with self._lock:
+            self._log("write", "review")
+            self.data["review"] = validate_review(raw)
 
     def _log(self, action: str, field: str):
         if self._current_agent:
@@ -106,115 +117,113 @@ class Blackboard:
 
     def get_activity(self, n: int = 6) -> list[dict]:
         """获取最近 n 条活动记录"""
-        return self._activity[-n:]
+        with self._lock:
+            return self._activity[-n:]
 
     def get_activity_summary(self) -> dict[str, dict[str, set]]:
         """按 Agent 汇总读写字段：{agent: {read: {fields}, write: {fields}}}"""
-        summary: dict[str, dict[str, set]] = {}
-        for entry in self._activity:
-            if entry["action"] not in ("read", "write"):
-                continue
-            agent = entry["agent"]
-            if agent not in summary:
-                summary[agent] = {"read": set(), "write": set()}
-            summary[agent][entry["action"]].add(entry["field"])
-        return summary
+        with self._lock:
+            summary: dict[str, dict[str, set]] = {}
+            for entry in self._activity:
+                if entry["action"] not in ("read", "write"):
+                    continue
+                agent = entry["agent"]
+                if agent not in summary:
+                    summary[agent] = {"read": set(), "write": set()}
+                summary[agent][entry["action"]].add(entry["field"])
+            return summary
 
     def clear_activity(self):
-        self._activity.clear()
-        self._read_set.clear()
-        self._write_set.clear()
+        with self._lock:
+            self._activity.clear()
+            self._read_set.clear()
+            self._write_set.clear()
 
     def compress_for(self, role: str) -> dict:
-        """为指定角色压缩 Blackboard（只保留对方需要的字段）
+        """为指定角色压缩 Blackboard（只保留对方需要的字段）"""
+        with self._lock:
+            analysis = self.data.get("analysis") or {}
+            fix_plan = self.data.get("fix_plan") or {}
+            review = self.data.get("review") or {}
 
-        Args:
-            role: "analyzer" | "fixer" | "reviewer"
+            base = {
+                "task": self.data.get("task", ""),
+                "error": self.data.get("error", "")[:500],
+            }
 
-        Returns:
-            压缩后的 dict（不含完整代码，只有摘要+必需字段）
-        """
-        analysis = self.data.get("analysis") or {}
-        fix_plan = self.data.get("fix_plan") or {}
-        review = self.data.get("review") or {}
+            if role == "analyzer":
+                return {**base, "code": self.data.get("code", {})}
 
-        base = {
-            "task": self.data.get("task", ""),
-            "error": self.data.get("error", "")[:500],
-        }
+            if role == "fixer":
+                result = {**base}
+                if analysis:
+                    result["analysis"] = {k: analysis.get(k) for k in ANALYSIS_KEYS if k in analysis}
+                if review and not review.get("approved", True):
+                    result["review_feedback"] = review.get("feedback", "")
+                return result
 
-        if role == "analyzer":
-            # Analyzer 需要看 error + task + code（全量代码由外部传入）
-            return {**base, "code": self.data.get("code", {})}
+            if role == "reviewer":
+                result = {**base}
+                if analysis:
+                    result["analysis"] = {k: analysis.get(k) for k in ANALYSIS_KEYS if k in analysis}
+                if fix_plan:
+                    result["fix_plan"] = {"summary": fix_plan.get("summary", ""), "patches": fix_plan.get("patches", [])}
+                return result
 
-        if role == "fixer":
-            # Fixer 需要 analysis 摘要 + 错误 + 可选的 review 反馈
-            result = {**base}
-            if analysis:
-                result["analysis"] = {k: analysis.get(k) for k in ANALYSIS_KEYS if k in analysis}
-            if review and not review.get("approved", True):
-                result["review_feedback"] = review.get("feedback", "")
-            return result
-
-        if role == "reviewer":
-            # Reviewer 需要 analysis 摘要 + fix_plan 摘要
-            result = {**base}
-            if analysis:
-                result["analysis"] = {k: analysis.get(k) for k in ANALYSIS_KEYS if k in analysis}
-            if fix_plan:
-                result["fix_plan"] = {"summary": fix_plan.get("summary", ""), "patches": fix_plan.get("patches", [])}
-            return result
-
-        return dict(self.data)
+            return dict(self.data)
 
     def get_callchain_code(self) -> str:
         """获取调用链上所有文件的代码（给 Analyzer/Fixer 用）"""
-        self._log("read", "code")
-        analysis = self.data.get("analysis")
-        if not analysis or not analysis.get("impact_files") and not analysis.get("call_chain"):
-            return "\n".join(self.data["code"].values())
+        with self._lock:
+            self._log("read", "code")
+            analysis = self.data.get("analysis")
+            if not analysis or not analysis.get("impact_files") and not analysis.get("call_chain"):
+                return "\n".join(self.data["code"].values())
 
-        impact = analysis.get("impact_files") or []
-        call_chain = analysis.get("call_chain") or []
-        call_files = set(f["file"] for f in call_chain) | set(impact)
-        parts = []
-        for filepath in call_files:
-            content = self.data["code"].get(filepath, "")
-            if content:
-                parts.append(f"# === {filepath} ===\n{content}")
-        return "\n\n".join(parts) if parts else "\n".join(self.data["code"].values())
+            impact = analysis.get("impact_files") or []
+            call_chain = analysis.get("call_chain") or []
+            call_files = set(f["file"] for f in call_chain) | set(impact)
+            parts = []
+            for filepath in call_files:
+                content = self.data["code"].get(filepath, "")
+                if content:
+                    parts.append(f"# === {filepath} ===\n{content}")
+            return "\n\n".join(parts) if parts else "\n".join(self.data["code"].values())
 
     def get_code(self, allowed_files: list[str]) -> str:
         """获取指定文件的代码（受策略限制）"""
-        self._log("read", "code")
-        parts = []
-        for filepath in allowed_files:
-            content = self.data["code"].get(filepath, "")
-            if content:
-                parts.append(f"# === {filepath} ===\n{content}")
-        return "\n\n".join(parts) if parts else "(no files available)"
+        with self._lock:
+            self._log("read", "code")
+            parts = []
+            for filepath in allowed_files:
+                content = self.data["code"].get(filepath, "")
+                if content:
+                    parts.append(f"# === {filepath} ===\n{content}")
+            return "\n\n".join(parts) if parts else "(no files available)"
 
     def summary(self) -> str:
         """生成 Blackboard 状态摘要（一行）"""
-        parts = [f"Task: {self.data['task'][:60]}"]
-        a = self.data.get("analysis") or {}
-        if a.get("summary"):
-            parts.append(f"Analysis: {a['summary'][:60]}")
-        elif a.get("error_type"):
-            parts.append(f"Analysis: {a['error_type']} | {str(a.get('root_cause',''))[:40]}")
-        fp = self.data.get("fix_plan") or {}
-        if fp.get("summary"):
-            parts.append(f"Fix: {fp['summary'][:60]}")
-        elif fp.get("patches"):
-            parts.append(f"Fix: {len(fp['patches'])} patch(es)")
-        r = self.data.get("review") or {}
-        if r.get("summary"):
-            parts.append(f"Review: {r['summary'][:60]}")
-        elif r.get("approved") is not None:
-            parts.append(f"Review: {'approved' if r['approved'] else 'rejected'} ({r.get('score','?')}/10)")
-        return " | ".join(parts)
+        with self._lock:
+            parts = [f"Task: {self.data['task'][:60]}"]
+            a = self.data.get("analysis") or {}
+            if a.get("summary"):
+                parts.append(f"Analysis: {a['summary'][:60]}")
+            elif a.get("error_type"):
+                parts.append(f"Analysis: {a['error_type']} | {str(a.get('root_cause',''))[:40]}")
+            fp = self.data.get("fix_plan") or {}
+            if fp.get("summary"):
+                parts.append(f"Fix: {fp['summary'][:60]}")
+            elif fp.get("patches"):
+                parts.append(f"Fix: {len(fp['patches'])} patch(es)")
+            r = self.data.get("review") or {}
+            if r.get("summary"):
+                parts.append(f"Review: {r['summary'][:60]}")
+            elif r.get("approved") is not None:
+                parts.append(f"Review: {'approved' if r['approved'] else 'rejected'} ({r.get('score','?')}/10)")
+            return " | ".join(parts)
 
     def clone(self) -> "Blackboard":
-        n = Blackboard()
-        n.data = deepcopy(self.data)
-        return n
+        with self._lock:
+            n = Blackboard()
+            n.data = deepcopy(self.data)
+            return n
