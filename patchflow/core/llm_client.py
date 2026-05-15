@@ -231,14 +231,23 @@ def _parse_json(text: str) -> dict | None:
         return None
 
     # 第一步：先尝试提取 markdown 代码块中的 JSON
-    if "```json" in text:
-        start = text.index("```json") + 7
-        end = text.index("```", start)
-        text = text[start:end].strip()
-    elif "```" in text:
-        start = text.index("```") + 3
-        end = text.index("```", start)
-        text = text[start:end].strip()
+    try:
+        if "```json" in text:
+            start = text.index("```json") + 7
+            try:
+                end = text.index("```", start)
+                text = text[start:end].strip()
+            except ValueError:
+                text = text[start:].strip()
+        elif "```" in text:
+            start = text.index("```") + 3
+            try:
+                end = text.index("```", start)
+                text = text[start:end].strip()
+            except ValueError:
+                text = text[start:].strip()
+    except ValueError:
+        pass
 
     if not text:
         logger.warn("提取代码块后内容为空")
