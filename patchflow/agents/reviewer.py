@@ -54,10 +54,10 @@ Review this fix. Output ONLY the JSON."""
     )
 
     if result is None:
-        logger.error("[Agent Reviewer] LLM 调用失败，默认通过")
+        logger.error("[Agent Reviewer] LLM 调用失败，拒绝通过（安全熔断）")
         result = {
-            "approved": True, "score": 5, "issues": [],
-            "summary": "LLM call failed, auto-approved", "feedback": "",
+            "approved": False, "score": 0, "issues": ["LLM call failed — unable to review"],
+            "summary": "LLM call failed, review cannot proceed (fail-closed)", "feedback": "LLM 不可用，无法审查修复方案",
         }
 
     validated = validate_review(result)
