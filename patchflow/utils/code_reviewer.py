@@ -52,7 +52,7 @@ def review_file(filepath: str, work_dir: str = ".") -> str:
     lines = [f"{filepath} — 发现 {len(issues)} 个问题:"]
     for i, issue in enumerate(issues[:max_shown], 1):
         severity = issue.get("severity", "info")
-        sev_mark = "🔴" if severity == "error" else "🟡" if severity == "warning" else "🔵"
+        sev_mark = "[E]" if severity == "error" else "[W]" if severity == "warning" else "[I]"
         line = issue.get("line", "?")
         msg = issue.get("message", "")
         suggestion = issue.get("suggestion", "")
