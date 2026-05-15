@@ -6,8 +6,6 @@
 输出格式统一用 schema.py 定义的标准合约。
 """
 
-from pathlib import Path
-
 from patchflow.agents.schema import FIXER_PROMPT, validate_fix_plan
 from patchflow.core.analysis.error_analyzer import ErrorAnalysis
 from patchflow.core.analysis.strategy_selector import select_strategy
@@ -120,110 +118,22 @@ Fix the code. Output ONLY the JSON with the patches."""
     return validated
 
 
-def apply_agent_patches(blackboard, work_dir: str = ".") -> bool:
-    """将 Fixer Agent 的补丁安全写入磁盘
-
-    采用多级策略避免 LLM 返回代码片段时错误覆盖整个文件：
-      1. 文件不存在 → 直接创建
-      2. 有 old snippet 且在文件中找到 → 精确文本替换
-      3. new 接近原文件大小（>60%）→ 视为完整文件覆盖
-      4. 宽松匹配后替换 → 仍找不到则拒绝覆盖（防止文件损坏）
-
-    Args:
-        blackboard: Blackboard 实例（含 fix_plan）
-        work_dir: 工作目录
-
-    Returns:
-        bool: 是否全部写入成功
-    """
+def apply_agent_patches(blackboard, work_dir: str = ".", diff_tracker=None) -> bool:
     fix_plan = blackboard.get("fix_plan", {})
     patches = fix_plan.get("patches", [])
     if not patches:
         logger.warn("[Agent Fixer] 没有补丁可应用")
         return False
 
-    wd = Path(work_dir)
-    success = 0
+    from patchflow.core.fix.patch_applicator import PatchApplicator, SnippetPatch
+    snippet_patches = [SnippetPatch(
+        file=p.get("file", ""),
+        old=p.get("old", ""),
+        new=p.get("new", ""),
+        reason=p.get("reason", ""),
+    ) for p in patches]
 
-    try:
-        from patchflow.core.agent_sandbox import get_sandbox
-        sandbox = get_sandbox(str(wd))
-    except Exception:
-        sandbox = None
-
-    for patch in patches:
-        filepath = patch.get("file", "")
-        new_content = patch.get("new", "")
-        old_content = patch.get("old", "")
-        if not filepath or not new_content:
-            logger.warn(f"[Agent Fixer] 跳过无效补丁: file={filepath or '?'}")
-            continue
-
-        # 沙箱验证文件路径
-        if sandbox:
-            try:
-                target = sandbox.validate_write(filepath, len(new_content))
-            except Exception as e:
-                logger.error(f"[Agent Fixer] 沙箱拦截写入 {filepath}: {e}")
-                continue
-        else:
-            target = wd / filepath
-        target.parent.mkdir(parents=True, exist_ok=True)
-
-        existing = ""
-        if target.exists():
-            try:
-                existing = target.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                pass
-
-        # 策略 1: 文件不存在 → 直接创建
-        if not existing:
-            target.write_text(new_content, encoding="utf-8")
-            logger.info(f"[Agent Fixer] 新建文件: {filepath} ({len(new_content)} chars)")
-            success += 1
-            continue
-
-        # 策略 2: 有 old snippet → 精确替换
-        if old_content and old_content in existing:
-            replaced = existing.replace(old_content, new_content, 1)
-            target.write_text(replaced, encoding="utf-8")
-            logger.info(f"[Agent Fixer] Snippet替换: {filepath} ({len(old_content)}→{len(new_content)} chars)")
-            success += 1
-            continue
-
-        # 策略 3: new 接近原文件大小 → 视为完整文件覆盖
-        len_ratio = len(new_content) / max(len(existing), 1)
-        if len_ratio > 0.6:
-            logger.info(f"[Agent Fixer] 全文覆盖: {filepath} ({len_ratio:.0%} 相似度)")
-            target.write_text(new_content, encoding="utf-8")
-            success += 1
-            continue
-
-        # 策略 4: 宽松匹配（忽略首尾空白）
-        if old_content:
-            old_stripped = old_content.strip()
-            existing_stripped = existing.strip()
-            if old_stripped and old_stripped in existing_stripped:
-                replaced = existing_stripped.replace(old_stripped, new_content.strip(), 1)
-                target.write_text(replaced, encoding="utf-8")
-                logger.info(f"[Agent Fixer] 宽松Snippet替换: {filepath}")
-                success += 1
-                continue
-
-        # 策略 5: new 太短，可能是 LLM 返回不完整片段 → 拒绝覆盖
-        if len_ratio < 0.2 and len(new_content) < 200:
-            logger.warn(
-                f"[Agent Fixer] 拒绝覆盖 {filepath}: "
-                f"new 过小 ({len(new_content)}B vs {len(existing)}B)，可能是 LLM 返回了代码片段而非完整文件"
-            )
-            continue
-
-        # 兜底: 覆盖（带警告）
-        logger.warn(f"[Agent Fixer] 兜底覆盖: {filepath} ({len(new_content)} chars)，"
-                     f"old 未在文件中定位到，使用新内容覆盖")
-        target.write_text(new_content, encoding="utf-8")
-        success += 1
-
-    logger.info(f"[Agent Fixer] 应用 {success}/{len(patches)} 补丁")
+    success, fail = PatchApplicator.apply_all(snippet_patches, work_dir=work_dir, diff_tracker=diff_tracker)
+    if diff_tracker and success > 0:
+        logger.info(f"[Agent Fixer] DiffTracker 已记录: {diff_tracker.recent_changes_summary}")
     return success > 0
