@@ -228,7 +228,8 @@ Output ONLY the JSON plan."""
             if result.ok:
                 logger.success("[Plan] 最终验证通过")
             else:
-                logger.warn(f"[Plan] 最终验证: {result.message or '未通过'}")
+                logger.warn(f"[Plan] 最终验证未通过: {result.message or '验证失败'}")
+                all_ok = False
 
         return all_ok
 
