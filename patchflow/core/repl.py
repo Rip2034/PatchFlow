@@ -205,6 +205,7 @@ class REPL:
         self.client: ChatClient | None = None
         self._history: list[str] = []
         self._hist_idx: int = 0
+        self._last_ctrl_c: float = 0.0
 
     def run(self):
         """启动 REPL 主循环
@@ -258,9 +259,9 @@ class REPL:
 
         # ── 设置终端标题 ──
         if sys.platform == "win32":
-            os.system("title 🦉 PatchFlow")
+            os.system("title 💠 PatchFlow")
         else:
-            sys.stdout.write("\x1b]0;🦉 PatchFlow\x07")
+            sys.stdout.write("\x1b]0;💠 PatchFlow\x07")
             sys.stdout.flush()
 
         # ── Git 忽略 ──
@@ -320,7 +321,13 @@ class REPL:
 
             except KeyboardInterrupt:
                 _CANCELLED.set()
-                console.print("\n  [yellow]已取消[/yellow] [dim](输入 /exit 退出)[/dim]")
+                now = time.time()
+                if self._last_ctrl_c and now - self._last_ctrl_c < 3:
+                    console.print("\n  [bold yellow]确认退出[/bold yellow]")
+                    self._do_exit()
+                    return
+                self._last_ctrl_c = now
+                console.print("\n  [yellow]已取消[/yellow] [dim](再次 Ctrl+C 退出, /exit 也可退出)[/dim]")
                 continue
             except EOFError:
                 self._do_exit()
@@ -864,7 +871,7 @@ class REPL:
             console.print("  [red]  ❌ 多 Agent 修复失败，已回滚[/red]")
 
     def _do_exit(self):
-        console.print("[dim]再见![/dim]")
+        console.print("[dim]期待下次相遇![/dim]")
         self.client = None
 
     def _cmd_model(self, arg: str):
@@ -1006,8 +1013,9 @@ class REPL:
                 console.print("[green]v 验证通过[/green]")
                 console.print(f"[green bold]成功完成! ({total} 步)[/green bold]")
             else:
-                console.print(f"[yellow]验证: {result.message or '未通过'}[/yellow]")
-                console.print(f"[green bold]执行完成 ({total} 步), 但验证未完全通过[/green bold]")
+                console.print(f"[yellow]验证未通过: {result.message or '验证失败'}[/yellow]")
+                console.print(f"[red bold]执行完成 ({total} 步), 但验证未通过[/red bold]")
+                all_ok = False
         else:
             console.print(f"[red]执行中断 (完成 {i + 1}/{total} 步)[/red]")
 
