@@ -102,18 +102,113 @@ Fix the error. Output ONLY the JSON with the fixed file content."""
     fixed_file = result["file"]
 
     if scope_files and fixed_file not in scope_files:
-        logger.warn(f"Fixer: LLM 尝试修改不在范围内的文件: {fixed_file}")
-        logger.warn(f"  允许范围: {scope_files}")
-        logger.warn(f"  强制将目标改为: {file_path}")
-        result["file"] = str(Path(file_path).name)
-        result["content"] = current_code
+        logger.error(f"Fixer: LLM 尝试修改不在范围内的文件: {fixed_file}")
+        logger.error(f"  允许范围: {scope_files}")
+        logger.error(f"  拒绝修复，返回 None 触发策略升级")
+        return None
 
     logger.success(f"Fixer: 生成修复方案 for {result['file']}")
     return result
 
 
+FIX_SYSTEM_PROMPT_MULTI = """You are a debugging agent. Fix the specific error in the code.
+
+RULES:
+- Output ONLY valid JSON, no other text
+- Make MINIMAL changes to fix the error
+- Do NOT add new features or "improve" the code
+- Keep the same coding style as the original
+- You MAY fix multiple files if the error spans across them
+
+OUTPUT FORMAT:
+{
+  "changes": [
+    {"file": "app.py", "content": "fixed file content", "reason": "why (<=100 chars)"}
+  ]
+}"""
+
+FIX_SNIPPET_PROMPT = """You are a debugging agent. Fix the specific error with minimal snippet changes.
+
+RULES:
+- Output ONLY valid JSON, no other text
+- Only provide the specific lines that need to change (NOT the whole file)
+- Make the MINIMAL change needed to fix the error
+- Keep the same coding style
+
+OUTPUT FORMAT:
+{
+  "patches": [
+    {"file": "app.py", "old": "the exact lines to replace",
+     "new": "the replacement lines", "reason": "why (<=100 chars)"}
+  ],
+  "summary": "one-line fix summary (<=150 chars)"
+}"""
+
+
+def fix_multi(error_text: str, scope_files: list[str], model: str | None = None,
+              project_context: str | None = None) -> list[dict]:
+    code_blocks = ""
+    for f in scope_files:
+        p = Path(f)
+        if p.exists():
+            try:
+                content = p.read_text(encoding="utf-8")
+                ext = p.suffix.lower().lstrip(".") or "text"
+                code_blocks += f"\n```{ext}\n{content}\n```\n"
+            except (UnicodeDecodeError, OSError):
+                pass
+
+    context_block = f"{project_context}\n" if project_context else ""
+    user_message = f"""{context_block}Error:
+{error_text}
+
+Files to fix:
+{code_blocks}
+
+You may fix any of these files: {', '.join(scope_files)}
+Output ONLY the JSON with changes array."""
+
+    result = call_llm(
+        system_prompt=FIX_SYSTEM_PROMPT_MULTI,
+        user_message=user_message,
+        model=model,
+    )
+    if result is None:
+        return []
+    return result.get("changes", [])
+
+
+def fix_snippets(error_text: str, file_path: str, model: str | None = None,
+                 diff_context: str = "") -> list[dict]:
+    p = Path(file_path)
+    if not p.exists():
+        return []
+    current_code = p.read_text(encoding="utf-8")
+    ext = p.suffix.lower().lstrip(".") or "text"
+
+    diff_block = f"\nRecent changes (for context):\n{diff_context}\n" if diff_context else ""
+    user_message = f"""Error:
+{error_text}
+
+Current code in {file_path}:
+```{ext}
+{current_code}
+```
+{diff_block}
+Fix the error with minimal snippet changes. Output ONLY the JSON."""
+
+    result = call_llm(
+        system_prompt=FIX_SNIPPET_PROMPT,
+        user_message=user_message,
+        model=model,
+    )
+    if result is None:
+        return []
+    return result.get("patches", [])
+
+
 def apply_fix(fix_result: dict, work_dir: str = ".") -> bool:
-    """把 Fixer 的修复方案写入磁盘
+    """把 Fixer 的修复方案写入磁盘（文件级并发安全）
 
     Args:
         fix_result: {"file": "app.py", "content": "fixed code"}
@@ -122,13 +217,17 @@ def apply_fix(fix_result: dict, work_dir: str = ".") -> bool:
     Returns:
         bool: 写入是否成功
     """
+    from patchflow.core.concurrency import AtomicWrite, get_file_lock_manager
+
     wd = Path(work_dir)
     file_path = wd / fix_result["file"]
     content = fix_result["content"]
 
     try:
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding="utf-8")
+        flm = get_file_lock_manager()
+        with flm.lock(fix_result["file"]):
+            AtomicWrite.write(str(file_path), content)
         logger.info(f"应用修复: {file_path} ({len(content)} 字符)")
         return True
     except Exception as e:
