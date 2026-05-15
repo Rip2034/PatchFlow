@@ -89,6 +89,17 @@ OUTPUT FORMAT:
 }"""
 
 
+def _safe_int(value, default: int = 5) -> int:
+    """安全转换为 int，处理 LLM 可能返回的非数值（"8.5", "high", None 等）"""
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        try:
+            return int(float(value))
+        except (ValueError, TypeError):
+            return default
+
+
 def truncate(text: str, max_chars: int) -> str:
   if not text:
     return ""
@@ -136,7 +147,7 @@ def validate_review(data: dict) -> dict:
   """校验并补全 Reviewer 输出"""
   result = {
     "approved": bool(data.get("approved", False)),
-    "score": min(10, max(1, int(data.get("score", 5)))),
+    "score": min(10, max(1, _safe_int(data.get("score"), 5))),
     "summary": truncate(str(data.get("summary", "")), 150),
     "issues": (data.get("issues") or [])[:3],
     "feedback": truncate(str(data.get("feedback") or data.get("suggestion", "")), 200),
