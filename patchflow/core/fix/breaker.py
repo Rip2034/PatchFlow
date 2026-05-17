@@ -4,11 +4,10 @@
 借鉴 Claude Code 的 Denial 熔断器机制。
 
 熔断规则：
-  1. 达到最大重试次数 → 熔断
+1. 达到最大重试次数 → 熔断
   2. 同样的错误（类型+根因相同）连续出现 N 次 → 熔断
   3. 同一策略连续失败 M 次 → 自动升级策略
 """
-
 
 
 class FixLoopBreaker:
@@ -18,11 +17,12 @@ class FixLoopBreaker:
     SIMILAR_FAILURES_THRESHOLD = 2
     MAX_FAILURES_PER_STRATEGY = 1
 
-    def __init__(self, max_retries: int = 3):
+    def __init__(self, max_retries: int = 3, memory_bank=None):
         self.max_retries = max_retries
         self.turn = 0
         self.error_history: list[dict] = []
         self.strategy_failures: dict[str, int] = {}
+        self.memory_bank = memory_bank
 
     def should_retry(self, error_type: str, root_cause: str,
                      strategy_name: str | None = None) -> tuple[bool, str]:
@@ -46,6 +46,12 @@ class FixLoopBreaker:
         same_count = sum(1 for e in self.error_history if e.get("key") == error_key)
         if same_count >= self.SIMILAR_FAILURES_THRESHOLD:
             return False, f"same_error_repeated ({same_count + 1} times)"
+
+        if self.memory_bank:
+            should_skip, reason = self.memory_bank.should_skip(
+                error_type, root_cause, strategy_name or "")
+            if should_skip:
+                return False, f"memory_bank_skip: {reason}"
 
         if strategy_name:
             self.strategy_failures[strategy_name] = self.strategy_failures.get(strategy_name, 0) + 1
