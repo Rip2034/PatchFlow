@@ -16,7 +16,7 @@
   /clear   清空对话历史
   /plan    分步骤生成代码
   /build   一次性生成代码
-  /fix     多 Agent 修复
+  /fix     智能执行（Plan-and-Execute / ReAct / 多 Agent）
   /context 查看上下文状态
   /model   切换模型
   /stop    停止后台进程
@@ -62,18 +62,16 @@ HELP_TEXT = """[bold bright_white]可用命令:[/bold bright_white]
   [cyan]/exit[/cyan]    退出 PatchFlow
   [cyan]/quit[/cyan]    同上
   [cyan]/clear[/cyan]   清空对话历史
+  [cyan]/fix[/cyan]     智能执行任务（构建→Plan-and-Execute，修复→ReAct，自动选策略）
   [cyan]/history[/cyan] 显示对话统计
-  [cyan]/memory[/cyan]  显示记忆状态（智能检测，自动记忆开发任务）
+  [cyan]/memory[/cyan]  显示记忆状态
   [cyan]/model[/cyan]   列出/切换可用模型
-  [cyan]/plan[/cyan]    制定计划后分步骤生成代码（AI 先出计划，用户确认后执行）
-  [cyan]/build[/cyan]   一次性生成代码并自动验证
-  [cyan]/fix[/cyan]     多 Agent 协作修复代码问题（Analyzer → Fixer → Reviewer）
-  [cyan]/context[/cyan] 查看当前对话上下文（消息数、token、最近消息内容）
-  [cyan]/init[/cyan]    创建项目级 PatchFlow 规则文件 (.patchflow/rules.md)
+  [cyan]/context[/cyan] 查看对话上下文
+  [cyan]/init[/cyan]    创建项目规则文件 (.patchflow/rules.md)
   [cyan]/stop[/cyan]    停止后台进程，如 /stop 2
   [cyan]/ps[/cyan]      查看所有后台进程
 
-也可以直接输入任意问题或任务描述。"""
+直接输入任意内容即进入对话模式。"""
 
 
 def _interactive_select(options: list[tuple[str, str, str]]) -> str:
@@ -270,6 +268,13 @@ class REPL:
             _ensure_gitignore()
         except Exception as e:
             logger.debug(f"Gitignore 设置失败: {e}")
+
+        # ── 后台预热 tree-sitter 语法缓存 ──
+        try:
+            from patchflow.core.fix.conflict_detector import warm_tree_sitter_cache
+            warm_tree_sitter_cache()
+        except Exception:
+            pass
 
         console.print()
 
@@ -479,20 +484,11 @@ class REPL:
                 console.print("[dim]还没有对话历史[/dim]")
         elif cmd == "/model":
             self._cmd_model(arg)
-        elif cmd == "/build":
-            if not arg:
-                console.print("[yellow]用法: /build <任务描述>[/yellow]")
-            else:
-                self._do_build(arg)
-        elif cmd == "/plan":
-            if not arg:
-                console.print("[yellow]用法: /plan <任务描述>[/yellow]")
-                console.print("  [dim]示例: /plan 创建一个 FastAPI TODO 应用[/dim]")
-            else:
-                self._do_plan(arg)
         elif cmd == "/fix":
             if not arg:
                 console.print("[yellow]用法: /fix <任务描述>[/yellow]")
+                console.print("  [dim]示例: /fix 修复 UserService.java 中的 NullPointerException[/dim]")
+                console.print("  [dim]       /fix 创建一个 FastAPI TODO 应用[/dim]")
             else:
                 self._do_fix(arg)
         elif cmd == "/context":
@@ -603,15 +599,21 @@ class REPL:
                     elif evt == "tool_start":
                         name = data["name"]
                         args = data["args"]
-                        if name == "read_file":
-                            fn = args.get("filename", "?")
-                            console.print(f"  [cyan]read[/cyan]  [dim]{fn}[/dim]")
+                        if name == "read":
+                            raw = args.get("files", "?")
+                            if isinstance(raw, list):
+                                preview = ", ".join(raw[:3])
+                                if len(raw) > 3:
+                                    preview += f" (+{len(raw)-3} more)"
+                                console.print(f"  [cyan]read[/cyan] [dim]{preview}[/dim]")
+                            else:
+                                console.print(f"  [cyan]read[/cyan] [dim]{raw}[/dim]")
                         elif name == "write_file":
                             fn = args.get("filename", "")
                             console.print(f"  [green]✎ AI[/green] [dim]{fn}[/dim]")
-                        elif name == "list_files":
+                        elif name == "list":
                             p = args.get("path", ".")
-                            console.print(f"  [cyan]scan[/cyan]  [dim]{p}[/dim]")
+                            console.print(f"  [cyan]list[/cyan] [dim]{p}[/dim]")
                         elif name == "delete_file":
                             fn = args.get("filename", "")
                             console.print(f"  [red]del[/red]  [dim]{fn}[/dim]")
@@ -623,21 +625,12 @@ class REPL:
                             cmd = args.get("command", "?")
                             display = cmd if len(cmd) < 80 else cmd[:77] + "..."
                             console.print(f"  [yellow]$[/yellow] [bold]{display}[/bold]")
-                        elif name == "search_files":
+                        elif name == "search":
                             q = args.get("query", "?")
                             console.print(f"  [magenta]search[/magenta] [dim]{q}[/dim]")
-                        elif name == "search_code":
-                            p = args.get("pattern", "?")
-                            console.print(f"  [magenta]grep[/magenta]  [dim]{p}[/dim]")
                         elif name == "review_code":
                             fn = args.get("filepath", "?")
                             console.print(f"  [yellow]review[/yellow] [dim]{fn}[/dim]")
-                        elif name == "batch_read_files":
-                            files = args.get("files", [])
-                            files_preview = ", ".join(files[:3])
-                            if len(files) > 3:
-                                files_preview += f" (+{len(files)-3} more)"
-                            console.print(f"  [cyan]batch[/cyan] [dim]{files_preview}[/dim]")
 
                     elif evt == "tool_result":
                         name = data["name"]
@@ -650,13 +643,18 @@ class REPL:
                             spinner_thread = threading.Thread(target=_start_spinner, args=(stop_spinner,), daemon=True)
                             spinner_thread.start()
                             continue
-                        if name == "read_file":
+                        if name == "read":
                             if result.startswith("ERROR"):
                                 console.print("    [red]✘[/red] [dim]read failed[/dim]")
                             elif result == "(tool skipped — budget exhausted)":
                                 console.print("    [dim](skipped — budget exhausted)[/dim]")
                             elif result.startswith("(already read"):
                                 console.print(f"    [dim]{result}[/dim]")
+                            elif "\n\n" in result and result.startswith("# ==="):
+                                # 批量读取
+                                n = len(result)
+                                files = sum(1 for part in result.split("\n\n") if part.startswith("# ==="))
+                                console.print(f"    [dim]{files} files, {n} chars[/dim]")
                             else:
                                 n = len(result)
                                 console.print(f"    [dim]{n} chars[/dim]")
@@ -664,7 +662,7 @@ class REPL:
                             content = data["args"].get("content", "")
                             n = len(content.split("\n"))
                             console.print(f"    [dim]{n} lines[/dim]")
-                        elif name == "list_files":
+                        elif name == "list":
                             n = sum(1 for line in result.split("\n") if line.strip().startswith(("├", "└")))
                             if n:
                                 console.print(f"    [dim]{n} items[/dim]")
@@ -697,22 +695,20 @@ class REPL:
                                         console.print(f"    [red]✘ exit {exit_code}[/red] [dim]{error_line}[/dim]")
                                     else:
                                         console.print(f"    [red]✘ exit {exit_code}[/red]")
-                        elif name == "search_files":
+                        elif name == "search":
                             n = result.count("\n") + 1 if result.strip() else 0
-                            if "未找到" in result:
+                            if "未找到" in result or "no matches" in result:
                                 console.print("    [yellow]no results[/yellow]")
-                            else:
+                            elif any(line[0].isdigit() and ". " in line for line in result.split("\n")[:1]):
+                                # 语义搜索结果（编号列表）
                                 console.print(f"    [magenta]{n}[/magenta] [dim]files[/dim]")
                                 search_outputs.append((f"  search: {data['args'].get('query', '')}", result))
-                        elif name == "search_code":
-                            n = result.count("\n") + 1 if result.strip() else 0
-                            if "no matches" in result:
-                                console.print("    [yellow]no matches[/yellow]")
                             else:
+                                # 正则搜索结果
                                 console.print(f"    [magenta]{n}[/magenta] [dim]matches[/dim]")
                                 preview = "\n".join(result.split("\n")[:8])
                                 more = f"\n  ... (total {n} matches)" if n > 8 else ""
-                                search_outputs.append((f"  grep: {data['args'].get('pattern', '')[:50]}", f"{preview}{more}"))
+                                search_outputs.append((f"  search: {data['args'].get('query', '')[:50]}", f"{preview}{more}"))
 
                         all_tool_calls.append(data)
                         if name == "write_file":
@@ -729,9 +725,6 @@ class REPL:
                             else:
                                 first = result.split("\n")[0]
                                 console.print(f"    [yellow]{first}[/yellow]")
-                        elif name == "batch_read_files":
-                            file_count = len(data["args"].get("files", []))
-                            console.print(f"    [dim]{file_count} files[/dim]")
 
                     elif evt == "usage":
                         session_usage = data
@@ -895,131 +888,198 @@ class REPL:
         for alias, info in models.items():
             console.print(f"  [cyan]{alias}[/cyan] [dim]({info.get('provider', '?')})[/dim]")
 
-    def _do_build(self, task: str):
-        from patchflow.core.orchestrator import Orchestrator
-
-        console.print(f"[dim]任务: {task}[/dim]")
-        console.print(f"[dim]模型: {self.model}[/dim]")
-
-        orchestrator = Orchestrator(model=self.model)
-        success = orchestrator.run(task)
-
-        if success:
-            console.print(f"[green]成功完成! (修复 {orchestrator.state['turn']} 轮)[/green]")
-        else:
-            console.print("[red]构建失败, 请重试或检查模型配置[/red]")
-            console.print()
-
     def _do_fix(self, task: str):
-        from patchflow.core.agent_orchestrator import AgentOrchestrator
+        """统一任务执行入口 — LLM 规划 + ReAct 执行
 
-        console.print(f"[dim]任务: {task}[/dim]")
-        console.print(f"[dim]模型: {self.model}[/dim]")
-        console.print("[yellow]启动多 Agent 协作模式 (Analyzer → Fixer → Reviewer)...[/yellow]")
-
-        orch = AgentOrchestrator(model=self.model, work_dir=".")
-        success = orch.run_from_task(task)
-
-        if success:
-            console.print(f"[green]多 Agent 协作修复成功! (共 {orch.turn_count} 步)[/green]")
-        else:
-            console.print("[red]修复失败, 请重试或检查模型配置[/red]")
-            console.print()
-
-    def _do_plan(self, task: str):
-        """制定计划后分步骤生成代码"""
-        from rich.table import Table
-
+        始终先让 LLM 生成计划，LLM 判断任务复杂度：
+          - 简单任务 → 1 步计划 → ReAct 直接执行（无需用户审批）
+          - 复杂任务 → 多步计划 → 展示 → 用户确认 → 每步用 ReAct 执行
+          - 计划失败 → 回退到纯 ReAct
+          - ReAct 失败 → 回退到多 Agent 协作管道
+        """
         from patchflow.core.planner import PlanExecutor
 
         console.print(f"[dim]任务: {task}[/dim]")
         console.print(f"[dim]模型: {self.model}[/dim]")
         console.print()
 
+        # Step 1: LLM 生成计划（LLM 自己判断复杂度，决定 1 步还是多步）
+        console.print("[cyan]⠋ 分析任务并生成执行计划...[/cyan]")
         executor = PlanExecutor(model=self.model, work_dir=".")
-
         plan = executor.generate_plan(task)
-        if plan is None or not plan.steps:
-            console.print("[red]计划生成失败[/red]")
+        if plan is None:
+            console.print("[yellow]⚠ 计划生成失败，回退到 ReAct...[/yellow]")
+            self._do_fix_react(task)
             return
 
-        # ── 显示计划 ──
+        console.print(f"\r  [green]✓[/green] [dim]{plan.summary} ({len(plan.steps)} 步)[/dim]")
+        console.print()
+
+        # Step 2: 简单任务（1 步）→ 跳过审批，ReAct 直接执行
+        if len(plan.steps) == 1:
+            self._execute_step_with_react(plan.steps[0], step_num="1/1")
+            return
+
+        # Step 3: 复杂任务（2+ 步）→ 展示计划，用户确认后逐步执行
+        from rich.table import Table
         table = Table(title=f"Plan: {plan.summary}", title_style="bold cyan", border_style="cyan")
         table.add_column("#", style="dim", width=3)
         table.add_column("Step", style="bold", width=30)
         table.add_column("Description", style="dim", width=60)
-
         for s in plan.steps:
             files_hint = ", ".join(s.files_expected[:3])
             if len(s.files_expected) > 3:
                 files_hint += "..."
             desc = f"{s.description} [dim]({files_hint})[/dim]" if files_hint else s.description
             table.add_row(str(s.step), s.title, desc)
-
         console.print(table)
         console.print()
 
-        # ── 确认 ──
         console.print("[bold]是否按此计划执行?[/bold]")
         console.print("  [green]y[/green] — 开始执行")
         console.print("  [red]n[/red] — 取消")
-
         try:
             confirm = input().strip().lower()
         except (EOFError, KeyboardInterrupt):
             confirm = "n"
             console.print("[dim]已取消[/dim]")
-
-        if confirm != "y" and confirm != "yes":
+        if confirm not in ("y", "yes"):
             console.print("[yellow]计划已取消[/yellow]")
             return
 
-        # ── 执行 ──
+        # Step 4: 逐步用 ReAct 执行
         console.print()
         console.print("[bold cyan]开始执行计划...[/bold cyan]")
         console.print()
 
         total = len(plan.steps)
-        all_ok = True
-
-        for i, step in enumerate(plan.steps):
-            step_num = f"[{i + 1}/{total}]"
-            console.print(f"  {step_num} [bold]{step.title}[/bold]")
-            console.print(f"       [dim]{step.description}[/dim]")
-            console.print("       [cyan]⠋ 生成中...[/cyan]")
-
-            ok = executor.execute_step(i)
-
-            if ok:
-                files_str = ", ".join(step.files_written[:3])
-                extra = f" (+{len(step.files_written) - 3} files)" if len(step.files_written) > 3 else ""
-                console.print(f"\r  {step_num} [green]v[/green] [bold]{step.title}[/bold]")
-                if files_str:
-                    console.print(f"       [dim]{files_str}{extra}[/dim]")
+        for i, s in enumerate(plan.steps):
+            step_num = f"{i + 1}/{total}"
+            console.print(f"  [bold]{step_num} — {s.title}[/bold]")
+            console.print(f"       [dim]{s.description}[/dim]")
+            ok = self._execute_step_with_react(s, step_num=step_num)
+            console.print()
+            if not ok:
+                console.print(f"[red]执行中断 (完成 {i}/{total} 步)[/red]")
                 console.print()
-            else:
-                console.print(f"\r  {step_num} [red]x[/red] [bold]{step.title}[/bold]")
-                console.print(f"       [red]{step.error or '步骤失败'}[/red]")
-                console.print()
-                all_ok = False
-                break
+                return
 
-        # ── 最终验证 ──
-        if all_ok:
-            console.print("[bold cyan]执行完成, 正在最终验证...[/bold cyan]")
-            from patchflow.core.fix.validator import validate
-            result = validate(work_dir=".")
-            if result.ok:
-                console.print("[green]v 验证通过[/green]")
-                console.print(f"[green bold]成功完成! ({total} 步)[/green bold]")
-            else:
-                console.print(f"[yellow]验证未通过: {result.message or '验证失败'}[/yellow]")
-                console.print(f"[red bold]执行完成 ({total} 步), 但验证未通过[/red bold]")
-                all_ok = False
+        # Step 5: 最终验证
+        console.print("[bold cyan]执行完成, 正在最终验证...[/bold cyan]")
+        from patchflow.core.fix.validator import validate
+        result = validate(work_dir=".")
+        if result.ok:
+            console.print("[green]✓ 验证通过[/green]")
+            console.print(f"[green bold]成功完成! ({total} 步)[/green bold]")
         else:
-            console.print(f"[red]执行中断 (完成 {i + 1}/{total} 步)[/red]")
+            console.print(f"[yellow]验证未通过: {result.message or '验证失败'}[/yellow]")
+        console.print()
+
+    def _execute_step_with_react(self, step, step_num: str = "") -> bool:
+        """用 ReAct Agent 执行单个计划步骤
+
+        Args:
+            step: PlanStep 对象（含 task/description/title）
+            step_num: 步骤编号字符串，如 "1/3"
+
+        Returns:
+            bool: 是否成功
+        """
+        from patchflow.agents.react_agent import ReActAgent
+
+        prefix = f"[{step_num}] " if step_num else ""
+        label = f"{prefix}{step.title}"
+
+        def on_event(event_type: str, data):
+            if event_type == "thought":
+                lines = str(data).split("\n")
+                preview = lines[0][:120]
+                more = f" ...(+{len(lines) - 1} lines)" if len(lines) > 1 else ""
+                if len(str(data)) > 120:
+                    console.print(f"    [dim italic]💭 {preview}{more}[/dim italic]")
+                else:
+                    console.print(f"    [dim italic]💭 {data}[/dim italic]")
+            elif event_type == "action":
+                tool = data.get("tool", "?")
+                args_preview = str(data.get("args", {}))
+                if len(args_preview) > 60:
+                    args_preview = args_preview[:57] + "..."
+                console.print(f"    [bold cyan]⚡ {tool}[/bold cyan] [dim]{args_preview}[/dim]")
+            elif event_type == "observation":
+                obs_text = str(data)
+                preview = obs_text[:150].replace("\n", " ")
+                if len(obs_text) > 150:
+                    preview += f" ... [{len(obs_text)} chars]"
+                console.print(f"    [dim]📋 {preview}[/dim]")
+            elif event_type == "finish":
+                console.print(f"    [green]✅ {data}[/green]")
+            elif event_type == "error":
+                console.print(f"    [red]❌ {data}[/red]")
+
+        agent = ReActAgent(model=self.model, work_dir=".",
+                           max_steps=10, thinking_budget=1500)
+        result = agent.run(step.task, on_event=on_event)
+
+        if result:
+            console.print(f"  {prefix}[green]✓ {step.title}[/green]")
+            return True
+        else:
+            console.print(f"  {prefix}[red]✗ {step.title}[/red] [dim](ReAct 未完成)[/dim]")
+            return False
+
+    def _do_fix_react(self, task: str):
+        """纯 ReAct 策略（供 Plan 失败时回退）"""
+        from patchflow.agents.react_agent import ReActAgent
+
+        def on_event(event_type: str, data):
+            if event_type == "thought":
+                lines = str(data).split("\n")
+                preview = lines[0][:120]
+                more = f" ...(+{len(lines) - 1} lines)" if len(lines) > 1 else ""
+                if len(str(data)) > 120:
+                    console.print(f"  [dim italic]💭 {preview}{more}[/dim italic]")
+                else:
+                    console.print(f"  [dim italic]💭 {data}[/dim italic]")
+            elif event_type == "action":
+                tool = data.get("tool", "?")
+                args_preview = str(data.get("args", {}))
+                if len(args_preview) > 60:
+                    args_preview = args_preview[:57] + "..."
+                console.print(f"  [bold cyan]⚡ {tool}[/bold cyan] [dim]{args_preview}[/dim]")
+            elif event_type == "observation":
+                obs_text = str(data)
+                preview = obs_text[:200].replace("\n", " ")
+                if len(obs_text) > 200:
+                    preview += f" ... [{len(obs_text)} chars]"
+                console.print(f"  [dim]📋 {preview}[/dim]")
+            elif event_type == "finish":
+                console.print(f"  [green]✅ {data}[/green]")
+            elif event_type == "error":
+                console.print(f"  [red]❌ {data}[/red]")
+
+        agent = ReActAgent(model=self.model, work_dir=".",
+                           max_steps=15, thinking_budget=2000)
+        result = agent.run(task, on_event=on_event)
 
         console.print()
+        if result:
+            console.print(f"[green]✓ 任务完成[/green]")
+        else:
+            console.print("[yellow]⚠ ReAct 未完全解决，尝试多 Agent 协作管道...[/yellow]")
+            self._fallback_multi_agent(task)
+
+    def _fallback_multi_agent(self, task: str):
+        """ReAct 回退：多 Agent 协作修复管道"""
+        try:
+            from patchflow.core.agent_orchestrator import AgentOrchestrator
+            orch = AgentOrchestrator(model=self.model, work_dir=".")
+            success = orch.run_from_task(task)
+            if success:
+                console.print(f"[green]✓ 多 Agent 协作修复成功 (共 {orch.turn_count} 步)[/green]")
+            else:
+                console.print("[red]✗ 修复失败，请检查模型配置或手动修复[/red]")
+        except Exception as e:
+            console.print(f"[red]✗ 回退管道失败: {e}[/red]")
 
     def _cmd_context(self):
         """显示当前对话上下文的详细结构"""
@@ -1078,17 +1138,17 @@ class REPL:
 
         if has_file:
             size = len(memory_path.read_bytes())
-            limit_kb = self.client._MAX_MEMORY_BYTES // 1024
+            limit_kb = self.client.MAX_MEMORY_BYTES // 1024
             if size > 1024:
                 console.print(f"  文件: [dim].patchflow/memory.json ({size // 1024} KB / {limit_kb} KB)[/dim]")
             else:
                 console.print(f"  文件: [dim].patchflow/memory.json ({size} B / {limit_kb} KB)[/dim]")
-            pct = size / self.client._MAX_MEMORY_BYTES * 100
+            pct = size / self.client.MAX_MEMORY_BYTES * 100
             if pct > 80:
                 console.print(f"  状态: [yellow]已用 {pct:.0f}%，旧消息将被自动压缩为摘要[/yellow]")
             else:
                 console.print(f"  状态: [green]{pct:.0f}% 已使用[/green]")
-            summaries = self.client._memory_summary
+            summaries = self.client.memory_summary
             if summaries:
                 console.print(f"  [bold]摘要预览 (最近 {min(3, len(summaries))} 条):[/bold]")
                 for s in summaries[-3:]:
