@@ -235,7 +235,7 @@ def plan(task: str, model: str | None, work_dir: str, yes: bool):
         if result.ok:
             logger.success("最终验证通过")
         else:
-            logger.warn(f"最终验证: {result.message or '未通过'}")
+            logger.warn(f"最终验证未通过: {result.message or '验证失败'}")
     else:
         logger.error(f"执行中断 (完成 {i + 1}/{total} 步)")
 
