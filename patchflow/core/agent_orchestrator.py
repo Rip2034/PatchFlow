@@ -30,6 +30,9 @@ AgentOrchestrator 使用多个独立 Agent 协作完成修复：
 
 from pathlib import Path
 
+from patchflow.core.fix.breaker import FixLoopBreaker
+from patchflow.core.fix.change_set import ChangeSet
+from patchflow.core.fix.patch_applicator import DiffTracker
 from patchflow.core.fix.scope_calculator import DepGraph
 from patchflow.core.fix.snapshot_manager import SnapshotManager
 from patchflow.utils import logger
@@ -46,8 +49,15 @@ class AgentOrchestrator:
         self.work_dir = work_dir
         self.snapshot = SnapshotManager(work_dir)
         self.dep_graph = DepGraph(work_dir)
+        self.code_graph = None  # 延迟构建（首次 run 时）
         self.turn_count = 0
         self._agent_aliases: dict[str, str] = {}
+        from patchflow.core.fix.memory_bank import FixMemoryBank
+        self.memory_bank = FixMemoryBank(work_dir=work_dir)
+        self.memory_bank.load()
+        self.breaker = FixLoopBreaker(max_retries=2, memory_bank=self.memory_bank)
+        self.change_set = ChangeSet(work_dir=work_dir, dep_graph=self.dep_graph)
+        self.diff_tracker = DiffTracker()
 
     def _get_alias(self, role: str) -> str | None:
         """读取 config.json 中 agents 段的角色-模型别名映射"""
@@ -74,16 +84,16 @@ class AgentOrchestrator:
         logger.info("[AgentOrch] run_from_task: 自动收集项目上下文...")
 
         # 1. 收集项目上下文
-        from patchflow.core.language_registry import LanguageRegistry
         from patchflow.core.project.context_collector import ContextCollector
         collector = ContextCollector(wd)
         ctx = collector.collect(use_cache=True)
 
         # 2. 读取所有源码文件（按语言自动识别扩展名）
         code = {}
-        reg = LanguageRegistry()
-        detected_lang = reg.detect(wd)
-        exts = detected_lang.extensions if detected_lang else {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".rb", ".php", ".cs", ".swift", ".kt"}
+        from patchflow.core.language_strategy import LanguageFactory
+        factory = LanguageFactory()
+        strategy = factory.detect(wd)
+        exts = strategy.extensions if strategy else factory.all_extensions
         for ext in exts:
             for f in Path(wd).rglob(f"*{ext}"):
                 rel = str(f.relative_to(wd))
@@ -94,32 +104,21 @@ class AgentOrchestrator:
                 except Exception:
                     continue
 
-        # 3. 尝试运行获取错误（按语言选择入口点+运行命令）
+        # 3. 尝试运行获取错误（使用 LanguageStrategy 入口点+运行命令）
         error_text = ""
-        entry_map = {
-            "python": {"entries": ["main.py", "app.py", "cli.py", "manage.py"], "cmd": "python"},
-            "javascript": {"entries": ["index.js", "app.js", "server.js", "main.js"], "cmd": "node"},
-            "typescript": {"entries": ["index.ts", "app.ts", "server.ts", "main.ts"], "cmd": "node"},
-            "java": {"entries": ["Main.java", "Application.java", "App.java"], "cmd": "java"},
-            "go": {"entries": ["main.go"], "cmd": "go run"},
-            "rust": {"entries": ["src/main.rs", "src/lib.rs"], "cmd": "cargo run"},
-        }
-        lang_name = detected_lang.name if detected_lang else "python"
-        lang_config = entry_map.get(lang_name, entry_map["python"])
-        for entry in lang_config["entries"]:
-            entry_path = Path(wd, entry)
-            if entry_path.exists():
+        if strategy:
+            entry = strategy.find_entry_file(Path(wd))
+            if entry and strategy.run_command:
                 from patchflow.utils.runner import run
-                cmd = f"{lang_config['cmd']} {entry}"
+                cmd = f"{strategy.run_command} {entry.name}"
                 result = run(cmd, cwd=wd, timeout=30)
                 if result.exit_code != 0:
                     error_text = result.stderr.strip() or result.stdout.strip()
-                    break
-        else:
-            if lang_name == "python":
-                error_text = "(no entry point found, repair based on task description)"
-            else:
+            if not error_text:
+                lang_name = strategy.name
                 error_text = f"(no entry point found for {lang_name}, repair based on error output)"
+        else:
+            error_text = "(no language detected, repair based on task description)"
 
         # 4. 构建 Blackboard
         from patchflow.agents.blackboard import Blackboard
@@ -179,14 +178,36 @@ class AgentOrchestrator:
         logger.info(f"  AgentOrch 任务: {blackboard['task'][:80]}")
 
         # ── 保存快照 ──
+        display.set_detail(0, "Saving snapshot...")
         files_to_snapshot = list(blackboard.get("code", {}).keys())
         snap_id = self.snapshot.save(files_to_snapshot)
 
         # ── 构建依赖图（用于 Scope 计算和冲突检测）──
+        display.set_detail(0, "Building dependency graph...")
         try:
             self.dep_graph.build()
         except Exception as e:
             logger.debug(f"Dep graph 构建失败（非致命）: {e}")
+
+        # ── 构建语义代码图谱（函数/类级别，用于精确 Scope）──
+        if self.code_graph is None:
+            try:
+                from patchflow.core.language_registry import LanguageRegistry
+                from patchflow.core.fix.code_graph import CodeGraph
+                display.set_detail(0, "Detecting language...")
+                lang = LanguageRegistry().detect(str(self.work_dir))
+                if lang:
+                    display.set_detail(0, f"Building semantic code graph ({lang.name})...")
+                    self.code_graph = CodeGraph(str(self.work_dir), lang)
+                    logger.info(f"[AgentOrch] CodeGraph built: {len(self.code_graph.files)} files, "
+                                f"{len(self.code_graph.symbols)} symbols")
+            except Exception as e:
+                logger.debug(f"CodeGraph 构建失败（非致命，回退 file-level）: {e}")
+                self.code_graph = None
+
+        # 注入 CodeGraph 到 Blackboard（Agent 可通过黑板书读取语义分块）
+        if self.code_graph is not None:
+            blackboard.code_graph = self.code_graph
 
         # ── Step 1: Analyzer 分析错误 ──
         # 调用分析 Agent 定位问题根因，返回错误类型、置信度、影响文件等
@@ -211,10 +232,17 @@ class AgentOrchestrator:
 
         # ── Step 3: Fixer 生成修复补丁 ──
         # 根据分析结果生成具体的代码修改（patch）
+        # 先查询记忆库：是否有相似历史修复作为上下文
+        memory_ctx = self._query_memory_context(analysis)
+        if memory_ctx:
+            blackboard["memory_context"] = memory_ctx
+            logger.info(f"[AgentOrch] 找到相似历史修复:\n{memory_ctx}")
+
         display.set_detail(1, f"Fixing {len(code_files)} files...")
         display.set_running(1)
         from patchflow.agents.fixer_agent import agent_fix, apply_agent_patches
         blackboard["fix_plan"] = agent_fix(blackboard, dep_graph=self.dep_graph,
+                                           code_graph=self.code_graph,
                                            model=self.model, model_alias=fixer_alias)
         self.turn_count += 1
         patch_count = len(blackboard["fix_plan"].get("patches", []))
@@ -226,6 +254,7 @@ class AgentOrchestrator:
             display.set_failed(1, "未生成任何补丁")
             display.finish(False)
             logger.error("[AgentOrch] Fixer 未生成任何补丁，终止")
+            self._record_fix_outcome(analysis, [], False, "agent_fix")
             self.snapshot.rollback(snap_id)
             return False
 
@@ -240,12 +269,15 @@ class AgentOrchestrator:
                     original_files[fp] = p.read_text(encoding="utf-8")
 
         # ── 应用补丁到文件系统 ──
-        if not apply_agent_patches(blackboard, work_dir=self.work_dir):
+        if not apply_agent_patches(blackboard, work_dir=self.work_dir, diff_tracker=self.diff_tracker):
             display.set_failed(1, "补丁应用失败")
             display.finish(False)
             logger.error("[AgentOrch] 补丁应用失败")
+            self._record_fix_outcome(analysis, [], False, "agent_fix")
             self.snapshot.rollback(snap_id)
             return False
+
+        patched_files = list({p.get("file", "") for p in blackboard["fix_plan"].get("patches", []) if p.get("file")})
 
         # ── Step 4: Reviewer 审查 ──
         # 审查修复质量，给出 score（0-10）和 approval
@@ -268,11 +300,22 @@ class AgentOrchestrator:
             # 回滚到原始文件
             self.snapshot.rollback(snap_id)
 
+            # 检查熔断器
+            should_retry, reason = self.breaker.should_retry(
+                analysis.get("error_type", ""), analysis.get("root_cause", ""), "agent_fix"
+            )
+            if not should_retry:
+                logger.error(f"[AgentOrch] 熔断: {reason}")
+                self._record_fix_outcome(analysis, patched_files, False, "agent_fix")
+                display.finish(False)
+                return False
+
             # 带 feedback 重新修复
             blackboard["review_feedback"] = review.get("feedback", "")
             display.set_detail(1, "Redoing based on review feedback...")
             display.set_retry(1)
             blackboard["fix_plan"] = agent_fix(blackboard, dep_graph=self.dep_graph,
+                                               code_graph=self.code_graph,
                                                model=self.model, model_alias=fixer_alias)
             self.turn_count += 1
 
@@ -280,6 +323,7 @@ class AgentOrchestrator:
                 display.set_failed(1, "二次修复未生成补丁")
                 display.finish(False)
                 logger.error("[AgentOrch] 二次修复未生成补丁")
+                self._record_fix_outcome(analysis, patched_files, False, "agent_fix")
                 return False
 
             patch_count2 = len(blackboard["fix_plan"].get("patches", []))
@@ -288,11 +332,14 @@ class AgentOrchestrator:
             # 重新保存快照对二次修复后的内容
             snap_id = self.snapshot.save(files_to_snapshot)
 
-            if not apply_agent_patches(blackboard, work_dir=self.work_dir):
+            if not apply_agent_patches(blackboard, work_dir=self.work_dir, diff_tracker=self.diff_tracker):
                 display.set_failed(1, "二次补丁应用失败")
                 display.finish(False)
+                self._record_fix_outcome(analysis, patched_files, False, "agent_fix")
                 self.snapshot.rollback(snap_id)
                 return False
+
+            patched_files = list({p.get("file", "") for p in blackboard["fix_plan"].get("patches", []) if p.get("file")})
 
             # 再审
             display.set_detail(2, "Re-reviewing...")
@@ -307,6 +354,7 @@ class AgentOrchestrator:
                 display.set_failed(2, f"二次审查未通过 ({review.get('score',0)})")
                 display.finish(False)
                 logger.error(f"[AgentOrch] 二次审查仍未通过 (score: {review.get('score',0)})")
+                self._record_fix_outcome(analysis, patched_files, False, "agent_fix")
                 self.snapshot.rollback(snap_id)
                 return False
 
@@ -318,15 +366,49 @@ class AgentOrchestrator:
         if result.ok:
             self.snapshot.commit(snap_id)
             self._print_diff_report(original_files)
+            self._record_fix_outcome(analysis, patched_files, True, "agent_fix")
+            self.memory_bank.save()
             logger.success(f"[AgentOrch] Agent 协作修复成功! ({self.turn_count} 步)")
             display.finish(True)
             return True
 
         # 验证失败 → 回滚
         logger.error("[AgentOrch] 验证失败，回滚")
+        self._record_fix_outcome(analysis, patched_files, False, "agent_fix")
         display.finish(False)
         self.snapshot.rollback(snap_id)
         return False
+
+    def _query_memory_context(self, analysis: dict) -> str:
+        """查询记忆库中的相似历史修复，返回格式化上下文"""
+        error_type = analysis.get("error_type", "")
+        root_cause = analysis.get("root_cause", "")
+        if not error_type or not root_cause:
+            return ""
+        similar = self.memory_bank.query(error_type, root_cause)
+        if not similar:
+            return ""
+        parts = []
+        for m in similar[:3]:
+            status = "ok" if m.success else "failed"
+            parts.append(f"  [{status}] {m.fix_pattern[:80]}")
+        return "Similar past fixes:\n" + "\n".join(parts)
+
+    def _record_fix_outcome(self, analysis: dict, file_paths: list[str],
+                            success: bool, strategy: str) -> None:
+        """记录修复结果到记忆库"""
+        error_type = analysis.get("error_type", "")
+        root_cause = analysis.get("root_cause", "")
+        if not error_type or not root_cause:
+            return
+        self.memory_bank.add(
+            error_type=error_type,
+            root_cause=root_cause,
+            fix_pattern=f"{'fixed' if success else 'failed'}: {root_cause[:100]}",
+            file_paths=file_paths or analysis.get("impact_files", []),
+            success=success,
+            strategy_used=strategy,
+        )
 
     def _print_diff_report(self, original_files: dict[str, str]):
         diff_lines = []

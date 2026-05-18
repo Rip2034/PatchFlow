@@ -33,11 +33,13 @@ from patchflow.core.language_registry import LanguageRegistry
 class Scope:
     """修复范围结果"""
     def __init__(self, files: list[str], lines: list[int] | None = None,
-                 strategy: str = "line", description: str = ""):
+                 strategy: str = "line", description: str = "",
+                 symbols: list[dict] | None = None):
         self.files = files
         self.lines = lines or []
         self.strategy = strategy
         self.description = description
+        self.symbols = symbols or []  # 语义级符号列表 [{uid, name, kind, file}]
 
 
 class DepGraph:
@@ -122,20 +124,8 @@ class DepGraph:
     def find_type(self, type_name: str) -> str | None:
         cleaned = type_name.split(":")[0].strip().split()[-1] if " " in type_name else type_name
         _, lang = self._get_import_parser()
-        patterns = []
-        if lang:
-            if lang.name == "python":
-                patterns = [f"class {cleaned}", f"type {cleaned}"]
-            elif lang.name in ("javascript", "typescript"):
-                patterns = [f"class {cleaned}", f"function {cleaned}", f"const {cleaned}"]
-            elif lang.name == "java":
-                patterns = [f"class {cleaned}", f"interface {cleaned}"]
-            elif lang.name == "go":
-                patterns = [f"type {cleaned}"]
-            elif lang.name == "rust":
-                patterns = [f"struct {cleaned}", f"enum {cleaned}", f"trait {cleaned}"]
-            else:
-                patterns = [f"class {cleaned}", f"type {cleaned}"]
+        if lang and lang.type_search_patterns:
+            patterns = [f"{p}{cleaned}" for p in lang.type_search_patterns]
         else:
             patterns = [f"class {cleaned}", f"type {cleaned}"]
 
@@ -164,16 +154,21 @@ class DepGraph:
         return result
 
 
-def calculate(analysis, dep_graph: DepGraph | None = None) -> Scope:
+def calculate(analysis, dep_graph: DepGraph | None = None,
+              code_graph=None) -> Scope:
     """根据错误分析和依赖图计算修复范围
 
     Args:
         analysis: Error Analyzer 输出的 ErrorAnalysis 对象
         dep_graph: 代码依赖图（可选，没有则退化为基于 trace 文件列表）
+        code_graph: CodeGraph 语义代码图谱（优先使用，实现函数级精度）
 
     Returns:
-        Scope: 包含修复范围（文件列表、行号、策略标识）
+        Scope: 包含修复范围（文件列表、行号、策略标识、符号列表）
     """
+    # 优先使用语义代码图谱
+    if code_graph is not None:
+        return calculate_semantic(analysis, code_graph)
     crash = analysis.call_chain[-1] if analysis.call_chain else {}
     error_type = analysis.type
 
@@ -243,4 +238,133 @@ def calculate(analysis, dep_graph: DepGraph | None = None) -> Scope:
         files=analysis.impact_files,
         strategy="callchain",
         description=f"{error_type}错误：默认调用链修复",
+    )
+
+
+def calculate_semantic(analysis, code_graph) -> Scope:
+    """基于语义代码图谱的精确范围计算
+
+    相比 file-level DepGraph 的优势：
+      - 精确到函数/方法级别，而非整个文件
+      - 通过调用链追踪，找到真正需要修改的符号
+      - 自动计算符号级别的语义上下文
+
+    Args:
+        analysis: ErrorAnalyzer 输出的 ErrorAnalysis 对象
+        code_graph: CodeGraph 实例
+
+    Returns:
+        Scope: 包含 symbol 级别的修复范围
+    """
+    crash = analysis.call_chain[-1] if analysis.call_chain else {}
+    crash_file = crash.get("file", "")
+    crash_line = crash.get("line", 0)
+    error_type = analysis.type
+
+    # ── 核心增强：定位到具体符号 ──
+    crash_symbol = None
+    if crash_file and crash_line:
+        crash_symbol = code_graph.find_symbol_by_location(crash_file, crash_line)
+    elif crash_file:
+        # 没有行号 → 取 crash 文件中最后一个函数（最可能的位置）
+        syms = code_graph.find_symbols(crash_file)
+        if syms:
+            crash_symbol = syms[-1]
+
+    crash_uid = crash_symbol.uid if crash_symbol else ""
+
+    def _sym_dict(uid: str) -> dict:
+        s = code_graph.get_symbol(uid)
+        if not s:
+            return {"uid": uid, "name": "?", "kind": "?", "file": ""}
+        return {"uid": s.uid, "name": s.name, "kind": s.kind, "file": s.file_rel}
+
+    # ── 按错误类型计算语义级范围 ──
+
+    if error_type == "syntax":
+        syms = []
+        if crash_symbol:
+            syms = [_sym_dict(crash_symbol.uid)]
+        return Scope(
+            files=analysis.impact_files[:1],
+            lines=[crash_line],
+            strategy="line",
+            description="语法错误：行级单符号修复",
+            symbols=syms,
+        )
+
+    if error_type == "type":
+        syms = []
+        if crash_symbol:
+            chain = code_graph.trace_call_chain(crash_symbol.uid, depth=3, direction="up")
+            syms = [{k: v for k, v in n.items() if k != "depth"} for n in chain[:5]]
+        return Scope(
+            files=analysis.impact_files[:3],
+            strategy="chain",
+            description="类型错误：语义追溯类型定义链修复",
+            symbols=syms,
+        )
+
+    if error_type == "runtime":
+        syms = []
+        if crash_symbol:
+            scope_info = code_graph.semantic_scope(crash_symbol.uid)
+            syms = [scope_info["symbol"]] if scope_info.get("symbol") else []
+            for caller in scope_info.get("direct_callers", [])[:3]:
+                syms.append(caller)
+            for callee in scope_info.get("direct_callees", [])[:3]:
+                syms.append(callee)
+        return Scope(
+            files=analysis.impact_files,
+            strategy="callchain",
+            description="运行时异常：语义调用链符号修复",
+            symbols=syms,
+        )
+
+    if error_type in ("import", "attribute", "key_error", "index_error",
+                       "value_error", "file_error"):
+        syms = []
+        if crash_symbol:
+            syms = [_sym_dict(crash_symbol.uid)]
+            # 加上同一文件的相关符号
+            fn = code_graph.files.get(crash_file)
+            if fn:
+                for uid in fn.symbols[:5]:
+                    if uid != crash_symbol.uid:
+                        syms.append(_sym_dict(uid))
+        return Scope(
+            files=analysis.impact_files,
+            strategy="callchain",
+            description=f"{error_type}错误：语义符号级修复",
+            symbols=syms,
+        )
+
+    if error_type == "name":
+        syms = []
+        if crash_symbol:
+            syms = [_sym_dict(crash_symbol.uid)]
+        return Scope(
+            files=analysis.impact_files[:1],
+            lines=[crash_line],
+            strategy="line",
+            description="名称错误：语义单符号单行修复",
+            symbols=syms,
+        )
+
+    if error_type == "test_fail":
+        syms = []
+        if crash_symbol:
+            chain = code_graph.trace_call_chain(crash_symbol.uid, depth=2, direction="down")
+            syms = [{k: v for k, v in n.items() if k != "depth"} for n in chain[:5]]
+        return Scope(
+            files=analysis.impact_files[:2],
+            strategy="logic",
+            description="测试失败：语义以测试函数为锚反推修正",
+            symbols=syms,
+        )
+
+    return Scope(
+        files=analysis.impact_files,
+        strategy="callchain",
+        description=f"{error_type}错误：语义默认调用链修复",
     )

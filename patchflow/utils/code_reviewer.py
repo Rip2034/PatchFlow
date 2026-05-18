@@ -11,6 +11,7 @@ AI 可以在阅读代码后主动调用，而不是等运行报错。
 import re
 from pathlib import Path
 
+from patchflow.core.language_strategy import LanguageFactory
 from patchflow.utils import logger
 from patchflow.utils.runner import run
 
@@ -68,39 +69,30 @@ def review_file(filepath: str, work_dir: str = ".") -> str:
 
 
 def _detect_lang(ext: str) -> str:
-    mapping = {
-        ".py": "python",
-        ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
-        ".ts": "typescript", ".tsx": "typescript",
-        ".java": "java", ".kt": "kotlin",
-        ".go": "go", ".rs": "rust",
-        ".rb": "ruby", ".php": "php",
-        ".c": "c", ".cpp": "cpp", ".h": "c", ".hpp": "cpp",
-        ".cs": "csharp",
-        ".swift": "swift",
-        ".vue": "vue", ".svelte": "svelte",
-        ".yaml": "yaml", ".yml": "yaml", ".json": "json", ".xml": "xml",
-        ".sql": "sql",
-        ".sh": "shell", ".bash": "shell", ".ps1": "powershell",
-        ".md": "markdown", ".html": "html", ".css": "css", ".scss": "scss",
-    }
-    return mapping.get(ext, "text")
+    """通过 LanguageFactory 检测语言"""
+    strategy = LanguageFactory().detect_by_extension(ext)
+    return strategy.name if strategy else "text"
 
 
 def _run_linter(filepath: str, ext: str, work_dir: str) -> list[dict]:
-    """尝试运行语言专用 linter（带硬超时，超时则降级）"""
+    """尝试运行语言专用 linter（带硬超时，超时则降级）— 通过 LanguageFactory 分发"""
     import threading
 
+    strategy = LanguageFactory().detect_by_extension(ext)
+    if strategy is None:
+        return []
+    lang_name = strategy.name
+
     # 项目级禁用检查
-    if ext in (".js", ".jsx", ".ts", ".tsx") and work_dir in _ESLINT_DISABLED:
+    if lang_name in ("javascript", "typescript") and work_dir in _ESLINT_DISABLED:
         return []
 
     results = []
     thread = None
 
-    if ext == ".py":
+    if lang_name == "python":
         thread = threading.Thread(target=lambda: results.extend(_run_pylint(filepath, work_dir)))
-    elif ext in (".js", ".jsx", ".ts", ".tsx"):
+    elif lang_name in ("javascript", "typescript"):
         thread = threading.Thread(target=lambda: results.extend(_run_eslint(filepath, work_dir)))
 
     if thread is None:
@@ -110,7 +102,7 @@ def _run_linter(filepath: str, ext: str, work_dir: str) -> list[dict]:
     thread.join(timeout=5)
 
     if thread.is_alive():
-        logger.warn(f"[Linter] eslint 超时（>5s），禁用 eslint: {filepath}")
+        logger.warn(f"[Linter] {lang_name} linter 超时（>5s），禁用: {filepath}")
         _ESLINT_DISABLED.add(work_dir)
         return []
 

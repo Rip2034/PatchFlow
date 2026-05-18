@@ -1,10 +1,12 @@
 """对话客户端 — 工具调用 + 流式输出(Claude Code 风格)
 
-AI 可以直接 write_file，read_file，run_code，list_files，search_files，search_code。
+AI 可以直接 write_file，read，edit_file，run_code，list，search，grep，review_code。
 支持流式输出 —— 一个字一个字显示，不是等完了才一起出来。
 """
 
 import json
+import os
+import re
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -13,6 +15,7 @@ from anthropic import Anthropic
 from openai import OpenAI
 
 from patchflow.core.config import get_config, get_normalized_provider
+from patchflow.core.language_strategy import LanguageFactory
 from patchflow.core.project.context_manager import compress
 from patchflow.utils import logger
 
@@ -32,7 +35,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "创建或覆盖一个文件。如果文件所在的目录不存在，会自动创建。",
+            "description": "创建或覆盖一个文件。如果文件所在的目录不存在，会自动创建。NEVER use run_code to create files (echo/cat/printf redirection) — use this tool instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -46,16 +49,22 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "read_file",
-            "description": "读取文件内容。这是读取文件内容的唯一正确工具，支持跨平台。大文件自动截断（保留首尾），可用 offset/limit 分页精读。不要用 run_code 来读文件。",
+            "name": "read",
+            "description": "读取文件内容。接受单个文件路径或路径列表，一个调用覆盖所有读文件场景。大文件自动截断（保留首尾），单文件可用 offset/limit 分页精读。NEVER use run_code (cat/type/python -c/node -e) to read files.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "filename": {"type": "string", "description": "要读取的文件名"},
-                    "offset": {"type": "integer", "description": "起始行号（0-based），默认 0"},
+                    "files": {
+                        "anyOf": [
+                            {"type": "string", "description": "单个文件路径"},
+                            {"type": "array", "items": {"type": "string"}, "description": "多个文件路径"}
+                        ],
+                        "description": "要读取的文件路径，如 'app.py' 或 ['app.py', 'utils.py']"
+                    },
+                    "offset": {"type": "integer", "description": "起始行号（0-based），默认 0，仅单文件时有效"},
                     "limit": {"type": "integer", "description": "最大读取行数，默认全部（大文件自动截断）"},
                 },
-                "required": ["filename"]
+                "required": ["files"]
             }
         }
     },
@@ -63,7 +72,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "rename_file",
-            "description": "移动或重命名文件/目录。用于整理项目结构，如把文件移到子目录、给文件改名等。如果目标父目录不存在会自动创建。",
+            "description": "移动或重命名文件/目录。用于整理项目结构，如把文件移到子目录、给文件改名等。如果目标父目录不存在会自动创建。NEVER use run_code (mv/ren) to move files — use this tool.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -77,26 +86,8 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "batch_read_files",
-            "description": "【推荐】一次读取多个文件。比逐个 read_file 高效得多，适合在 Phase 2/3 中批量读取相关文件。返回每个文件的完整内容，文件之间用分隔线隔开。已缓存的文件会标注 (already read)。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "files": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "要读取的文件路径列表，如 [\"src/UserService.java\", \"src/UserController.java\"]"
-                    },
-                },
-                "required": ["files"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "delete_file",
-            "description": "删除文件。用于清理临时文件、废弃代码或不需要的产物。慎用，每次删除都会确认。",
+            "description": "删除文件。用于清理临时文件、废弃代码或不需要的产物。每次删除都会确认。NEVER use run_code (rm/del) to delete files — use this tool.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -110,7 +101,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "run_code",
-            "description": "运行一条命令。返回命令输出。长驻命令（如 npm run dev）会自动转入后台运行，不会阻塞。",
+            "description": "运行一条合法命令（编译、测试、安装依赖等）。长驻命令（如 npm run dev）会自动转入后台运行。NEVER use this to read files (cat/type/python -c/node -e) — use read. NEVER use this to write files (echo >/printf) — use write_file. NEVER run hex dumps or byte checks.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -124,7 +115,7 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "list_files",
+            "name": "list",
             "description": "列出目录结构树（递归），了解项目架构。最佳用法是分层探索：先看根目录（depth=1），再深入主要子目录（depth=2-3）。自动忽略无关目录。超过 25 行会自动截断。嵌套的单目录链会合并为一行。",
             "parameters": {
                 "type": "object",
@@ -139,30 +130,15 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "search_files",
-            "description": "按概念搜索项目文件。用自然语言描述要找什么（如'处理支付的代码'）。无需配置即可使用——有 embedding 时语义搜索，没有时自动降级为关键词匹配。",
+            "name": "search",
+            "description": "搜索项目代码。自动判断查询类型：含正则元字符（\\\\ ^ $ * + ? [ ] ( ) |）→正则匹配代码，不含→语义搜索文件。用于查找函数定义、类引用、或按概念找文件。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "自然语言搜索描述，如 '用户认证相关代码' 或 'payment processing'"},
-                    "top_k": {"type": "integer", "description": "返回结果数量，默认 10"},
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_code",
-            "description": "在项目文件中执行正则搜索。用于精确查找函数定义、类引用、特定代码模式。返回匹配行及行号。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "正则表达式，如 'def\\s+processPayment' 或 'class\\s+User\\b'"},
+                    "query": {"type": "string", "description": "搜索词或正则表达式，如 '认证'、'def processPayment' 或 'class\\s+User\\b'"},
                     "path_filter": {"type": "string", "description": "可选：只搜索路径包含此字符串的文件，如 'service'"},
                 },
-                "required": ["pattern"]
+                "required": ["query"]
             }
         }
     },
@@ -184,22 +160,22 @@ TOOLS = [
 
 SYSTEM_PROMPT = (
     "You are PatchFlow, an AI coding assistant.\n"
-    "You have tools: write_file, read_file, batch_read_files, delete_file, rename_file, run_code, list_files, search_files, search_code, review_code.\n\n"
+    "You have tools: write_file, read, delete_file, rename_file, run_code, list, search, review_code.\n\n"
     "CRITICAL — READ BEFORE RESPONDING:\n"
     "When a user message contains tool_result blocks, those are the output of "
     "tools you just called. Your reply MUST be based on what those results ACTUALLY show.\n"
-    "If list_files returned 'index.html, package.json, src/', then SAY you see those files.\n"
+    "If list returned 'index.html, package.json, src/', then SAY you see those files.\n"
     "NEVER say 'the directory is empty' or contradict the tool output.\n\n"
     "WHEN run_code FAILS — FOLLOW THIS DIAGNOSTIC FLOW:\n"
     "  Step 1: Look at the stderr (it's in the tool result). DO NOT run diagnostic commands.\n"
-    "  Step 2: If the error is about file content/syntax, use read_file to check the file.\n"
+    "  Step 2: If the error is about file content/syntax, use read to check the file.\n"
     "  Step 3: Fix the actual issue. Do NOT run hex dumps, byte checks, or test files.\n"
     "  Example: 'exit: 1\\nstdout:\\n\\nstderr:\\nReferenceError: x is not defined'\n"
     "    → This tells you exactly what's wrong. Read the relevant file, find 'x', fix it.\n"
     "  NEVER run node -e to check bytes/encoding. NEVER create test files.\n"
     "  NEVER inspect raw bytes. The error message tells you what's wrong.\n\n"
-    "AFTER write_file — ALWAYS read_file to verify:\n"
-    "  read_file(filename) after write_file to check the file was written correctly.\n"
+    "AFTER write_file — ALWAYS read to verify:\n"
+    "  read(files=filename) after write_file to check the file was written correctly.\n"
     "  If the file content is corrupted (all one line, wrong encoding), fix and re-write.\n\n"
     "CODE REVIEW — USE review_code AFTER READING FILES:\n"
     "- After reading a file, call review_code to check for issues.\n"
@@ -213,31 +189,29 @@ SYSTEM_PROMPT = (
     "Follow these 3 phases, in order:\n\n"
     "PHASE 1 — RECONNAISSANCE (start here):\n"
     "  Goal: understand what the project IS. Just 1-2 tool calls.\n"
-    "  Action: call list_files(path='backend', max_depth=2) to explore a major subsystem.\n"
+    "  Action: call list(path='backend', max_depth=2) to explore a major subsystem.\n"
     "  Do NOT read any files yet. Just figure out what exists.\n\n"
     "PHASE 2 — FOCUS (based on user task + Phase 1 findings):\n"
     "  Goal: narrow down to relevant files. At most 3-5 calls.\n"
     "  Action: identify which directories/files are relevant to the user's task.\n"
-    "  - Use list_files(path='specific/dir', max_depth=2) to inspect a subsystem.\n"
-    "  - Use search_code(pattern) to find specific classes or functions.\n"
-    "  - Use search_files(query) to find files by concept.\n"
+    "  - Use list(path='specific/dir', max_depth=2) to inspect a subsystem.\n"
+    "  - Use search(query) to find specific classes, functions, or concept files.\n"
     "  Only read files AFTER you've identified the right ones.\n\n"
     "PHASE 3 — DEEP DIVE (only after Phase 2):\n"
     "  Goal: read specific files, make changes, run code.\n"
-    "  IMPORTANT: read ALL needed files in ONE batch_read_files call. "
-    "Do NOT read files one-by-one.\n"
-    "  - batch_read_files(files=['a.js','b.js','c.js']) reads 3 files in 1 call.\n"
-    "  - Individual read_file is ONLY for offset/limit on large files.\n"
-    "  - If batch_read_files returns truncated content, use read_file with offset/limit.\n"
+    "  IMPORTANT: read ALL needed files in ONE read call with an array.\n"
+    "  Do NOT read files one-by-one.\n"
+    "  - read(files=['a.js','b.js','c.js']) reads 3 files in 1 call.\n"
+    "  - Single read with offset/limit is ONLY for paginating large files.\n"
     "  - Use review_code after reading to check for issues.\n"
     "  - Only write files when you're sure about the changes.\n\n"
     "CRITICAL — NEVER skip phases. Do NOT read files during Phase 1.\n"
     "Do NOT call review_code during Phase 1 or 2. Only in Phase 3.\n"
-    "ALWAYS use batch_read_files for 2+ files. One-by-one read_file wastes budget.\n\n"
-    "READ_FILE TIPS:\n"
+    "ALWAYS use read with array for 2+ files. One-by-one read wastes budget.\n\n"
+    "READ TIPS:\n"
     "- First read gives a truncated view (head+tail). Use this to get the structure.\n"
     "- For deep analysis, use offset/limit to read specific sections.\n"
-    "- Example: read_file(filename='User.java', offset=150, limit=300) reads lines 150-449.\n"
+    "- Example: read(files='User.java', offset=150, limit=300) reads lines 150-449.\n"
     "- Read one section at a time — don't over-read.\n\n"
     "RUN_CODE TIPS:\n"
     "- Short commands (python app.py, pytest) run synchronously and return output.\n"
@@ -254,12 +228,12 @@ SYSTEM_PROMPT = (
     "  Do NOT start multiple instances of the same server.\n"
     "Put ALL code in write_file — not in your text.\n"
     "CRITICAL — NEVER use run_code to read file contents. "
-    "Use read_file instead. "
+    "Use read instead. "
     "Do NOT run cat, type, node -e, python -c, or any other command just to read a file. "
-    "read_file is designed for this purpose and works correctly across all platforms.\n"
+    "read is designed for this purpose and works correctly across all platforms.\n"
     "CRITICAL — NEVER create temp/utility/bridge scripts in the project. "
     "Do NOT write .mjs, .sh, .bat, .ps1, or any other helper files. "
-    "All fixes must be done directly with write_file/read_file. "
+    "All fixes must be done directly with write_file/read. "
     "If you already created a temp file, clean it up with delete_file.\n"
     "To reorganize files: use rename_file instead of re-writing. "
     "Example: rename_file(source='src/old.js', dest='src/utils/old.js'). "
@@ -273,9 +247,13 @@ SYSTEM_PROMPT = (
 
 IGNORE_DIRS_SKELETON = {
     ".git", "node_modules", "__pycache__", ".idea", ".vscode",
-    ".venv", "venv", ".env", "build", "dist", ".next", ".nuxt",
+    ".venv", "venv", "env", ".env", "build", "dist", ".next", ".nuxt",
     ".turbo", "target", ".tox", ".eggs", "*.egg-info",
-    ".patchflow", ".mypy_cache", ".pytest_cache", "vendor",
+    ".patchflow", ".mypy_cache", ".pytest_cache",
+    "vendor", "bundle", ".bundle",
+    ".gradle", "gradle", "bower_components",
+    "__generated__", "generated", "gen",
+    "Pods", "Carthage", ".terraform", ".serverless", "cdk.out",
 }
 
 
@@ -293,9 +271,9 @@ def _get_project_skeleton(work_dir: str = ".") -> str:
         Project Skeleton (depth=2):
         ├── backend/  (Java/SpringBoot)
         │   ├── src/main/java/com/game/...
-        │   └── src/main/resources/
+        │   └── src/main/resources/...
         ├── frontend/ (Vue.js)
-        │   ├── src/
+        │   ├── src/...
         │   └── package.json
         └── README.md
     """
@@ -369,49 +347,21 @@ def _get_project_skeleton(work_dir: str = ".") -> str:
         lines.insert(2, "")
 
     if line_count >= max_lines:
-        lines.append("  ... (truncated, use list_files for details)")
+        lines.append("  ... (truncated, use list for details)")
 
     return "\n".join(lines)
 
 
 def _detect_tech(dir_path: Path, sub_entries: list) -> str:
-    """快速识别目录的技术栈"""
-    names = {e.name for e in sub_entries}
-    lower_ext = set()
-
-    for e in sub_entries:
-        if e.is_file():
-            lower_ext.add(e.suffix.lower())
-
-    if "pom.xml" in names or "build.gradle" in names:
-        return "Java/SpringBoot"
-    if "package.json" in names:
-        # 是前端还是后端？
-        has_vue = any("vue" in e.name.lower() for e in sub_entries)
-        has_react = any("react" in e.name.lower() for e in sub_entries)
-        if has_vue:
-            return "Vue.js"
-        if has_react:
-            return "React"
-        return "Node.js"
-    if "Cargo.toml" in names:
-        return "Rust"
-    if "go.mod" in names:
-        return "Go"
-    if "requirements.txt" in names or "setup.py" in names or "pyproject.toml" in names:
-        return "Python"
-    if "Gemfile" in names:
-        return "Ruby"
-    if ".csproj" in lower_ext:
-        return "C#/.NET"
-    # Java 项目常用目录
-    java_markers = {"src/main/java", "src/main/resources", "WEB-INF"}
-    if any(m in names or any(m in e.name for e in sub_entries if e.is_dir()) for m in java_markers):
-        return "Java"
-    if any(e.suffix == ".java" for e in sub_entries):
-        return "Java"
-
-    return ""
+    """快速识别目录的技术栈 — 委托给 LanguageFactory"""
+    strategy = LanguageFactory().detect(str(dir_path))
+    if strategy is None:
+        return ""
+    lang_name = strategy.name.capitalize()
+    fw_info = strategy.detect_framework(dir_path, [])
+    if fw_info:
+        return f"{lang_name}/{fw_info['name']}"
+    return lang_name
 
 
 # ═══════════════════════════════════════════════════════════
@@ -421,13 +371,11 @@ def _detect_tech(dir_path: Path, sub_entries: list) -> str:
 # 全对话工具调用预算 — 防止 LLM 过度调用导致上下文爆炸
 _TOOL_BUDGET = {
     "review_code":     {"max": 8,  "count": 0},
-    "read_file":       {"max": 35, "count": 0},
-    "batch_read_files":{"max": 5,  "count": 0},
+    "read":            {"max": 40, "count": 0},
     "rename_file":     {"max": 10, "count": 0},
     "delete_file":     {"max": 5,  "count": 0},
     "run_code":        {"max": 15, "count": 0},
-    "search_code":     {"max": 5,  "count": 0},
-    "search_files":    {"max": 3,  "count": 0},
+    "search":          {"max": 8,  "count": 0},
     "_total":          {"max": 70, "count": 0},
 }
 
@@ -581,6 +529,180 @@ def set_confirm_callback(cb: Callable[[str, str], str] | None):
     _confirm_run_callback = cb
 
 
+# ═══════════════════════════════════════════════════════════
+# 模型能力分级 — 决定是否需要写/删确认
+#
+# 原则：不以 provider 划线，以模型实际能力为准。
+#   - 已知强模型（在生产级 tool calling 上表现稳定）→ 直接执行
+#   - 未知模型（新模型、小众模型）→ 写/删前需用户确认（安全默认）
+#   - 运行时降级：强模型如果在本次会话中被 _check_command_abuse
+#     拦截 ≥3 次，自动降级为需要确认模式
+# ═══════════════════════════════════════════════════════════
+
+# 已知强模型标识符（忽略大小写，子串匹配）
+_STRONG_MODEL_PATTERNS = [
+    # Anthropic
+    "claude-4", "claude-opus-4", "claude-sonnet-4", "claude-3.5", "claude-3-5",
+    # OpenAI
+    "gpt-4", "gpt-4o", "gpt-4.1", "gpt-4-", "o1", "o3", "o4",
+    # DeepSeek V3/R1 系列（在 tool calling benchmark 中表现优秀）
+    "deepseek-v3", "deepseek-r1", "deepseek-chat",
+    # Google
+    "gemini-2", "gemini-pro-2",
+    # 其他经过验证的强模型
+    "qwq-32b", "qwen3",
+]
+
+# 运行时状态
+_tool_abuse_count: int = 0
+_ABUSE_DOWNGRADE_THRESHOLD = 3
+_model_trusted: bool = True  # 默认信任，_resolve_model_trust 在 ChatClient.__init__ 中设置
+
+
+def _resolve_model_trust(model_name: str) -> bool:
+    """根据模型名判断是否属于已知强模型
+
+    逻辑：
+      1. 模型名命中 _STRONG_MODEL_PATTERNS → 信任
+      2. 未命中 → 不信任（安全默认，新模型需要用户确认）
+
+    这是一致性优于完备性的判断 —— 宁可让一个强模型多确认一次，
+    也不让一个弱模型悄无声息地写坏文件。
+    """
+    lowered = model_name.lower()
+    for pattern in _STRONG_MODEL_PATTERNS:
+        if pattern in lowered:
+            return True
+    return False
+
+
+def _on_tool_abuse() -> bool:
+    """记录一次工具误用，返回是否触发降级"""
+    global _tool_abuse_count, _model_trusted
+    _tool_abuse_count += 1
+    if _model_trusted and _tool_abuse_count >= _ABUSE_DOWNGRADE_THRESHOLD:
+        _model_trusted = False
+        return True
+    return _model_trusted is False
+
+
+def _requires_confirm() -> bool:
+    """当前模型是否需要对写/删操作做用户确认"""
+    return not _model_trusted
+
+
+def _suggest_files(filename: str, max_suggestions: int = 5) -> str:
+    """文件不存在时，搜索项目给出相似文件建议"""
+    name = Path(filename).name
+    name_lower = name.lower()
+    suggestions: list[str] = []
+    noise = {"__pycache__", ".git", "node_modules", ".patchflow", "build", "dist",
+             "target", "venv", ".venv", "vendor", ".tox"}
+    # 先搜当前目录下同名文件
+    for match in Path(".").rglob(name):
+        if len(suggestions) >= max_suggestions:
+            break
+        if len(str(match)) >= 200:
+            continue
+        if any(p in noise for p in match.parts):
+            continue
+        suggestions.append(str(match))
+    # 再搜名字部分匹配的
+    if len(suggestions) < max_suggestions:
+        for match in Path(".").rglob(f"*{name}*"):
+            if len(suggestions) >= max_suggestions:
+                break
+            if len(str(match)) >= 200:
+                continue
+            if any(p in noise for p in match.parts):
+                continue
+            lowered = match.name.lower()
+            if name_lower in lowered or lowered in name_lower:
+                path_str = str(match)
+                if path_str not in suggestions:
+                    suggestions.append(path_str)
+    if suggestions:
+        return "\nDid you mean:\n  " + "\n  ".join(suggestions[:max_suggestions])
+    return ""
+
+
+def _safe_path(filename: str) -> str | None:
+    """校验路径安全性，防止路径穿越攻击。
+
+    用 Path.resolve() 而非简单的 ".." 检测，可以防住：
+      - 混用斜杠 (foo/..\\bar)
+      - NTFS 流 (file:::$DATA)
+      - 符号链接逃逸
+
+    Returns:
+        错误消息字符串（不安全时），或 None（安全时）
+    """
+    import os
+    resolved = os.path.abspath(filename)
+    cwd = os.getcwd()
+    if not resolved.startswith(cwd + os.sep) and resolved != cwd:
+        return f"ERROR: path traversal blocked: {filename}"
+    return None
+
+
+def _check_command_abuse(command: str) -> str | None:
+    """检测模型是否在滥用 run_code 来替代专用工具
+
+    每次拦截都会调用 _on_tool_abuse() 记录一次滥用。
+    累计 ≥3 次后，即使是已知强模型也会被降级为需要确认模式。
+
+    Returns:
+        引导消息字符串（需要拦截），或 None（允许执行）
+    """
+    import re
+
+    cmd = command.strip().lower()
+    result = None
+
+    # 读文件模式：cat / type / more / less / head / tail
+    if re.match(r'^(cat|type)\s+', cmd):
+        result = "BLOCKED: this looks like reading a file. Use read instead."
+    elif re.match(r'^(more|less|head|tail)\s+', cmd):
+        result = "BLOCKED: this looks like reading a file. Use read instead."
+    # Python/Node 单行脚本 → 经常用来读文件或做字节检查
+    elif re.match(r'^(python3?|python)\s+-c\s+', cmd):
+        if any(kw in cmd for kw in ("pip", "pytest", "unittest", "setup.py")):
+            return None
+        result = (
+            "BLOCKED: python -c is typically used to read or inspect file contents. "
+            "Use read instead. If you need to run actual Python code, "
+            "write it to a .py file with write_file and run that."
+        )
+    elif re.match(r'^node\s+-e\s+', cmd):
+        result = (
+            "BLOCKED: node -e is typically used to read or inspect file contents. "
+            "Use read instead."
+        )
+    # 写入文件模式：echo/printf 重定向
+    elif re.search(r'(echo|printf)\s+.*\s*>', cmd):
+        result = "BLOCKED: this looks like writing a file via shell. Use write_file instead."
+    # 删除文件模式：rm / del
+    elif re.match(r'^(rm|del)\s+', cmd):
+        result = "BLOCKED: this looks like deleting a file. Use delete_file instead."
+    # 重命名模式：mv / ren
+    elif re.match(r'^(mv|ren)\s+', cmd):
+        result = "BLOCKED: this looks like moving/renaming a file. Use rename_file instead."
+    # 二进制/编码诊断命令
+    elif re.match(r'^(hexdump|xxd|od|file)\s+', cmd):
+        result = (
+            "BLOCKED: byte-level inspection is unnecessary. "
+            "Read the error message in stderr — it tells you what's wrong."
+        )
+
+    if result:
+        downgraded = _on_tool_abuse()
+        logger.warn(f"[ToolAbuse] #{_tool_abuse_count} 滥用: {command[:120]}")
+        if downgraded:
+            logger.warn("[ToolAbuse] 滥用 ≥3 次，模型降级为需确认模式")
+
+    return result
+
+
 def _execute_tool(name: str, args: dict,
                   on_run_output: Callable[[str], None] | None = None) -> str:
     from patchflow.utils.runner import (
@@ -608,15 +730,24 @@ def _execute_tool(name: str, args: dict,
             return "ERROR: write_file — could not parse filename from LLM output"
         content = args.get("content", "")
         raw = Path(filename)
-        if raw.is_absolute() or ".." in filename:
+        if raw.is_absolute() or _safe_path(filename):
             filename = raw.name
+
+        # 不信任模型 → 写文件前确认
+        if _requires_confirm() and _confirm_run_callback:
+            decision = _confirm_run_callback(
+                f"write {filename}", f"模型请求写入 {filename} ({len(content)} chars)"
+            )
+            if decision == "reject":
+                return f"USER_REJECTED: 用户拒绝写入 {filename}"
+
         p = Path(filename)
         p.parent.mkdir(parents=True, exist_ok=True)
 
         # AI 标记：如果文件被修改或新建，添加注释头
-        ext = p.suffix.lower()
-        if ext in (".js", ".jsx", ".ts", ".tsx", ".py", ".java", ".go", ".rs", ".rb", ".php", ".c", ".cpp", ".h", ".hpp", ".cs", ".swift", ".kt", ".vue", ".svelte"):
-            comment_char = "//" if ext not in (".py", ".rb", ".yaml", ".yml") else "#"
+        strategy = LanguageFactory().detect_by_extension(p.suffix.lower())
+        if strategy is not None:
+            comment_char = strategy.comment_syntax
             # 只在文件头部没有 AI marker 时添加
             first_line = content.split("\n")[0].strip() if content else ""
             if comment_char not in first_line or "ai" not in first_line.lower():
@@ -633,12 +764,22 @@ def _execute_tool(name: str, args: dict,
             return "ERROR: delete_file — no filename provided"
         fn = str(Path(filename.strip()).as_posix())
         p = Path(fn)
+
+        # 不信任模型 → 删文件前确认
+        if _requires_confirm() and _confirm_run_callback:
+            decision = _confirm_run_callback(
+                f"delete {fn}", f"模型请求删除 {fn}"
+            )
+            if decision == "reject":
+                return f"USER_REJECTED: 用户拒绝删除 {fn}"
+
         if not p.exists():
             return f"ERROR: file not found: {fn}"
         if not p.is_file():
             return f"ERROR: not a file: {fn}"
-        if ".." in fn:
-            return f"ERROR: path traversal blocked: {fn}"
+        traversal = _safe_path(fn)
+        if traversal:
+            return traversal
         p.unlink()
         logger.info(f"delete_file: {fn}")
         return f"OK: deleted {fn}"
@@ -652,92 +793,87 @@ def _execute_tool(name: str, args: dict,
         dst = Path(dest.strip())
         if not src.exists():
             return f"ERROR: source not found: {source}"
-        if ".." in source or ".." in dest:
-            return "ERROR: path traversal blocked"
+        traversal = _safe_path(source) or _safe_path(dest)
+        if traversal:
+            return traversal
         dst.parent.mkdir(parents=True, exist_ok=True)
         src.rename(dst)
         logger.info(f"rename_file: {source} -> {dest}")
         return f"OK: moved {source} -> {dest}"
 
-    elif name == "read_file":
-        filename = args.get("filename", "")
-        if not filename:
-            return "ERROR: read_file — no filename provided"
-        filename = str(Path(filename.strip()).as_posix())
+    elif name == "read":
+        raw_files = args.get("files", "")
+        if not raw_files:
+            return "ERROR: read — no files provided"
+        # 标准化：字符串→[字符串]，数组→保持
+        files: list[str] = [raw_files] if isinstance(raw_files, str) else list(raw_files)
+        if not files:
+            return "ERROR: read — files must be a non-empty string or list"
         offset = int(args.get("offset", 0))
         limit = int(args.get("limit", 0))
 
-        # ── 同一文件已读（无 offset/limit）→ 直接返回缓存提示 ──
-        if offset == 0 and limit == 0:
-            if filename in _READ_CACHE:
-                logger.info(f"  [cache HIT] {filename}")
-                return f"(already read — {filename} is in your context, use offset/limit for specific sections)"
-            logger.info(f"  [cache MISS] {filename}")
-
-        if ".." in filename:
-            return f"ERROR: path traversal blocked: {filename}"
-        p = Path(filename)
-        if not p.exists():
-            return f"ERROR: file not found: {filename}"
-        content = p.read_text(encoding="utf-8")
-        logger.info(f"read_file: {filename} ({len(content)} chars)")
-
-        # ── 成功读到内容后才加入缓存（防止无效文件名污染） ──
-        if offset == 0 and limit == 0:
+        # 单文件 + offset/limit → 旧 read_file 精读路径
+        if len(files) == 1 and (offset > 0 or limit > 0):
+            filename = str(Path(files[0].strip()).as_posix())
+            traversal = _safe_path(filename)
+            if traversal:
+                return traversal
+            p = Path(filename)
+            if not p.exists():
+                hint = _suggest_files(filename)
+                return f"ERROR: file not found: {filename}{hint}"
+            if not p.is_file():
+                return f"ERROR: not a file: {filename}"
+            content = p.read_text(encoding="utf-8")
+            logger.info(f"read (paginated): {filename} ({len(content)} chars)")
             _READ_CACHE.add(filename)
+            lines = content.split("\n")
+            total_lines = len(lines)
+            if offset < 0:
+                offset = 0
+            if offset >= total_lines:
+                return f"(file is {total_lines} lines, offset {offset} is out of range)"
+            if limit > 0:
+                end = min(offset + limit, total_lines)
+                sliced = "\n".join(lines[offset:end])
+                header = f"[lines {offset}-{end-1} of {total_lines}]\n" if offset > 0 or end < total_lines else ""
+                return f"{header}{sliced}"
+            # limit==0 但 offset>0 → 从 offset 到尾
+            return "\n".join(lines[offset:])
 
-        lines = content.split("\n")
-        total_lines = len(lines)
-
-        if offset < 0:
-            offset = 0
-        if offset >= total_lines:
-            return f"(file is {total_lines} lines, offset {offset} is out of range)"
-
-        if limit and limit > 0:
-            end = min(offset + limit, total_lines)
-            sliced = "\n".join(lines[offset:end])
-            header = f"[lines {offset}-{end-1} of {total_lines}]\n" if offset > 0 or end < total_lines else ""
-            return f"{header}{sliced}"
-
-        read_max = 5000
-        if len(content) <= read_max:
-            return content
-
-        head_lines = 150
-        tail_lines = 50
-
-        if total_lines <= head_lines + tail_lines:
-            return content
-
-        head = "\n".join(lines[:head_lines])
-        tail = "\n".join(lines[-tail_lines:])
-        omitted = total_lines - head_lines - tail_lines
-        return (
-            f"[lines 0-{head_lines-1} of {total_lines}]\n"
-            f"{head}\n\n"
-            f"# ... [truncated {omitted} lines — use read_file with offset={head_lines},limit=N to continue] ...\n\n"
-            f"[lines {total_lines-tail_lines}-{total_lines-1} of {total_lines}]\n"
-            f"{tail}"
-        )
-
-    elif name == "batch_read_files":
-        files = args.get("files", [])
-        if not files or not isinstance(files, list):
-            return "ERROR: batch_read_files — files must be a non-empty list"
+        # 批量读取（无 offset/limit，或单文件无分页）
         parts = []
         for f in files:
             normal = str(Path(f.strip()).as_posix())
             if normal in _READ_CACHE:
                 parts.append(f"# === {f} ===\n(already read — in context)")
-            else:
-                fp = Path(normal)
-                if fp.exists():
-                    content = fp.read_text(encoding="utf-8")
-                    _READ_CACHE.add(normal)
-                    parts.append(f"# === {f} ===\n{content[:5000]}")
-                else:
-                    parts.append(f"# === {f} ===\n(not found)")
+                continue
+            fp = Path(normal)
+            if not fp.exists():
+                hint = _suggest_files(normal)
+                parts.append(f"# === {f} ===\n(not found{hint})")
+                continue
+            if not fp.is_file():
+                parts.append(f"# === {f} ===\n(not a file — is a directory)")
+                continue
+            content = fp.read_text(encoding="utf-8")
+            _READ_CACHE.add(normal)
+            logger.info(f"read: {normal} ({len(content)} chars)")
+            # 截断大文件
+            if len(content) > 5000:
+                lines = content.split("\n")
+                total_lines = len(lines)
+                head_lines, tail_lines = 150, 50
+                if total_lines > head_lines + tail_lines:
+                    head = "\n".join(lines[:head_lines])
+                    tail = "\n".join(lines[-tail_lines:])
+                    omitted = total_lines - head_lines - tail_lines
+                    content = (
+                        f"[lines 0-{head_lines-1} of {total_lines}]\n{head}\n\n"
+                        f"# ... [truncated {omitted} lines — use read(files='{normal}', offset={head_lines},limit=N) to continue] ...\n\n"
+                        f"[lines {total_lines-tail_lines}-{total_lines-1} of {total_lines}]\n{tail}"
+                    )
+            parts.append(f"# === {f} ===\n{content}")
         return "\n\n".join(parts)
 
     elif name == "run_code":
@@ -751,6 +887,12 @@ def _execute_tool(name: str, args: dict,
         if action == "block":
             logger.warn(f"run_code BLOCKED: {reason}")
             return f"BLOCKED: {reason}"
+
+        # ── 工具误用检测：模型用 run_code 读文件 → 拦截并引导 ──
+        redirect = _check_command_abuse(command)
+        if redirect:
+            logger.warn(f"run_code ABUSE DETECTED: {command[:120]} → {redirect}")
+            return redirect
 
         if action == "confirm":
             if _confirm_run_callback:
@@ -802,7 +944,7 @@ def _execute_tool(name: str, args: dict,
         else:
             return f"exit: {result.exit_code}\nstdout:\n{output_text[:1500]}{truncated}\nstderr:\n{result.stderr[:1500]}"
 
-    elif name == "list_files":
+    elif name == "list":
         dirpath = args.get("path", ".") or "."
         max_depth = args.get("max_depth", 4)
         p = Path(dirpath)
@@ -917,25 +1059,25 @@ def _execute_tool(name: str, args: dict,
             tree_lines.append(f"  ... ({line_count[0] - 1}+ items, showing first {max_tree_lines})")
         return "\n".join(tree_lines)
 
-    elif name == "search_files":
+    elif name == "search":
         query = args.get("query", "")
-        top_k = int(args.get("top_k", 10))
+        if not query:
+            return "ERROR: search — no query provided"
+        path_filter = args.get("path_filter", "")
         idx = _get_index(".")
-        results = idx.search_files(query, top_k=top_k)
 
+        # 自动判断：含正则元字符 → 代码搜索，否则 → 语义搜索
+        _REGEX_META = re.compile(r'[\\\[\](){}.*+?^$|]')
+        if _REGEX_META.search(query):
+            return idx.search_code(query, path_filter=path_filter)
+
+        results = idx.search_files(query, top_k=10)
         if not results:
-            return "(未找到相关文件，请尝试用其他关键词，或先用 list_files 了解项目结构)"
-
+            return "(未找到相关文件，请尝试用其他关键词，或先用 list 了解项目结构)"
         lines = []
         for i, r in enumerate(results):
             lines.append(f"{i + 1}. {r['summary']}")
         return "\n".join(lines)
-
-    elif name == "search_code":
-        pattern = args.get("pattern", "")
-        path_filter = args.get("path_filter", "")
-        idx = _get_index(".")
-        return idx.search_code(pattern, path_filter=path_filter)
 
     elif name == "review_code":
         filepath = args.get("filepath", "")
@@ -991,7 +1133,8 @@ ToolUse = dict
 
 class ChatClient:
 
-    def __init__(self, model: str | None = None, work_dir: str = ".", memory_enabled: bool = True):
+    def __init__(self, model: str | None = None, work_dir: str = ".", memory_enabled: bool = True,
+                 thinking_budget: int = 0):
         cfg = get_config()
         self.provider = get_normalized_provider()
         self.api_key = cfg["api_key"]
@@ -1000,6 +1143,13 @@ class ChatClient:
 
         if not self.api_key:
             raise ValueError("未配置 API Key")
+
+        # 模型能力分级：已知强模型可信，未知模型写/删前需确认
+        global _model_trusted, _tool_abuse_count
+        _model_trusted = _resolve_model_trust(self.model)
+        _tool_abuse_count = 0
+        if not _model_trusted:
+            logger.info(f"模型 {self.model} 不在已知强模型列表中，写/删操作需确认")
 
         if self.provider == "anthropic":
             base_url = self.api_base or None
@@ -1029,6 +1179,7 @@ class ChatClient:
         self._memory_path = self._work_dir / ".patchflow" / "memory.json"
         self._session_boundary_added = False
         self._memory_summary: list[str] = []
+        self._thinking_budget = thinking_budget  # 0 = 禁用，>0 = 启用扩展思考
         if self._memory_enabled:
             self._load_memory()
 
@@ -1074,13 +1225,17 @@ class ChatClient:
 
             if self._openai:
                 text, tcs, usage = self._call_openai_stream(recent)
+                thinking_text = ""
             else:
-                text, tcs, usage = self._call_anthropic(recent)
+                text, tcs, usage, thinking_text = self._call_anthropic(recent)
 
             session_usage["input_tokens"] += usage.get("input_tokens", 0)
             session_usage["output_tokens"] += usage.get("output_tokens", 0)
             session_usage["total_tokens"] += usage.get("total_tokens", 0)
             session_usage["calls"] += 1
+
+            if thinking_text:
+                yield ("thinking", thinking_text)
 
             if text:
                 yield ("text", text)
@@ -1088,11 +1243,11 @@ class ChatClient:
             if not tcs:
                 self._append_assistant(text, tcs)
                 self._save_memory()
-                yield ("usage", dict(session_usage))
-                yield ("done", all_tool_calls)
+                yield "usage", dict(session_usage)
+                yield "done", all_tool_calls
                 return
 
-            yield ("usage", dict(session_usage))
+            yield "usage", dict(session_usage)
 
             # 执行工具
             for tc in tcs:
@@ -1100,10 +1255,10 @@ class ChatClient:
                     "name": tc["function"]["name"],
                     "args": _safe_json_parse(tc["function"]["arguments"]),
                 }
-                yield ("tool_start", fn_info)
+                yield "tool_start", fn_info
 
                 if fn_info["name"] == "run_code" and on_run_output:
-                    yield ("run_output", f"$ {fn_info['args'].get('command', '')}")
+                    yield "run_output", f"$ {fn_info['args'].get('command', '')}"
 
                 result = _execute_tool(
                     fn_info["name"], fn_info["args"],
@@ -1112,7 +1267,7 @@ class ChatClient:
                 fn_info["result"] = result
                 fn_info["id"] = tc["id"]
                 all_tool_calls.append(fn_info)
-                yield ("tool_result", fn_info)
+                yield "tool_result", fn_info
 
                 if fn_info["name"] == "review_code":
                     first_line = result.split("\n")[0]
@@ -1123,9 +1278,9 @@ class ChatClient:
             self._append_assistant(text, tcs)
             self._save_memory()
 
-        yield ("usage", dict(session_usage))
-        yield ("hint", "round_limit")
-        yield ("done", all_tool_calls)
+        yield "usage", dict(session_usage)
+        yield "hint", "round_limit"
+        yield "done", all_tool_calls
 
     def _append_assistant(self, text, tcs):
         """把 assistant 回复 + 工具结果追加到消息历史"""
@@ -1188,26 +1343,33 @@ class ChatClient:
     # ── Anthropic 调用 ──
 
     def _call_anthropic(self, messages):
-        """Anthropic 原生工具调用"""
+        """Anthropic 原生工具调用，支持扩展思考"""
+        kwargs: dict = {
+            "model": self.model,
+            "max_tokens": 2048,
+            "system": SYSTEM_PROMPT,
+            "messages": messages,
+            "tools": _get_anthropic_tools(),
+        }
+        if self._thinking_budget > 0 and self.provider == "anthropic":
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": self._thinking_budget}
+
         try:
-            response = self._anthropic.messages.create(
-                model=self.model,
-                max_tokens=2048,
-                system=SYSTEM_PROMPT,
-                messages=messages,
-                tools=_get_anthropic_tools(),
-            )
+            response = self._anthropic.messages.create(**kwargs)
         except Exception as e:
             error_msg = f"[API 请求失败: {e}]"
             logger.error(f"Anthropic API 调用异常: {e}")
-            return (error_msg, [], {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+            return error_msg, [], {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, ""
 
         text_parts = []
+        thinking_parts = []
         tcs = []
 
         for block in response.content:
             if block.type == "text":
                 text_parts.append(block.text)
+            elif block.type == "thinking":
+                thinking_parts.append(block.thinking)
             elif block.type == "tool_use":
                 tcs.append({
                     "id": block.id,
@@ -1224,7 +1386,8 @@ class ChatClient:
         }
         usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
 
-        return ("\n".join(text_parts).strip(), tcs, usage)
+        thinking_text = "\n".join(thinking_parts).strip()
+        return "\n".join(text_parts).strip(), tcs, usage, thinking_text
 
     def _call_openai_stream(self, messages):
         """流式调用 OpenAI 兼容 API(内部消费流,返回最终结果)"""
@@ -1245,11 +1408,11 @@ class ChatClient:
         usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
         try:
-            stream_deadline = time.time() + 45
+            stream_deadline = time.time() + 180
             stream_client = OpenAI(
                 api_key=self.api_key,
                 base_url=self.api_base,
-                timeout=20,
+                timeout=120,
                 max_retries=0,
             )
             response = stream_client.chat.completions.create(
@@ -1257,7 +1420,7 @@ class ChatClient:
                 messages=api_messages,
                 tools=TOOLS,
                 tool_choice="auto",
-                max_tokens=2048,
+                max_tokens=4096,
                 stream=True,
                 stream_options={"include_usage": True},
             )
@@ -1265,7 +1428,8 @@ class ChatClient:
             time.time()
             for chunk in response:
                 if time.time() - stream_deadline > 0:
-                    logger.warning("OpenAI streaming total time > 45s, breaking out")
+                    logger.warn("OpenAI streaming total time > 180s, discarding partial tool calls")
+                    tool_calls_acc.clear()
                     break
                 if chunk.usage:
                     usage = {
@@ -1303,12 +1467,12 @@ class ChatClient:
         except Exception as e:
             error_msg = f"[API 请求失败: {e}]"
             logger.error(f"OpenAI API 调用异常: {e}")
-            return (error_msg, [], usage)
+            return error_msg, [], usage
 
         final_text = "".join(text_parts).strip()
         final_tcs = list(tool_calls_acc.values()) if tool_calls_acc else []
 
-        return (final_text, final_tcs, usage)
+        return final_text, final_tcs, usage
 
     # ── 非流式 chat（给 build 命令用）──
 
@@ -1343,8 +1507,12 @@ class ChatClient:
 
     # ── 跨会话记忆持久化 ──
 
-    _MAX_MEMORY_BYTES = 512_000  # 500 KB，超过这个大小会压缩旧消息
-    _MIN_KEEP_TURNS = 3          # 压缩时最少保留最近 3 个完整对话回合
+    _MAX_MEMORY_BYTES = 200_000   # 200 KB，总内存上限
+    _TOOL_COMPRESS_BYTES = 80_000  # 80 KB，超此值先压缩工具结果
+    _HEAVY_COMPRESS_BYTES = 150_000  # 150 KB，超此值压缩旧 assistant 回复
+    _MIN_KEEP_TURNS = 3           # 压缩时最少保留最近 3 个完整对话回合
+    _MAX_L1_SUMMARIES = 20        # L1 摘要超过此数触发 LLM 蒸馏
+    _MAX_L2_SUMMARIES = 10        # L2 摘要超过此数触发 LLM 蒸馏 → L3
 
     def _check_dev_activity(self) -> bool:
         """扫描当前对话，判断是否有开发活动
@@ -1405,10 +1573,182 @@ class ChatClient:
         except (json.JSONDecodeError, OSError) as e:
             logger.warn(f"记忆加载失败: {e}")
 
+    def _strip_tool_results(self, messages: list[dict]) -> list[dict]:
+        """将消息列表中的冗余工具结果替换为紧凑元信息
+
+        不修改原始消息，返回新的消息列表（用于保存到磁盘）。
+        原始 messages 列表保持不变（LLM 需要完整上下文）。
+        """
+        stripped = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            # 跳过冗余的 system prompt（每轮工具调用后自动插入的提示）
+            if role == "user" and isinstance(content, str):
+                if content.startswith("(system: you just called"):
+                    continue
+                if content.startswith("(session resuming"):
+                    stripped.append(msg)
+                    continue
+
+            # 压缩工具结果
+            if role in ("tool", "user") and isinstance(content, (str, list)):
+                compressed = self._compress_tool_content(content)
+                if compressed is not None:
+                    new_msg = dict(msg)
+                    new_msg["content"] = compressed
+                    stripped.append(new_msg)
+                    continue
+
+            stripped.append(msg)
+        return stripped
+
+    def _compress_tool_content(self, content) -> str | list | None:
+        """压缩单个工具结果内容，返回 None 表示不需要压缩"""
+        if isinstance(content, str):
+            result = self._summarize_tool_string(content)
+            return result if result != content else None
+        if isinstance(content, list):
+            changed = False
+            new_blocks = []
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("text", "")
+                    if isinstance(text, str) and len(text) > 400:
+                        summary = self._summarize_tool_string(text)
+                        new_blocks.append({**block, "text": summary})
+                        changed = True
+                    else:
+                        new_blocks.append(block)
+                else:
+                    new_blocks.append(block)
+            return new_blocks if changed else None
+        return None
+
+    @staticmethod
+    def _summarize_tool_string(text: str) -> str:
+        """将工具结果字符串替换为紧凑摘要"""
+        if not text or len(text) <= 400:
+            return text
+        first_line = text.split("\n")[0].strip()
+
+        # read 结果
+        if first_line.startswith("[lines "):
+            n_lines = text.count("\n")
+            return f"[read: {first_line.split(']')[0]}] — {n_lines} lines]"
+        if text.startswith("[toolu_bdrk_") or text.startswith("[tool output:"):
+            return text[:200]
+
+        # write_file 结果
+        if text.startswith("OK: wrote"):
+            return text.split("\n")[0]
+
+        # run_code 结果
+        if text.startswith("exit:"):
+            exit_line = text.split("\n")[0]
+            stderr_idx = text.find("stderr:")
+            if stderr_idx > 0:
+                stderr_preview = text[stderr_idx:stderr_idx + 200].replace("\n", " ")
+                return f"{exit_line} | {stderr_preview}"
+            return exit_line
+
+        # list 结果
+        if "├──" in text or "└──" in text:
+            n_items = sum(1 for line in text.split("\n") if line.strip().startswith(("├", "└")))
+            return f"[listed: {n_items} items]"
+
+        # search 结果
+        if "matches" in first_line.lower() or "files" in first_line.lower():
+            return first_line[:200]
+
+        # review_code 结果
+        if first_line.endswith("— 发现") or "未发现明显问题" in text:
+            return text[:300]
+
+        # 兜底：截断
+        if len(text) > 400:
+            return text[:200] + f"\n... [{len(text) - 400} chars trimmed]"
+        return text
+
+    def _distill_summaries(self):
+        """LLM 驱动的摘要蒸馏：L1 → L2 → L3
+
+        L1 摘要 > _MAX_L1_SUMMARIES → 蒸馏最早 10 条为 L2 叙述
+        L2 摘要 > _MAX_L2_SUMMARIES → 蒸馏最早 5 条为 L3 知识条目
+        """
+        if not self._memory_summary:
+            return
+
+        from patchflow.core.llm_client import call_llm
+
+        # L1 → L2: 单轮摘要合并为会话级叙述
+        if len(self._memory_summary) > self._MAX_L1_SUMMARIES:
+            batch = self._memory_summary[:10]
+            prompt = (
+                "将以下 PatchFlow 对话摘要列表提炼为一段简洁的叙述（≤300 字符）。\n"
+                "保留：项目名、技术栈、关键决策、修复过的 bug 类型、创建/修改的文件。\n"
+                "丢弃：日常问候、重复内容、非技术闲聊。\n\n"
+                + "\n".join(f"- {s}" for s in batch)
+                + "\n\nOutput ONLY the distilled summary text, no JSON, no markdown."
+            )
+            try:
+                result = call_llm(
+                    system_prompt="You are a knowledge distiller. Output ONLY the distilled summary text.",
+                    user_message=prompt,
+                    max_tokens=256,
+                )
+                if result and isinstance(result, dict):
+                    distilled = result.get("content", "") or str(result)
+                elif result and isinstance(result, str):
+                    distilled = result
+                else:
+                    distilled = "; ".join(batch)[:300]
+                # 存入 L2（用特殊前缀标记）
+                l2_entry = f"[L2] {distilled[:300]}"
+                self._memory_summary = self._memory_summary[10:]
+                self._memory_summary.insert(0, l2_entry)
+                logger.info(f"记忆蒸馏 L1→L2: {len(batch)} 条 → 1 条叙述 ({len(l2_entry)} 字符)")
+            except Exception as e:
+                logger.warn(f"记忆蒸馏 L1→L2 失败: {e}")
+
+        # L2 → L3: 会话摘要合并为知识条目
+        l2_entries = [s for s in self._memory_summary if s.startswith("[L2]")]
+        if len(l2_entries) > self._MAX_L2_SUMMARIES:
+            batch = l2_entries[:5]
+            prompt = (
+                "将以下 PatchFlow 会话摘要提炼为结构化知识条目（≤200 字符）。\n"
+                "只保留可复用的知识：项目结构决策、修复模式、工具链配置。\n\n"
+                + "\n".join(f"- {s}" for s in batch)
+                + "\n\nOutput ONLY the distilled knowledge entry, no JSON."
+            )
+            try:
+                result = call_llm(
+                    system_prompt="You are a knowledge distiller. Output ONLY the knowledge entry text.",
+                    user_message=prompt,
+                    max_tokens=200,
+                )
+                if result and isinstance(result, dict):
+                    distilled = result.get("content", "") or str(result)
+                elif result and isinstance(result, str):
+                    distilled = result
+                else:
+                    distilled = "; ".join(batch)[:200]
+                l3_entry = f"[L3] {distilled[:200]}"
+                # 移除被蒸馏的 L2 条目，插入 L3
+                self._memory_summary = [s for s in self._memory_summary if s not in batch]
+                self._memory_summary.insert(0, l3_entry)
+                logger.info(f"记忆蒸馏 L2→L3: {len(batch)} 条 → 1 条知识 ({len(l3_entry)} 字符)")
+            except Exception as e:
+                logger.warn(f"记忆蒸馏 L2→L3 失败: {e}")
+
     def _save_memory(self):
         """将当前对话持久化到磁盘（仅当检测到开发活动时）
 
-        保存前自动压缩旧消息为摘要，只保留最近 N 轮原始消息。
+        保存前：
+          1. 剪枝工具结果（替换为紧凑元信息）
+          2. 压缩旧消息为摘要
+          3. LLM 蒸馏摘要（L1→L2→L3）
         如果对话不涉及开发任务（纯查询/闲聊），跳过磁盘写入。
         """
         if not self._memory_enabled:
@@ -1420,15 +1760,19 @@ class ChatClient:
 
         try:
             self._compress_old_messages()
+            self._distill_summaries()
+            # 剪枝工具结果后保存（不修改内存中的 messages，LLM 需要完整上下文）
+            stripped = self._strip_tool_results(self.messages)
             self._memory_path.parent.mkdir(parents=True, exist_ok=True)
             data = {
                 "summary": self._memory_summary,
-                "messages": self.messages,
+                "messages": stripped,
                 "_saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
             raw = json.dumps(data, ensure_ascii=False, indent=2)
             self._memory_path.write_text(raw, encoding="utf-8")
-            logger.info(f"{_log_tag} 已持久化 ({len(self._memory_summary)} 摘要 + {len(self.messages)} 消息)")
+            logger.info(f"{_log_tag} 已持久化 ({len(self._memory_summary)} 摘要 + {len(stripped)} 消息, "
+                        f"{len(raw.encode('utf-8')) // 1024}KB)")
         except OSError as e:
             logger.warn(f"记忆保存失败: {e}")
 
@@ -1631,3 +1975,11 @@ class ChatClient:
             lines.append(f"  #{round_idx:<2}  {round_tok:>5} tok  {user_preview}{tool_str}")
 
         return "\n".join(lines)
+
+    @property
+    def MAX_MEMORY_BYTES(self):
+        return self._MAX_MEMORY_BYTES
+
+    @property
+    def memory_summary(self):
+        return self._memory_summary

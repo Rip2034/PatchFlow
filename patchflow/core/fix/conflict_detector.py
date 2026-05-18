@@ -26,7 +26,23 @@ import ast
 import json
 import re
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
+
+from patchflow.core.language_strategy import WARM_LANGS
+
+# 可选依赖 — tree-sitter 语法包（未安装时回退到 pygments）
+_tslp_get_parser: Callable[..., Any] | None = None
+try:
+    from tree_sitter_language_pack import get_parser as _tslp_get_parser  # type: ignore[assignment]
+except ImportError:
+    pass
+_tree_sitter_module: Any = None
+try:
+    import tree_sitter as _tree_sitter_module  # type: ignore
+except ImportError:
+    pass
 
 # 语言名 → (grammar 模块名, 备选模块名)
 _TS_GRAMMAR_PACKAGES: dict[str, tuple[str, ...]] = {
@@ -45,33 +61,60 @@ _TS_GRAMMAR_PACKAGES: dict[str, tuple[str, ...]] = {
 
 # Parser 缓存：避免每次解析都重建 Parser
 _TS_PARSER_CACHE: dict = {}
+_WARMING_DONE: bool = False
+
+
+def warm_tree_sitter_cache():
+    """同步预热 tree-sitter parser 缓存
+
+    REPL 启动时同步下载全部 8 种语言的语法文件。
+    tree-sitter-language-pack 首次下载后本地缓存，后续启动瞬间完成。
+    """
+    global _WARMING_DONE
+    if _WARMING_DONE:
+        return
+    _WARMING_DONE = True
+
+    for lang in WARM_LANGS:
+        try:
+            _get_ts_parser(lang)
+        except Exception:
+            pass
 
 
 def _get_ts_parser(lang_name: str):
-    """懒加载 tree-sitter parser，失败返回 None"""
+    """懒加载 tree-sitter parser，失败返回 None
+
+    尝试顺序：
+      1. tree_sitter_language_pack（运行时下载，需要网络）
+      2. 独立 grammar 包（旧方式，需预先安装）
+      有任何异常都返回 None，让调用方回退到 pygments
+    """
     if lang_name in _TS_PARSER_CACHE:
         return _TS_PARSER_CACHE[lang_name]
 
-    pkg_names = _TS_GRAMMAR_PACKAGES.get(lang_name)
-    if not pkg_names:
-        return None
-
-    import importlib
-
-    try:
-        import tree_sitter
-    except ImportError:
-        return None
-
-    for pkg_name in pkg_names:
+    # 方式 1: tree-sitter-language-pack 统一包
+    if _tslp_get_parser is not None:
         try:
-            grammar_mod = importlib.import_module(pkg_name)
-            language = tree_sitter.Language(grammar_mod.language())
-            parser = tree_sitter.Parser(language)
+            parser = _tslp_get_parser(lang_name)
             _TS_PARSER_CACHE[lang_name] = parser
             return parser
-        except ImportError:
-            continue
+        except Exception:
+            pass
+
+    # 方式 2: 独立 grammar 包（回退）
+    pkg_names = _TS_GRAMMAR_PACKAGES.get(lang_name)
+    if pkg_names and _tree_sitter_module is not None:
+        import importlib
+        for pkg_name in pkg_names:
+            try:
+                grammar_mod = importlib.import_module(pkg_name)
+                language = _tree_sitter_module.Language(grammar_mod.language())
+                parser = _tree_sitter_module.Parser(language)
+                _TS_PARSER_CACHE[lang_name] = parser
+                return parser
+            except Exception:
+                continue
 
     return None
 
@@ -333,6 +376,93 @@ def _extract_entities_tree_sitter(content: str, ext: str) -> list[tuple[str, str
     return entities
 
 
+def _extract_entities_pygments(content: str, filepath: str = "") -> list[tuple[str, str]]:
+    """使用 Pygments 分词器提取实体（类/函数/接口等）
+
+    相比正则的改进：
+      - 能区分代码和注释/字符串（不会把注释里的 class Foo 当成实体）
+      - 支持 50+ 语言，覆盖所有常见语言
+      - 无需额外安装依赖（Pygments 已随 Rich 安装）
+
+    Returns:
+        list[tuple[str, str]]: [(名称, 类型), ...]
+    """
+    from pygments.lexers import guess_lexer_for_filename
+    from pygments.token import Comment, Literal, Name, Keyword
+
+    try:
+        lexer = guess_lexer_for_filename(filepath, content)
+    except Exception:
+        return []
+
+    tokens = list(lexer.get_tokens(content))  # type: ignore[union-attr]
+    entities: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    # Token 类别 → 实体类型
+    _TOKEN_ENTITY_MAP = {
+        Name.Class: "class",
+        Name.Function: "function",
+        Keyword.Declaration: None,  # 只是声明关键字，实体名在下一个 name token
+        Keyword.Namespace: None,
+    }
+
+    # 声明关键字后面紧跟着的 Name token 就是实体名
+    # 例如 'class' → Name.Class, 'struct' → Name.Class, 'fn' → Name.Function
+    _DECLARATION_KEYWORDS = {
+        "class", "struct", "interface", "enum", "trait", "impl",
+        "def", "fn", "func", "function", "type", "object",
+        "public class", "pub struct", "pub enum", "pub trait",
+    }
+
+    i = 0
+    while i < len(tokens):
+        tok_type, value = tokens[i]
+
+        # 跳过注释和字符串
+        if tok_type in Comment or tok_type in Literal.String:
+            i += 1
+            continue
+
+        # 直接命中 Name.Class / Name.Function
+        entity_type = _TOKEN_ENTITY_MAP.get(tok_type)
+        if entity_type and value.strip():
+            key = (value.strip(), entity_type)
+            if key not in seen:
+                seen.add(key)
+                entities.append(key)
+
+        # 声明关键字 → 下一个 Name token 为实体名
+        if tok_type in Keyword and value.strip() in _DECLARATION_KEYWORDS:
+            # 向前看：跳过空格和修饰符，找下一个 Name token
+            for j in range(i + 1, min(i + 8, len(tokens))):
+                nt, nv = tokens[j]
+                if nt in (Name.Class, Name.Function, Name.Other, Name):
+                    if nv.strip():
+                        # 推断类型
+                        kw = value.strip()
+                        if kw in ("class", "struct", "interface", "object"):
+                            etype = kw
+                        elif kw in ("type", "trait", "impl", "impl"):
+                            etype = kw
+                        else:
+                            etype = "function"
+                        key = (nv.strip(), etype)
+                        if key not in seen:
+                            seen.add(key)
+                            entities.append(key)
+                    break
+                if nt in Comment or nt in Literal.String:
+                    continue
+                if nt not in (Name.Attribute, Name.Builtin,):
+                    # 只跳过已知的修饰 token 类型，避免跳过头
+                    pass
+
+        i += 1
+
+    return entities
+
+
 class LazyConflictDetector:
     """Lazy Diff 冲突检测器"""
 
@@ -411,24 +541,18 @@ class LazyConflictDetector:
         return False
 
     def _extract_entities(self, content: str, filepath: str = "") -> list[tuple[str, str]]:
-        """从代码中提取实体（类名、函数名）— AST 优先，正则兜底
+        """从代码中提取实体（类名、函数名）— AST 优先，Pygments 兜底
 
-        Args:
-            content: 源代码文本
-            filepath: 文件路径（用于判断语言）
-
-        Returns:
-            list[tuple[str, str]]: [(实体名, 实体类型), ...]
+        回退链：tree-sitter → Python AST → Pygments lexer → Regex
         """
         ext = Path(filepath).suffix.lower().lstrip(".") if filepath else ""
 
-        # 1. tree-sitter AST（覆盖 14 种语言）
+        # 1. tree-sitter AST（覆盖 14 种语言，最精准）
         entities = _extract_entities_tree_sitter(content, ext)
         if entities:
             return entities
 
         # 2. Python 内置 AST（回退，无需 tree-sitter）
-        # 当 ext 为空或为 Python 扩展名时尝试
         if ext in ("py", "pyw", ""):
             try:
                 tree = ast.parse(content)
@@ -443,7 +567,12 @@ class LazyConflictDetector:
             except SyntaxError:
                 pass
 
-        # 3. 正则兜底（无 tree-sitter 时使用）
+        # 3. Pygments lexer（中间兜底，比正则精准——能跳过注释和字符串）
+        entities = _extract_entities_pygments(content, filepath)
+        if entities:
+            return entities
+
+        # 4. 正则兜底（当 pygments 也识别不了时）
         return self._extract_entities_regex(content)
 
     def _extract_entities_regex(self, content: str) -> list[tuple[str, str]]:
