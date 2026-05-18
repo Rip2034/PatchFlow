@@ -18,6 +18,7 @@ V0.4 增强：指数退避重试机制
 """
 
 import json
+import threading
 import time
 
 from anthropic import Anthropic
@@ -190,7 +191,6 @@ def _call_openai_compat(system_prompt, user_message, model, max_tokens, api_key,
 
     client = OpenAI(api_key=api_key, base_url=api_base, timeout=120)
 
-    # 构造消息：OpenAI 格式没有 system 字段，system 也是一条 message
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message},
@@ -199,14 +199,33 @@ def _call_openai_compat(system_prompt, user_message, model, max_tokens, api_key,
     try:
         logger.llm(f"[{provider}] 调用 {model} ({api_base})...")
 
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=0.7,
-            # DeepSeek 新版 API 需要这个参数来启用思考链
-            # 如果不需要可以不加
-        )
+        start_time = time.time()
+        done = threading.Event()
+        last_heartbeat = [0]
+
+        def _heartbeat():
+            while not done.is_set():
+                elapsed = int(time.time() - start_time)
+                if elapsed > 0 and elapsed % 15 == 0 and elapsed != last_heartbeat[0]:
+                    last_heartbeat[0] = elapsed
+                    logger.llm(f"[{provider}] 仍在等待响应... ({elapsed}s)")
+                done.wait(1)
+
+        heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+        heartbeat_thread.start()
+
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.7,
+            )
+        finally:
+            done.set()
+
+        elapsed = time.time() - start_time
+        logger.llm(f"[{provider}] 响应完成 ({elapsed:.1f}s)")
 
         text = response.choices[0].message.content
         return _parse_json(text)

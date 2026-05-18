@@ -77,11 +77,8 @@ def _compress_tool_result(msg: dict) -> dict | None:
             if isinstance(block, dict) and block.get("type") == "text":
                 total_text += block.get("text", "")
         if len(total_text) > 500:
-            return {"role": "user", "content": [
-                {"type": "tool_result",
-                 "tool_use_id": msg.get("tool_call_id", ""),
-                 "content": [{"type": "text", "text": f"[tool output: {len(total_text)} chars — compressed]"}]}
-            ]}
+            return {"role": "tool", "tool_call_id": msg.get("tool_call_id", ""),
+                    "content": [{"type": "text", "text": f"[tool output: {len(total_text)} chars — compressed]"}]}
 
     return msg
 
@@ -176,7 +173,20 @@ def _compress_heavy(messages: list[dict], recent_start: int, budget: int) -> lis
 
         if old_summary_parts:
             summary = "[earlier: " + "; ".join(old_summary_parts[:3]) + "]"
-            result = [{"role": "user", "content": summary}] + result[medium_start:]
+            # 避免相邻 user 消息：如果第一条也是 user，则合并
+            if result[medium_start:]:
+                first = result[medium_start]
+                if first.get("role") == "user":
+                    first_content = first.get("content", "")
+                    if isinstance(first_content, str):
+                        first["content"] = summary + "\n" + first_content
+                        result = result[medium_start:]
+                    else:
+                        result = [{"role": "user", "content": summary}] + result[medium_start:]
+                else:
+                    result = [{"role": "user", "content": summary}] + result[medium_start:]
+            else:
+                result = [{"role": "user", "content": summary}] + result[medium_start:]
             recent_start = recent_start - medium_start + 1
         else:
             result = list(messages[medium_start:])
@@ -193,7 +203,16 @@ def _compress_heavy(messages: list[dict], recent_start: int, budget: int) -> lis
 
 
 def _trim_to_budget(messages: list[dict], budget: int) -> list[dict]:
-    """从头部丢弃旧消息，直到总 token 不超预算"""
+    """从头部丢弃旧消息，直到总 token 不超预算
+
+    删除时保持 assistant(tool_calls) ↔ tool 的配对关系：
+    - 删除 tool 消息时，同时删除前一条含 tool_calls 的 assistant
+    - 删除含 tool_calls 的 assistant 时，同时删除其后所有连续的 tool 消息
+    """
+    # 先清理头部的孤 tool 消息（没有前置 assistant(tool_calls)）
+    while messages and messages[0].get("role") == "tool":
+        messages.pop(0)
+
     while len(messages) > 1:
         total = sum(estimate_message_tokens(m) for m in messages)
         if total <= budget:
@@ -210,7 +229,16 @@ def _trim_to_budget(messages: list[dict], budget: int) -> list[dict]:
                 messages[0] = {"role": "user", "content": "[...]"}
             else:
                 messages.pop(0)
-        elif first_role in ("assistant", "tool"):
+        elif first_role == "assistant":
+            if messages[0].get("tool_calls"):
+                # 删除 assistant(tool_calls) + 后续所有连续的 tool 消息
+                messages.pop(0)
+                while messages and messages[0].get("role") == "tool":
+                    messages.pop(0)
+            else:
+                messages.pop(0)
+        elif first_role == "tool":
+            # 孤立的 tool 消息（前一条 assistant 已被删）→ 直接删掉
             messages.pop(0)
         else:
             messages.pop(0)

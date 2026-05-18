@@ -56,9 +56,15 @@ def _mark_embed_unavailable():
 
 IGNORE_DIRS = {
     ".git", "node_modules", "__pycache__", ".idea", ".vscode",
-    ".venv", "venv", ".env", "build", "dist", ".next", ".nuxt",
+    ".venv", "venv", "env", ".env", "build", "dist", ".next", ".nuxt",
     ".turbo", "target", ".tox", ".eggs", "*.egg-info",
-    ".patchflow",
+    ".patchflow", ".mypy_cache", ".pytest_cache",
+    "vendor", "bundle", ".bundle",         # Go/PHP/Ruby 依赖
+    ".gradle", "gradle",                   # Gradle 缓存
+    "bower_components",                    # 旧 JS 包管理器
+    "__generated__", "generated", "gen",   # 代码生成
+    "Pods", "Carthage",                    # iOS/macOS 依赖
+    ".terraform", ".serverless", "cdk.out",  # IaC 产物
 }
 
 BINARY_EXT = {
@@ -74,22 +80,29 @@ BINARY_EXT = {
     ".map", ".chunk",
 }
 
-TEXT_EXT = {
-    ".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs",
-    ".java", ".kt", ".kts", ".scala",
+# 源码扩展名优先 — 这些文件对语义理解最有价值
+SOURCE_EXT = {
+    ".py", ".java", ".kt", ".kts", ".scala",
+    ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs",
     ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx",
     ".rs", ".go", ".rb", ".php",
     ".swift", ".m", ".mm",
     ".cs", ".fs", ".vb",
     ".vue", ".svelte", ".astro",
+    ".proto", ".graphql", ".gql",
+}
+
+# 配置文件/文档 — 低优先级
+CONFIG_EXT = {
     ".html", ".htm", ".xml", ".xhtml",
     ".css", ".scss", ".sass", ".less",
     ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
     ".md", ".mdx", ".rst", ".txt",
     ".sql", ".sh", ".bash", ".zsh", ".bat", ".ps1",
-    ".proto", ".graphql", ".gql",
     ".env", ".gitignore", ".gitattributes", ".dockerignore",
 }
+
+TEXT_EXT = SOURCE_EXT | CONFIG_EXT
 
 
 def _should_ignore(name: str, is_dir: bool) -> bool:
@@ -239,25 +252,45 @@ def _make_summary(path: Path, content: str, symbols: list[str]) -> str:
 # 文件扫描
 # ═══════════════════════════════════════════════════════════
 
-def _scan_files(work_dir: str) -> list[Path]:
-    """扫描项目下所有可用文本文件"""
+def _scan_files(work_dir: str, max_files: int = 8000) -> list[Path]:
+    """扫描项目文件，源码文件优先，配置文件次之
+
+    到达 max_files 上限后停止扫描。
+    """
     root = Path(work_dir).resolve()
-    files = []
+    source_files: list[Path] = []
+    other_files: list[Path] = []
 
     def _walk(d: Path):
+        if len(source_files) + len(other_files) >= max_files * 2:
+            return
         try:
             entries = sorted(d.iterdir())
         except PermissionError:
             return
         for entry in entries:
+            if len(source_files) + len(other_files) >= max_files * 2:
+                return
             if _should_ignore(entry.name, entry.is_dir()):
                 continue
             if entry.is_dir():
                 _walk(entry)
-            elif entry.suffix.lower() in TEXT_EXT or entry.suffix.lower() not in BINARY_EXT:
-                files.append(entry.relative_to(root))
+            else:
+                ext = entry.suffix.lower()
+                if ext not in BINARY_EXT:
+                    rel = entry.relative_to(root)
+                    if ext in SOURCE_EXT:
+                        source_files.append(rel)
+                    else:
+                        other_files.append(rel)
 
     _walk(root)
+
+    # 源码优先，总数控制在 max_files
+    files = source_files[:max_files]
+    remaining = max_files - len(files)
+    if remaining > 0:
+        files.extend(other_files[:remaining])
     return files
 
 
@@ -390,10 +423,18 @@ class CodebaseIndex:
         except (json.JSONDecodeError, OSError):
             return False
 
-    def build(self, force: bool = False) -> int:
+    def build(self, force: bool = False,
+              max_files: int = 5000, max_file_size: int = 200_000,
+              max_seconds: int = 30) -> int:
         """扫描项目 → 提取符号 → 生成 embedding → 持久化
 
-        返回索引的文件数量。如果 embedding 不可用，仍保存符号信息。
+        Args:
+            force: 强制重建
+            max_files: 最多索引文件数
+            max_file_size: 跳过超过此大小的文件（字节）
+            max_seconds: 超时后停止扫描，已索引内容仍会持久化
+
+        返回索引的文件数量。
         """
         if not force and self.is_built():
             self.load()
@@ -402,17 +443,29 @@ class CodebaseIndex:
         logger.info("正在构建项目索引...")
         t0 = time.time()
 
-        files = _scan_files(str(self.work_dir))
-        logger.info(f"发现 {len(files)} 个文件")
+        files = _scan_files(str(self.work_dir), max_files=max_files)
+        logger.info(f"发现 {len(files)} 个文件 (limit={max_files})")
 
         entries: dict[str, dict] = {}
         summaries: list[str] = []
         file_paths: list[str] = []
+        skipped_large = 0
+        skipped_timeout = False
 
         for fp in files:
+            if time.time() - t0 > max_seconds:
+                skipped_timeout = True
+                break
+
             key = str(fp).replace("\\", "/")
+            fpath = Path(self.work_dir / fp)
+
+            if fpath.stat().st_size > max_file_size:
+                skipped_large += 1
+                continue
+
             try:
-                content = Path(self.work_dir / fp).read_text(encoding="utf-8", errors="replace")
+                content = fpath.read_text(encoding="utf-8", errors="replace")
             except (OSError, UnicodeDecodeError):
                 continue
 
@@ -427,6 +480,11 @@ class CodebaseIndex:
             }
             summaries.append(summary)
             file_paths.append(key)
+
+        if skipped_large:
+            logger.info(f"跳过 {skipped_large} 个大文件 (> {max_file_size // 1000}KB)")
+        if skipped_timeout:
+            logger.info(f"索引超时 ({max_seconds}s)，已处理 {len(entries)} 个文件")
 
         logger.info(f"提取 {len(entries)} 个文件摘要")
 

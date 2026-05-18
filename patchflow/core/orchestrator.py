@@ -35,8 +35,11 @@ from pathlib import Path
 from patchflow.core.analysis.error_analyzer import analyze as analyze_error
 from patchflow.core.analysis.strategy_selector import select_strategy, strategy_sequence
 from patchflow.core.fix.breaker import FixLoopBreaker
-from patchflow.core.fix.fixer import apply_fix, fix
+from patchflow.core.fix.change_set import ChangeSet
+from patchflow.core.fix.fixer import apply_fix, fix, fix_multi
 from patchflow.core.fix.generator import generate, write_files
+from patchflow.core.fix.memory_bank import FixMemoryBank
+from patchflow.core.fix.patch_applicator import DiffTracker
 from patchflow.core.fix.scope_calculator import DepGraph
 from patchflow.core.fix.scope_calculator import calculate as calculate_scope
 from patchflow.core.fix.snapshot_manager import SnapshotManager
@@ -58,8 +61,13 @@ class Orchestrator:
         self.snapshot = SnapshotManager(work_dir)
 
         self.dep_graph = DepGraph(work_dir)
+        self.code_graph = None  # 延迟构建（首次 run 时）
         self._context_prompt = None
-        self.breaker = FixLoopBreaker(max_retries=max_retries)
+        self.memory_bank = FixMemoryBank(work_dir=work_dir)
+        self.memory_bank.load()
+        self.breaker = FixLoopBreaker(max_retries=max_retries, memory_bank=self.memory_bank)
+        self.change_set = ChangeSet(work_dir=work_dir, dep_graph=self.dep_graph)
+        self.diff_tracker = DiffTracker()
         self._diff_report: list[str] = []
 
         self.state: dict = {
@@ -68,6 +76,7 @@ class Orchestrator:
             "snapshot_id": None,
             "files_written": [],
             "strategy_tried": [],
+            "error_history": [],
         }
 
     def _get_context_prompt(self) -> str:
@@ -189,6 +198,7 @@ class Orchestrator:
             )
             if not should_retry:
                 logger.error(f"熔断: {reason}")
+                self.memory_bank.save()
                 self.snapshot.rollback(self.state["snapshot_id"])
                 return False
 
@@ -200,6 +210,7 @@ class Orchestrator:
             # 所有策略都已尝试过 → 放弃修复
             if current_strategy_scope >= len(scope_strategies):
                 logger.error("所有策略都已尝试，放弃修复")
+                self.memory_bank.save()
                 self.snapshot.rollback(self.state["snapshot_id"])
                 return False
 
@@ -212,8 +223,22 @@ class Orchestrator:
                 except Exception as e:
                     logger.debug(f"Dep graph 构建失败（非致命）: {e}")
 
-            # 计算受影响的文件范围
-            scope_result = calculate_scope(analysis, dep_graph=self.dep_graph)
+                # 构建语义代码图谱（函数/类级别，优先使用）
+                if self.code_graph is None:
+                    try:
+                        from patchflow.core.language_registry import LanguageRegistry
+                        from patchflow.core.fix.code_graph import CodeGraph
+                        lang = LanguageRegistry().detect(str(self.work_dir))
+                        if lang:
+                            self.code_graph = CodeGraph(str(self.work_dir), lang)
+                            logger.info(f"[Orch] CodeGraph built: {len(self.code_graph.files)} files, "
+                                        f"{len(self.code_graph.symbols)} symbols")
+                    except Exception as e:
+                        logger.debug(f"CodeGraph 构建失败（非致命）: {e}")
+
+            # 计算受影响的文件范围（优先使用语义图谱）
+            scope_result = calculate_scope(analysis, dep_graph=self.dep_graph,
+                                           code_graph=self.code_graph)
             logger.info(f"  ScopeCalculator: {scope_result.strategy} ({len(scope_result.files)} 文件)")
 
             # 选择具体的修复策略
@@ -235,37 +260,89 @@ class Orchestrator:
                 self.snapshot.rollback(self.state["snapshot_id"])
                 return False
 
+            # 查询记忆库：是否有相似历史修复作为上下文
+            memory_context = ""
+            similar = self.memory_bank.query(analysis.type, analysis.root_cause)
+            if similar:
+                parts = []
+                for m in similar[:3]:
+                    status = "ok" if m.success else "failed"
+                    parts.append(f"  [{status}] {m.fix_pattern[:80]}")
+                memory_context = "Similar past fixes:\n" + "\n".join(parts)
+
             # Step 5: 执行修复（Fixer）
-            # 注入项目上下文 + Scope 硬约束（LLM 只能修改范围内的文件）
-            fix_result = fix(
-                error_text=analysis.raw,
-                file_path=target_file,
-                model=self.model,
-                scope=scope_result,
-                project_context=context_prompt,
+            # 多文件 scope 则用 fix_multi，否则用 fix（注入项目上下文 + Scope 硬约束）
+            if len(scope_result.files) > 1:
+                multi_changes = fix_multi(
+                    error_text=analysis.raw,
+                    scope_files=scope_result.files,
+                    model=self.model,
+                    project_context=context_prompt + ("\n" + memory_context if memory_context else ""),
+                )
+                if multi_changes:
+                    self.change_set.changes.clear()
+                    for ch in multi_changes:
+                        self.change_set.add(ch.get("file", target_file),
+                                           ch.get("content", ""),
+                                           ch.get("reason", ""))
+                    self.change_set.expand_with_dependents()
+                    self.change_set.begin()
+                    applied = self.change_set.apply_all()
+                    fix_success = applied > 0
+                else:
+                    fix_success = False
+            else:
+                fix_result = fix(
+                    error_text=analysis.raw,
+                    file_path=target_file,
+                    model=self.model,
+                    scope=scope_result,
+                    project_context=context_prompt + ("\n" + memory_context if memory_context else ""),
+                )
+                if fix_result and apply_fix(fix_result, work_dir=self.work_dir):
+                    fix_success = True
+                    p = Path(target_file)
+                    if p.exists():
+                        try:
+                            self.diff_tracker.record(
+                                target_file,
+                                fix_result.get("old_content", ""),
+                                fix_result["content"]
+                            )
+                        except Exception:
+                            pass
+                else:
+                    fix_success = False
+
+            # 修复失败 → 升级策略（尝试更广的修复范围）
+            if not fix_success:
+                logger.warn(f"修复失败，升级策略 [{strategy_name}]")
+                self.state["strategy_level"] = current_strategy_scope + 1
+                self.state["strategy_tried"].append(strategy_name)
+                self.breaker.record_failure(analysis.type, analysis.root_cause)
+                self.memory_bank.add(
+                    error_type=analysis.type, root_cause=analysis.root_cause,
+                    fix_pattern=f"failed: {analysis.root_cause[:100]}",
+                    file_paths=scope_result.files,
+                    success=False, strategy_used=strategy_name,
+                )
+                if self.change_set._current_snapshot_id:
+                    self.change_set.rollback()
+                else:
+                    self.snapshot.rollback(self.state["snapshot_id"])
+                self.state["snapshot_id"] = self.snapshot.save(written)
+                continue
+
+            # 本轮修复成功 → 记录 memory，进入下一轮验证
+            self.memory_bank.add(
+                error_type=analysis.type, root_cause=analysis.root_cause,
+                fix_pattern=f"fixed: {analysis.root_cause[:100]}",
+                file_paths=scope_result.files,
+                success=True, strategy_used=strategy_name,
             )
+            self.memory_bank.save()
+            self.change_set.commit()
 
-            # 修复生成失败 → 升级策略（尝试更广的修复范围）
-            if fix_result is None:
-                logger.warn(f"修复生成失败，升级策略 [{strategy_name}]")
-                self.state["strategy_level"] = current_strategy_scope + 1
-                self.state["strategy_tried"].append(strategy_name)
-                self.breaker.record_failure(analysis.type, analysis.root_cause)
-                self.snapshot.rollback(self.state["snapshot_id"])
-                self.state["snapshot_id"] = self.snapshot.save(written)
-                continue
-
-            # 修复写入磁盘失败 → 升级策略
-            if not apply_fix(fix_result, work_dir=self.work_dir):
-                logger.warn(f"修复应用失败，升级策略 [{strategy_name}]")
-                self.state["strategy_level"] = current_strategy_scope + 1
-                self.state["strategy_tried"].append(strategy_name)
-                self.breaker.record_failure(analysis.type, analysis.root_cause)
-                self.snapshot.rollback(self.state["snapshot_id"])
-                self.state["snapshot_id"] = self.snapshot.save(written)
-                continue
-
-            # 本轮修复成功 → 进入下一轮验证
             self.state["turn"] += 1
             self.state["transition"] = "next_turn"
             self.state["strategy_tried"].append(strategy_name)
@@ -275,6 +352,7 @@ class Orchestrator:
         logger.error(f"已达到最大重试次数 ({self.max_retries})，回滚并退出")
         if self.state.get("strategy_tried"):
             logger.info(f"已尝试策略: {', '.join(self.state['strategy_tried'])}")
+        self.memory_bank.save()
         self.snapshot.rollback(self.state["snapshot_id"])
         if self._budget:
             logger.info(f"  {self._budget.summary()}")
