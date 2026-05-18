@@ -36,7 +36,7 @@ class Blackboard:
 
     def __init__(self, task: str = "", context: dict | None = None,
                  code: dict[str, str] | None = None,
-                 error: str = ""):
+                 error: str = "", code_graph=None):
         self._lock = threading.RLock()
         self.data = {
             "task": task,
@@ -48,6 +48,7 @@ class Blackboard:
             "review": None,
             "review_feedback": None,
         }
+        self.code_graph = code_graph  # CodeGraph 语义代码图谱（可选）
         self._current_agent: str | None = None
         self._activity: list[dict] = []
         self._read_set: set[str] = set()
@@ -173,7 +174,10 @@ class Blackboard:
             return dict(self.data)
 
     def get_callchain_code(self) -> str:
-        """获取调用链上所有文件的代码（给 Analyzer/Fixer 用）"""
+        """获取调用链上所有文件的代码（给 Analyzer/Fixer 用）
+
+        当 CodeGraph 可用时，优先返回语义分块（Token 预算感知）。
+        """
         with self._lock:
             self._log("read", "code")
             analysis = self.data.get("analysis")
@@ -183,6 +187,12 @@ class Blackboard:
             impact = analysis.get("impact_files") or []
             call_chain = analysis.get("call_chain") or []
             call_files = set(f["file"] for f in call_chain) | set(impact)
+
+            # 语义分块路径
+            if self.code_graph is not None:
+                return self._semantic_callchain(call_files)
+
+            # 回退：原始文件 dump
             parts = []
             for filepath in call_files:
                 content = self.data["code"].get(filepath, "")
@@ -191,15 +201,116 @@ class Blackboard:
             return "\n\n".join(parts) if parts else "\n".join(self.data["code"].values())
 
     def get_code(self, allowed_files: list[str]) -> str:
-        """获取指定文件的代码（受策略限制）"""
+        """获取指定文件的代码（受策略限制）
+
+        当 CodeGraph 可用时，在文件头添加符号索引，帮助 Fixer 快速定位。
+        """
         with self._lock:
             self._log("read", "code")
+
             parts = []
             for filepath in allowed_files:
                 content = self.data["code"].get(filepath, "")
-                if content:
+
+                # 有 CodeGraph 时添加符号索引头
+                if self.code_graph is not None and content:
+                    header = self._symbol_index(filepath)
+                    parts.append(f"# === {filepath} ===\n{header}\n{content}")
+                elif content:
                     parts.append(f"# === {filepath} ===\n{content}")
             return "\n\n".join(parts) if parts else "(no files available)"
+
+    def get_semantic_chunks(self, file_rel: str, line: int = 0,
+                            budget_tokens: int = 2000) -> list[dict]:
+        """Token 预算感知的语义上下文切片
+
+        Args:
+            file_rel: 目标文件相对路径
+            line: 目标行号（0 = 整个文件）
+            budget_tokens: Token 预算上限
+
+        Returns:
+            [{uid, name, kind, file, lines, content, priority}]
+        """
+        if self.code_graph is None:
+            return []
+
+        if line > 0:
+            sym = self.code_graph.find_symbol_by_location(file_rel, line)
+            if sym:
+                return self.code_graph.chunk_context(sym.uid, budget_tokens)
+
+        fn = self.code_graph.files.get(file_rel)
+        if fn is None:
+            return []
+        chunks = []
+        for uid in fn.symbols:
+            s = self.code_graph.get_symbol(uid)
+            if s is None or s.kind == "module":
+                continue
+            chunks.append({
+                "uid": s.uid, "name": s.name, "kind": s.kind,
+                "file": s.file_rel, "lines": f"{s.start_line}-{s.end_line}",
+                "content": "", "priority": 0,
+            })
+        return chunks
+
+    def _symbol_index(self, file_rel: str) -> str:
+        """为文件生成符号索引（紧凑一行）"""
+        fn = self.code_graph.files.get(file_rel)
+        if fn is None:
+            return ""
+        items = []
+        for uid in fn.symbols:
+            s = self.code_graph.get_symbol(uid)
+            if s is None or s.kind == "module":
+                continue
+            items.append(f"{s.kind} {s.name} L{s.start_line}-{s.end_line}")
+        return "// symbols: " + "; ".join(items[:15]) if items else ""
+
+    def _semantic_callchain(self, call_files: set[str]) -> str:
+        """为调用链文件生成语义分块上下文（含实际代码片段）"""
+        parts = []
+        wd_str = str(self.code_graph.work_dir) if hasattr(self.code_graph, 'work_dir') else "."
+        from pathlib import Path
+        wd = Path(wd_str)
+
+        for file_rel in sorted(call_files):
+            fn = self.code_graph.files.get(file_rel)
+            if fn is None:
+                content = self.data["code"].get(file_rel, "")
+                if content:
+                    parts.append(f"# === {file_rel} ===\n{content[:2000]}")
+                continue
+
+            sym_list = []
+            for uid in fn.symbols:
+                s = self.code_graph.get_symbol(uid)
+                if s is not None and s.kind != "module":
+                    sym_list.append(s)
+            sym_list.sort(key=lambda s: s.start_line)
+
+            file_parts = [f"# === {file_rel} ({len(sym_list)} symbols) ==="]
+
+            try:
+                source = (wd / file_rel).read_text(encoding="utf-8")
+                source_lines = source.split("\n")
+            except Exception:
+                source_lines = []
+
+            # 输出顶层符号的代码（最多 8 个，最相关优先）
+            for s in sym_list[:8]:
+                sig = f"  # {s.signature}" if s.signature else ""
+                file_parts.append(
+                    f"\n## {s.kind} {s.name} L{s.start_line}-{s.end_line}{sig}"
+                )
+                if source_lines:
+                    snippet = "\n".join(source_lines[s.start_line - 1:s.end_line])
+                    if len(snippet) > 1200:
+                        snippet = snippet[:1200] + "\n..."
+                    file_parts.append(snippet)
+            parts.append("\n".join(file_parts))
+        return "\n\n".join(parts) if parts else "(no symbols found)"
 
     def summary(self) -> str:
         """生成 Blackboard 状态摘要（一行）"""
