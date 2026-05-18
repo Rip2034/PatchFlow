@@ -30,6 +30,10 @@ def error(msg: str):
     print(f"[{_timestamp()}]  ERROR {msg}", file=sys.stderr)
 
 
+def debug(msg: str):
+    print(f"[{_timestamp()}]  DEBUG {msg}", file=sys.stderr)
+
+
 def warn(msg: str):
     print(f"[{_timestamp()}]  WARN  {msg}", file=sys.stderr)
 
