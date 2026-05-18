@@ -14,7 +14,8 @@ from patchflow.core.llm_client import call_llm
 from patchflow.utils import logger
 
 
-def agent_fix(blackboard, dep_graph=None, model: str | None = None, model_alias: str | None = None) -> dict:
+def agent_fix(blackboard, dep_graph=None, code_graph=None,
+              model: str | None = None, model_alias: str | None = None) -> dict:
     """Fixer Agent：根据分析和策略执行修复
 
     程序先通过 Scope Calculator + Strategy Selector 确定范围，
@@ -23,6 +24,7 @@ def agent_fix(blackboard, dep_graph=None, model: str | None = None, model_alias:
     Args:
         blackboard: Blackboard 实例
         dep_graph: 可选的依赖图（用于 Scope Calculator）
+        code_graph: 可选的语义代码图谱（用于函数级精确 Scope）
         model: LLM 模型
         model_alias: 模型别名（如 "deepseek"、"claude"），指定后覆盖认证配置
 
@@ -41,7 +43,7 @@ def agent_fix(blackboard, dep_graph=None, model: str | None = None, model_alias:
     )
     logger.info(f"[Agent Fixer] 策略: {strategy['scope']} 范围 | 改写: {strategy['rewrite']}")
 
-    if dep_graph:
+    if dep_graph or code_graph:
         try:
             scope_analysis = ErrorAnalysis(
                 type=analysis.get("error_type", "runtime"),
@@ -49,7 +51,8 @@ def agent_fix(blackboard, dep_graph=None, model: str | None = None, model_alias:
                 call_chain=analysis.get("call_chain", []),
                 impact_files=analysis.get("impact_files", []),
             )
-            scope_result = calculate_scope(scope_analysis, dep_graph=dep_graph)
+            scope_result = calculate_scope(scope_analysis, dep_graph=dep_graph,
+                                           code_graph=code_graph)
             allowed_files = scope_result.files
         except Exception as e:
             logger.warn(f"[Agent Fixer] Scope 计算失败: {e}，使用 impact_files 回退")
