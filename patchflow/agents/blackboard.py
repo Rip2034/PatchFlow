@@ -168,7 +168,10 @@ class Blackboard:
                 if analysis:
                     result["analysis"] = {k: analysis.get(k) for k in ANALYSIS_KEYS if k in analysis}
                 if fix_plan:
-                    result["fix_plan"] = {"summary": fix_plan.get("summary", ""), "patches": fix_plan.get("patches", [])}
+                    result["fix_plan"] = {
+                        "summary": fix_plan.get("summary", ""),
+                        "patches": fix_plan.get("patches", []),
+                    }
                 return result
 
             return dict(self.data)

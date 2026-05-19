@@ -1,8 +1,9 @@
 """Tests for TokenBudget session tracking."""
-import pytest
 from patchflow.core.fix.budget import (
-    TokenBudget, BudgetExceeded,
-    start_session_budget, get_session_budget, end_session_budget,
+    TokenBudget,
+    end_session_budget,
+    get_session_budget,
+    start_session_budget,
 )
 
 

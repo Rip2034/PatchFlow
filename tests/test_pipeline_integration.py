@@ -3,15 +3,14 @@
 These tests verify that all pipeline components work together correctly,
 using mocked LLM calls to avoid API dependencies.
 """
-import pytest
-from pathlib import Path
-from unittest.mock import patch, MagicMock
 
+import pytest
+
+from patchflow.core.agent_sandbox import AgentSandbox, reset_sandbox
 from patchflow.core.fix.breaker import FixLoopBreaker
-from patchflow.core.fix.budget import TokenBudget, start_session_budget, end_session_budget
-from patchflow.core.fix.prompt_guard import scan, fence_code, fence_user_input
-from patchflow.core.agent_sandbox import AgentSandbox, PathGuard, get_sandbox, reset_sandbox
+from patchflow.core.fix.budget import TokenBudget, end_session_budget, start_session_budget
 from patchflow.core.fix.conflict_detector import LazyConflictDetector
+from patchflow.core.fix.prompt_guard import fence_code, fence_user_input, scan
 
 
 class TestPipelineBreakerLoop:

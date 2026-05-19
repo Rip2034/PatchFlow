@@ -1,6 +1,5 @@
 """Tests for ChangeSet — cross-file fix coordination."""
-import pytest
-from patchflow.core.fix.change_set import FileChange, ChangeSet, _extract_entity_names
+from patchflow.core.fix.change_set import ChangeSet, FileChange, _extract_entity_names
 
 
 class TestFileChange:

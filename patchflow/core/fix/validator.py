@@ -8,7 +8,7 @@
 
 from pathlib import Path
 
-from patchflow.core.analysis.error_parser import ParsedError, parse
+from patchflow.core.analysis.error_parser import ParsedError
 from patchflow.core.language_strategy import LanguageFactory
 from patchflow.utils import logger
 

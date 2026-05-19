@@ -1,7 +1,4 @@
 """Tests for FixMemoryBank — persistent fix outcome memory."""
-import pytest
-import json
-from pathlib import Path
 from patchflow.core.fix.memory_bank import FixMemory, FixMemoryBank
 
 

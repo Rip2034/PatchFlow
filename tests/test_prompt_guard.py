@@ -1,8 +1,11 @@
 """Tests for prompt injection detection and sanitization."""
-import pytest
 from patchflow.core.fix.prompt_guard import (
-    scan, scan_code, scan_filepath, fence_code, fence_user_input,
-    InjectionResult, is_safe,
+    fence_code,
+    fence_user_input,
+    is_safe,
+    scan,
+    scan_code,
+    scan_filepath,
 )
 
 

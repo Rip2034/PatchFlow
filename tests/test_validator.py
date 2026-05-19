@@ -1,8 +1,9 @@
 """Tests for validator — language detection and entry file finding."""
-import pytest
-from pathlib import Path
 from patchflow.core.fix.validator import (
-    ValidationResult, detect_project_type, validate, _find_entry,
+    ValidationResult,
+    _find_entry,
+    detect_project_type,
+    validate,
 )
 
 

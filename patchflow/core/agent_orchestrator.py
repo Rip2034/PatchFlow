@@ -262,8 +262,8 @@ class AgentOrchestrator:
         # ── 构建语义代码图谱（函数/类级别，用于精确 Scope）──
         if self.code_graph is None:
             try:
-                from patchflow.core.language_registry import LanguageRegistry
                 from patchflow.core.fix.code_graph import CodeGraph
+                from patchflow.core.language_registry import LanguageRegistry
                 display.set_detail(0, "Detecting language...")
                 lang = LanguageRegistry().detect(str(self.work_dir))
                 if lang:
@@ -292,7 +292,7 @@ class AgentOrchestrator:
         confidence = analysis.get("confidence", 0)
         impact_files = analysis.get("impact_files", [])
         display.set_completed(0, f"Error: {error_type}" if error_type else analysis.get("summary", ""))
-        logger.info(f"[AgentOrch] === Analyzer 分析结果 ===")
+        logger.info("[AgentOrch] === Analyzer 分析结果 ===")
         logger.info(f"[AgentOrch]   错误类型: {error_type}")
         logger.info(f"[AgentOrch]   根因: {root_cause[:120]}")
         logger.info(f"[AgentOrch]   置信度: {confidence:.0%}")
@@ -376,7 +376,7 @@ class AgentOrchestrator:
         issues = review.get("issues", [])
         feedback = review.get("feedback", "")
         display.set_completed(2, f"Score: {score}/10 (approved)" if review.get("approved") else f"Score: {score}/10 (needs redo)")
-        logger.info(f"[AgentOrch] === Reviewer 审查结果 ===")
+        logger.info("[AgentOrch] === Reviewer 审查结果 ===")
         logger.info(f"[AgentOrch]   评分: {score}/10 {'(通过)' if review.get('approved') else '(需重做)'}")
         if issues:
             for issue in issues[:5]:

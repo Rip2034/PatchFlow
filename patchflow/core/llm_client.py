@@ -195,7 +195,8 @@ def _call_openai_compat(system_prompt, user_message, model, max_tokens, api_key,
     if not api_base:
         api_base = "https://api.deepseek.com" if provider == "deepseek" else "https://api.openai.com/v1"
 
-    client = OpenAI(api_key=api_key, base_url=api_base, timeout=120)
+    from httpx import Timeout
+    client = OpenAI(api_key=api_key, base_url=api_base, timeout=Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0))
 
     messages = [
         {"role": "system", "content": system_prompt},

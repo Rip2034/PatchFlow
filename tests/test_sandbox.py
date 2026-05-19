@@ -1,10 +1,13 @@
 """Tests for AgentSandbox path guard, command guard, and resource limiter."""
-import os
 import pytest
-from pathlib import Path
+
 from patchflow.core.agent_sandbox import (
-    PathGuard, CommandGuard, ResourceLimiter, AgentSandbox,
-    SandboxViolation, get_sandbox, reset_sandbox,
+    CommandGuard,
+    PathGuard,
+    ResourceLimiter,
+    SandboxViolation,
+    get_sandbox,
+    reset_sandbox,
 )
 
 

@@ -644,7 +644,6 @@ def _safe_path(filename: str) -> str | None:
     Returns:
         错误消息字符串（不安全时），或 None（安全时）
     """
-    import os
     resolved = os.path.abspath(filename)
     cwd = os.getcwd()
     if not resolved.startswith(cwd + os.sep) and resolved != cwd:
@@ -1105,8 +1104,8 @@ def _execute_tool(name: str, args: dict,
         idx = _get_index(".")
 
         # 自动判断：含正则元字符 → 代码搜索，否则 → 语义搜索
-        _REGEX_META = re.compile(r'[\\\[\](){}.*+?^$|]')
-        if _REGEX_META.search(query):
+        _regex_meta = re.compile(r'[\\\[\](){}.*+?^$|]')
+        if _regex_meta.search(query):
             return idx.search_code(query, path_filter=path_filter)
 
         results = idx.search_files(query, top_k=10)
@@ -1220,6 +1219,7 @@ class ChatClient:
         self._thinking_budget = thinking_budget  # 0 = 禁用，>0 = 启用扩展思考
         if self._memory_enabled:
             self._load_memory()
+            self._compress_old_messages()  # 加载后立即压缩，避免旧消息撑爆上下文
 
     # ── streaming chat（给 REPL 用）──
 
@@ -1230,7 +1230,9 @@ class ChatClient:
             _READ_CACHE.clear()
             _RUN_CACHE.clear()
             _RUN_COUNTER.clear()
+            t0 = time.time()
             skeleton = _get_project_skeleton(".")
+            logger.info(f"[perf] skeleton scan: {time.time() - t0:.2f}s")
 
             rules_text = ""
             rules_file = Path(".patchflow/rules.md")
@@ -1244,7 +1246,9 @@ class ChatClient:
             else:
                 enhanced_input = f"{skeleton}\n\n{user_input}"
             self.messages.append({"role": "user", "content": enhanced_input})
+            t0 = time.time()
             self._save_memory()
+            logger.info(f"[perf] save_memory: {time.time() - t0:.2f}s")
         else:
             bg_info = ""
             try:
@@ -1262,12 +1266,16 @@ class ChatClient:
 
         for _ in range(self._max_rounds):
             recent = compress(self.messages)
+            t0 = time.time()
+            input_tokens_est = sum(len(m.get("content", "")) for m in recent if isinstance(m.get("content"), str))
 
             if self._openai:
                 text, tcs, usage = self._call_openai_stream(recent)
                 thinking_text = ""
             else:
                 text, tcs, usage, thinking_text = self._call_anthropic(recent)
+            logger.info(f"[perf] LLM call: {time.time() - t0:.2f}s, "
+                         f"messages={len(recent)}, input_est={input_tokens_est // 1000}K chars")
 
             session_usage["input_tokens"] += usage.get("input_tokens", 0)
             session_usage["output_tokens"] += usage.get("output_tokens", 0)
@@ -1529,8 +1537,14 @@ class ChatClient:
 
     def clear_history(self):
         self.messages = []
+        self._memory_summary = []
         self._has_dev_activity = False
-        self._save_memory()
+        # 直接清空记忆文件，不经过 _save_memory（它会因为"非开发任务"跳过写盘）
+        if self._memory_enabled and self._memory_path.exists():
+            try:
+                self._memory_path.write_text(json.dumps({"summary": [], "messages": []}, ensure_ascii=False), encoding="utf-8")
+            except OSError:
+                pass
         logger.info("对话历史已清空")
 
     def get_summary(self) -> str:
@@ -1828,12 +1842,12 @@ class ChatClient:
         if not self.messages:
             return
 
-        MAX_MSG_COUNT = 500
+        _max_msg_count = 500
 
         test = json.dumps({"messages": self.messages, "summary": self._memory_summary},
                           ensure_ascii=False)
         size_ok = len(test.encode("utf-8")) <= self._MAX_MEMORY_BYTES
-        count_ok = len(self.messages) <= MAX_MSG_COUNT
+        count_ok = len(self.messages) <= _max_msg_count
         if size_ok and count_ok:
             return
 
@@ -1842,7 +1856,7 @@ class ChatClient:
                         if m.get("role") == "user" and not m.get("_memory_summary")]
 
         # 消息数过多 → 只保留 1 轮
-        if len(self.messages) > MAX_MSG_COUNT:
+        if len(self.messages) > _max_msg_count:
             keep_turns = 1
         else:
             keep_turns = self._MIN_KEEP_TURNS
@@ -1858,7 +1872,7 @@ class ChatClient:
             test = json.dumps({"messages": candidate, "summary": self._memory_summary},
                               ensure_ascii=False)
             size_ok = len(test.encode("utf-8")) <= self._MAX_MEMORY_BYTES
-            count_ok = len(candidate) <= MAX_MSG_COUNT
+            count_ok = len(candidate) <= _max_msg_count
             if size_ok and count_ok:
                 break
             # 找到最早的一个完整用户回合
@@ -2030,7 +2044,7 @@ class ChatClient:
         return "\n".join(lines)
 
     @property
-    def MAX_MEMORY_BYTES(self):
+    def max_memory_bytes(self):
         return self._MAX_MEMORY_BYTES
 
     @property

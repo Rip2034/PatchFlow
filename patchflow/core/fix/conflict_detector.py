@@ -388,7 +388,7 @@ def _extract_entities_pygments(content: str, filepath: str = "") -> list[tuple[s
         list[tuple[str, str]]: [(名称, 类型), ...]
     """
     from pygments.lexers import guess_lexer_for_filename
-    from pygments.token import Comment, Literal, Name, Keyword
+    from pygments.token import Comment, Keyword, Literal, Name
 
     try:
         lexer = guess_lexer_for_filename(filepath, content)
@@ -400,7 +400,7 @@ def _extract_entities_pygments(content: str, filepath: str = "") -> list[tuple[s
     seen: set[tuple[str, str]] = set()
 
     # Token 类别 → 实体类型
-    _TOKEN_ENTITY_MAP = {
+    token_entity_map = {
         Name.Class: "class",
         Name.Function: "function",
         Keyword.Declaration: None,  # 只是声明关键字，实体名在下一个 name token
@@ -409,7 +409,7 @@ def _extract_entities_pygments(content: str, filepath: str = "") -> list[tuple[s
 
     # 声明关键字后面紧跟着的 Name token 就是实体名
     # 例如 'class' → Name.Class, 'struct' → Name.Class, 'fn' → Name.Function
-    _DECLARATION_KEYWORDS = {
+    declaration_keywords = {
         "class", "struct", "interface", "enum", "trait", "impl",
         "def", "fn", "func", "function", "type", "object",
         "public class", "pub struct", "pub enum", "pub trait",
@@ -425,7 +425,7 @@ def _extract_entities_pygments(content: str, filepath: str = "") -> list[tuple[s
             continue
 
         # 直接命中 Name.Class / Name.Function
-        entity_type = _TOKEN_ENTITY_MAP.get(tok_type)
+        entity_type = token_entity_map.get(tok_type)
         if entity_type and value.strip():
             key = (value.strip(), entity_type)
             if key not in seen:
@@ -433,7 +433,7 @@ def _extract_entities_pygments(content: str, filepath: str = "") -> list[tuple[s
                 entities.append(key)
 
         # 声明关键字 → 下一个 Name token 为实体名
-        if tok_type in Keyword and value.strip() in _DECLARATION_KEYWORDS:
+        if tok_type in Keyword and value.strip() in declaration_keywords:
             # 向前看：跳过空格和修饰符，找下一个 Name token
             for j in range(i + 1, min(i + 8, len(tokens))):
                 nt, nv = tokens[j]

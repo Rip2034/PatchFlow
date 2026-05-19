@@ -104,7 +104,7 @@ Fix the error. Output ONLY the JSON with the fixed file content."""
     if scope_files and fixed_file not in scope_files:
         logger.error(f"Fixer: LLM 尝试修改不在范围内的文件: {fixed_file}")
         logger.error(f"  允许范围: {scope_files}")
-        logger.error(f"  拒绝修复，返回 None 触发策略升级")
+        logger.error("  拒绝修复，返回 None 触发策略升级")
         return None
 
     logger.success(f"Fixer: 生成修复方案 for {result['file']}")

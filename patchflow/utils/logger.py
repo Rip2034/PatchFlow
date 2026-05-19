@@ -19,7 +19,7 @@ def _timestamp():
 
 
 def info(msg: str):
-    print(f"[{_timestamp()}]  INFO  {msg}", file=sys.stderr)
+    print(f"[{_timestamp()}]  INFO  {msg}", file=sys.stderr, flush=True)
 
 
 def success(msg: str):

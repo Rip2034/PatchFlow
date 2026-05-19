@@ -18,8 +18,8 @@ from patchflow.utils import logger
 
 # tree-sitter-language-pack v2 — Rust-native binding
 try:
-    from tree_sitter_language_pack.api import process as ts_process
     from tree_sitter_language_pack.api import ProcessConfig, ProcessResult
+    from tree_sitter_language_pack.api import process as ts_process
     _TS_AVAILABLE = True
 except ImportError:
     _TS_AVAILABLE = False
@@ -114,14 +114,14 @@ class CodeGraph:
         import time
         ts_lang = self.lang.name
         extensions = self.lang.extensions
-        MAX_FILES = 2000
+        max_files = 2000
         start_time = time.time()
 
         # 第一遍：收集所有符号
         count = 0
         for fpath in self._iter_source_files(extensions):
-            if count >= MAX_FILES:
-                logger.info(f"[CodeGraph] reached max files ({MAX_FILES}), stopping parse")
+            if count >= max_files:
+                logger.info(f"[CodeGraph] reached max files ({max_files}), stopping parse")
                 break
             try:
                 self._parse_file(fpath, ts_lang)

@@ -16,7 +16,6 @@ from datetime import datetime
 from pathlib import Path
 
 from patchflow.core.language_strategy import LanguageFactory
-from patchflow.core.language_registry import LanguageRegistry
 from patchflow.utils import logger
 
 IGNORE_DIRS = {

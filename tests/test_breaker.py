@@ -1,5 +1,4 @@
 """Tests for FixLoopBreaker circuit breaker logic."""
-import pytest
 from patchflow.core.fix.breaker import FixLoopBreaker
 
 

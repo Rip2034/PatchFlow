@@ -271,8 +271,6 @@ def calculate_semantic(analysis, code_graph) -> Scope:
         if syms:
             crash_symbol = syms[-1]
 
-    crash_uid = crash_symbol.uid if crash_symbol else ""
-
     def _sym_dict(uid: str) -> dict:
         s = code_graph.get_symbol(uid)
         if not s:

@@ -19,13 +19,13 @@ ReActAgent 强制 LLM 在每个步骤显式输出它的思考过程，
 
 import json
 import re
-import time
 from pathlib import Path
 
 from patchflow.utils import logger
 
 # ReAct 系统提示词 —— 教模型如何以 ReAct 模式工作
-REACT_SYSTEM_PROMPT = """You are PatchFlow ReAct Agent — an AI that reasons step by step and uses tools to accomplish tasks.
+REACT_SYSTEM_PROMPT = """\
+You are PatchFlow ReAct Agent — an AI that reasons step by step and uses tools to accomplish tasks.
 
 IMPORTANT: You MUST follow this exact format for EVERY response:
 
@@ -256,7 +256,7 @@ class ReActAgent:
         """
         from patchflow.core.config import get_normalized_provider
 
-        provider = get_normalized_provider()
+        _provider = get_normalized_provider()  # 验证 provider 可用
 
         # 构建初始对话
         system = REACT_SYSTEM_PROMPT
@@ -352,5 +352,8 @@ class ReActAgent:
         """构建发送给 LLM 的用户消息（包含历史 observation）"""
         if observations:
             obs_text = "\n\n".join(observations[-10:])  # 只保留最近 10 条
-            return f"{messages[0]['content']}\n\n--- Previous observations ---\n{obs_text}\n\nContinue using Thought/Action/Finish format."
+            return (
+                f"{messages[0]['content']}\n\n--- Previous observations ---\n"
+                f"{obs_text}\n\nContinue using Thought/Action/Finish format."
+            )
         return messages[0]["content"]

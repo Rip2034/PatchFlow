@@ -1,6 +1,4 @@
 """Tests for LazyConflictDetector — entity extraction and file conflicts."""
-import pytest
-from pathlib import Path
 from patchflow.core.fix.conflict_detector import LazyConflictDetector
 
 

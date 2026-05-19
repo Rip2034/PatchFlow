@@ -1,7 +1,10 @@
 """Tests for PatchApplicator — incremental snippet-level fix application."""
-import pytest
 from patchflow.core.fix.patch_applicator import (
-    SnippetPatch, LineChange, PatchApplicator, DiffTracker, _compute_line_changes,
+    DiffTracker,
+    LineChange,
+    PatchApplicator,
+    SnippetPatch,
+    _compute_line_changes,
 )
 
 

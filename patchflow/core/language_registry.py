@@ -6,7 +6,6 @@
 新增语言只需在 language_strategy.py 中添加一个 Strategy 子类即可。
 """
 
-import re
 from pathlib import Path
 
 from patchflow.core.language_strategy import LanguageFactory, LanguageStrategy

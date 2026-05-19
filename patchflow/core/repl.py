@@ -345,7 +345,6 @@ class REPL:
                 return None
 
         prompt_str = "\033[36mPatchFlow >>\033[0m "
-        prompt_w = 13
 
         def _width(s: str) -> int:
             return sum(2 if ord(c) > 0x2e80 else 1 for c in s)
@@ -354,11 +353,11 @@ class REPL:
             """ANSI 清行，比空格填充更可靠（不会因换行导致残留）"""
             sys.stdout.write("\033[2K\r")
 
-        NEWLINE_GLYPH = "↵"  # ↵ 表示换行
+        _newline_glyph = "↵"
 
         def _visible(text: str) -> str:
             """将不可见字符渲染为可视符号"""
-            return text.replace("\r", NEWLINE_GLYPH).replace("\n", NEWLINE_GLYPH)
+            return text.replace("\r", _newline_glyph).replace("\n", _newline_glyph)
 
         def _redraw():
             """单次重绘输入行，长文本截断显示尾部，换行符显示为 ↵"""
@@ -367,8 +366,8 @@ class REPL:
             w = _width(text)
             nonlocal last_w
 
-            DISPLAY_MAX = 100
-            if w <= DISPLAY_MAX:
+            _display_max = 100
+            if w <= _display_max:
                 display = text
                 display_cursor = sum(1 for _ in text[:cursor]) if cursor <= len(raw) else len(text)
                 prefix_w = 0
@@ -378,7 +377,7 @@ class REPL:
                 tail_w = 0
                 for c in reversed(text):
                     cw = _width(c)
-                    if tail_w + cw > DISPLAY_MAX:
+                    if tail_w + cw > _display_max:
                         break
                     tail_chars.append(c)
                     tail_w += cw
@@ -894,7 +893,7 @@ class REPL:
 
         if streaming_text.strip():
             safe_text = streaming_text.encode("utf-8", errors="replace").decode("utf-8")
-            md = Markdown(safe_text, code_theme="monokai", code_width=min(_console_width - 8, 76))
+            md = Markdown(safe_text, code_theme="monokai")
             try:
                 console.print(md)
             except UnicodeEncodeError:
@@ -943,25 +942,48 @@ class REPL:
         self.client = None
 
     def _cmd_model(self, arg: str):
-        from patchflow.core.config import list_models, set_active_model
+        from patchflow.core.config import list_models, set_active_model, get_config
 
         models = list_models()
+        cfg = get_config()
+        active_alias = cfg.get("active", "")
 
         if arg:
-            if set_active_model(arg):
-                console.print(f"[green]已切换到模型: {arg}[/green]")
+            # 支持按别名或模型名切换
+            target = arg.strip()
+            matched = None
+            for alias, info in models.items():
+                if alias == target or info.get("model", "") == target:
+                    matched = alias
+                    break
+            if matched and set_active_model(matched):
+                console.print(f"[green]已切换到: {matched} → {models[matched].get('model', '?')}[/green]")
                 self.client = None
             else:
-                console.print(f"[red]未知模型: {arg}[/red]")
+                console.print(f"[red]未找到模型: {target}[/red]")
+                console.print("[dim]可用: " + ", ".join(models.keys()) + "[/dim]")
             return
 
         if not models:
             console.print("[yellow]未配置任何模型[/yellow]")
-            console.print("[dim]使用 patchflow config set api_key <key> 添加[/dim]")
+            console.print("[dim]CLI 添加: patchflow model add <别名> <厂商> <模型名> <api_key>[/dim]")
             return
 
+        # 按 provider 分组展示
+        from collections import defaultdict
+        grouped: dict[str, list[tuple[str, dict]]] = defaultdict(list)
         for alias, info in models.items():
-            console.print(f"  [cyan]{alias}[/cyan] [dim]({info.get('provider', '?')})[/dim]")
+            grouped[info.get("provider", "?")].append((alias, info))
+
+        console.print()
+        for provider, entries in sorted(grouped.items()):
+            console.print(f"  [bold]{provider}[/bold]")
+            for alias, info in entries:
+                model_name = info.get("model", "?")
+                marker = " [green]●[/green]" if alias == active_alias else ""
+                console.print(f"    [cyan]{alias}[/cyan] → {model_name}{marker}")
+        console.print()
+        console.print("[dim]切换: /model <别名或模型名>  添加: patchflow model add --help[/dim]")
 
     def _do_fix(self, task: str):
         """统一任务执行入口 — LLM 规划 + ReAct 执行
@@ -1063,7 +1085,6 @@ class REPL:
         from patchflow.agents.react_agent import ReActAgent
 
         prefix = f"[{step_num}] " if step_num else ""
-        label = f"{prefix}{step.title}"
 
         def on_event(event_type: str, data):
             if event_type == "thought":
@@ -1138,7 +1159,7 @@ class REPL:
 
         console.print()
         if result:
-            console.print(f"[green]✓ 任务完成[/green]")
+            console.print("[green]✓ 任务完成[/green]")
         else:
             console.print("[yellow]⚠ ReAct 未完全解决，尝试多 Agent 协作管道...[/yellow]")
             self._fallback_multi_agent(task)
@@ -1213,12 +1234,12 @@ class REPL:
 
         if has_file:
             size = len(memory_path.read_bytes())
-            limit_kb = self.client.MAX_MEMORY_BYTES // 1024
+            limit_kb = self.client.max_memory_bytes // 1024
             if size > 1024:
                 console.print(f"  文件: [dim].patchflow/memory.json ({size // 1024} KB / {limit_kb} KB)[/dim]")
             else:
                 console.print(f"  文件: [dim].patchflow/memory.json ({size} B / {limit_kb} KB)[/dim]")
-            pct = size / self.client.MAX_MEMORY_BYTES * 100
+            pct = size / self.client.max_memory_bytes * 100
             if pct > 80:
                 console.print(f"  状态: [yellow]已用 {pct:.0f}%，旧消息将被自动压缩为摘要[/yellow]")
             else:

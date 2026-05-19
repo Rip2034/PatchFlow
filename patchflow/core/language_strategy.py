@@ -4,17 +4,19 @@
 新增语言只需添加一个 LanguageStrategy 子类并在 _BUILTINS 中注册即可。
 """
 
+from __future__ import annotations
+
 import ast
 import json
 import platform
 import re
 import shlex
-from abc import ABC, abstractmethod
+from abc import ABC
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from patchflow.core.analysis.error_parser import ParsedError
+    from patchflow.core.fix.validator import ValidationResult
 
 
 # ── helpers ──────────────────────────────────────────────────
@@ -96,7 +98,7 @@ class LanguageStrategy(ABC):
         """解析文件的 import/依赖 语句 → 依赖文件列表"""
         return []
 
-    def validate(self, work_dir: str) -> "ValidationResult":
+    def validate(self, work_dir: str) -> ValidationResult:
         """验证代码是否可用（编译 + 运行）— 子类必须覆写"""
         from patchflow.core.fix.validator import ValidationResult
         return ValidationResult(ok=True, message=f"No validator for {self.name}", language=self.name)
@@ -197,7 +199,7 @@ class PythonStrategy(LanguageStrategy):
                         continue
         return imports
 
-    def validate(self, work_dir: str) -> "ValidationResult":
+    def validate(self, work_dir: str) -> ValidationResult:
         from patchflow.core.analysis.error_parser import parse
         from patchflow.core.fix.validator import ValidationResult
         from patchflow.utils import logger
@@ -350,7 +352,7 @@ class JavaScriptStrategy(LanguageStrategy):
                         pass
         return imports
 
-    def validate(self, work_dir: str) -> "ValidationResult":
+    def validate(self, work_dir: str) -> ValidationResult:
         from patchflow.core.analysis.error_parser import parse
         from patchflow.core.fix.validator import ValidationResult
         from patchflow.utils import logger
@@ -418,7 +420,7 @@ class TypeScriptStrategy(JavaScriptStrategy):
     run_command = "node"
     compile_command = "tsc"
 
-    def validate(self, work_dir: str) -> "ValidationResult":
+    def validate(self, work_dir: str) -> ValidationResult:
         from patchflow.core.analysis.error_parser import parse
         from patchflow.core.fix.validator import ValidationResult
         from patchflow.utils import logger
@@ -434,7 +436,9 @@ class TypeScriptStrategy(JavaScriptStrategy):
             if not result.ok:
                 error_text = result.stderr.strip() or result.stdout.strip() or "Compilation failed"
                 logger.error("编译验证失败")
-                return ValidationResult(ok=False, error=parse(error_text, lang_name="typescript"), language="typescript")
+                return ValidationResult(
+                    ok=False, error=parse(error_text, lang_name="typescript"), language="typescript",
+                )
         if self.run_command:
             js_entry = entry.stem + ".js"
             result = run(f"{self.run_command} {shlex.quote(js_entry)}", cwd=str(wd))
@@ -501,7 +505,7 @@ class JavaStrategy(LanguageStrategy):
                         pass
         return imports
 
-    def validate(self, work_dir: str) -> "ValidationResult":
+    def validate(self, work_dir: str) -> ValidationResult:
         from patchflow.core.analysis.error_parser import parse
         from patchflow.core.fix.validator import ValidationResult
         from patchflow.utils import logger
@@ -619,7 +623,7 @@ class GoStrategy(LanguageStrategy):
                             pass
         return imports
 
-    def validate(self, work_dir: str) -> "ValidationResult":
+    def validate(self, work_dir: str) -> ValidationResult:
         from patchflow.core.analysis.error_parser import parse
         from patchflow.core.fix.validator import ValidationResult
         from patchflow.utils import logger
@@ -703,7 +707,7 @@ class RustStrategy(LanguageStrategy):
                 pass
         return imports
 
-    def validate(self, work_dir: str) -> "ValidationResult":
+    def validate(self, work_dir: str) -> ValidationResult:
         from patchflow.core.analysis.error_parser import parse
         from patchflow.core.fix.validator import ValidationResult
         from patchflow.utils import logger
@@ -772,7 +776,7 @@ class LanguageFactory:
         strategy = factory.detect("/path/to/repo")  # 自动检测
     """
 
-    _instance: "LanguageFactory | None" = None
+    _instance: LanguageFactory | None = None
 
     def __init__(self):
         self._strategies: dict[str, LanguageStrategy] = {}
@@ -786,7 +790,7 @@ class LanguageFactory:
             self._ext_index[ext] = strategy.name
 
     @classmethod
-    def instance(cls) -> "LanguageFactory":
+    def instance(cls) -> LanguageFactory:
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance

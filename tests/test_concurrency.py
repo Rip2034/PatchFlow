@@ -2,9 +2,6 @@
 
 import threading
 import time
-from pathlib import Path
-
-import pytest
 
 from patchflow.core.concurrency import AtomicWrite, FileLockManager, get_file_lock_manager
 

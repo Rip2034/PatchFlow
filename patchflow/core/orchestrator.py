@@ -226,8 +226,8 @@ class Orchestrator:
                 # 构建语义代码图谱（函数/类级别，优先使用）
                 if self.code_graph is None:
                     try:
-                        from patchflow.core.language_registry import LanguageRegistry
                         from patchflow.core.fix.code_graph import CodeGraph
+                        from patchflow.core.language_registry import LanguageRegistry
                         lang = LanguageRegistry().detect(str(self.work_dir))
                         if lang:
                             self.code_graph = CodeGraph(str(self.work_dir), lang)
