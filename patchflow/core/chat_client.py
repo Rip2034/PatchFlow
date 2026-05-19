@@ -255,6 +255,12 @@ IGNORE_DIRS_SKELETON = {
     ".gradle", "gradle", "bower_components",
     "__generated__", "generated", "gen",
     "Pods", "Carthage", ".terraform", ".serverless", "cdk.out",
+    # Windows 云同步/系统目录 — iterdir() 可能卡死
+    "OneDrive", "OneDrive - Personal", "OneDrive - Company",
+    "Google Drive", "Dropbox", "iCloudDrive",
+    "Application Data", "AppData", "Local Settings",
+    "NetHood", "PrintHood", "Recent", "SendTo",
+    "Start Menu", "Templates", "Cookies",
 }
 
 
@@ -267,26 +273,43 @@ def _get_project_skeleton(work_dir: str = ".") -> str:
       - 微服务（多个 service-* 目录）
       - 其他
 
-    Returns:
-        格式化字符串，如：
-        Project Skeleton (depth=2):
-        ├── backend/  (Java/SpringBoot)
-        │   ├── src/main/java/com/game/...
-        │   └── src/main/resources/...
-        ├── frontend/ (Vue.js)
-        │   ├── src/...
-        │   └── package.json
-        └── README.md
+    内置 5 秒超时保护 — 在 C:\\Users 等大目录中避免卡死。
     """
+    import concurrent.futures
+
     root = Path(work_dir).resolve()
     if not root.is_dir():
         return "(project root not found)"
 
+    # 在独立线程中运行扫描，防止 OneDrive/NFS 等导致 iterdir() 卡死
+    result_holder: list[str] = []
+
+    def _do_scan() -> None:
+        try:
+            result_holder.append(_scan_skeleton(root))
+        except Exception:
+            result_holder.append("Project Skeleton:\n  (scan error)")
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(_do_scan)
+        future.result(timeout=5)
+    except concurrent.futures.TimeoutError:
+        executor.shutdown(wait=False)
+        return "Project Skeleton:\n  (scan timed out)"
+    else:
+        executor.shutdown(wait=True)
+
+    return result_holder[0] if result_holder else "Project Skeleton:\n  (empty)"
+
+
+def _scan_skeleton(root: Path) -> str:
+    """实际执行 skeleton 扫描（从 _get_project_skeleton 中分离，方便超时控制）"""
     lines = ["Project Skeleton:"]
     line_count = 0
     max_lines = 30
 
-    def _should_skip(name: str, is_dir: bool) -> bool:
+    def _should_skip(name: str) -> bool:
         if name.startswith("."):
             return True
         if name in IGNORE_DIRS_SKELETON:
@@ -298,18 +321,15 @@ def _get_project_skeleton(work_dir: str = ".") -> str:
     except PermissionError:
         return "(permission denied scanning project root)"
 
-    # 识别项目类型标记
     project_type_hints = []
 
     for e in entries:
-        if e.is_dir() and not _should_skip(e.name, True):
-            # 只看子目录的第一层
+        if e.is_dir() and not _should_skip(e.name):
             try:
                 sub_entries = sorted(e.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
-            except PermissionError:
+            except (PermissionError, OSError):
                 sub_entries = []
 
-            # 识别框架/语言
             tech_hint = _detect_tech(e, sub_entries)
             if tech_hint:
                 project_type_hints.append(f"{e.name} ({tech_hint})")
@@ -319,9 +339,8 @@ def _get_project_skeleton(work_dir: str = ".") -> str:
             if line_count >= max_lines:
                 break
 
-            # 最多再列两层
             for sub in sub_entries:
-                if _should_skip(sub.name, sub.is_dir()):
+                if _should_skip(sub.name):
                     continue
                 if sub.is_dir():
                     lines.append(f"      📁 {sub.name}/")
@@ -337,7 +356,6 @@ def _get_project_skeleton(work_dir: str = ".") -> str:
             if line_count >= max_lines:
                 break
 
-    # 根部 README
     for readme in ("README.md", "README", "README.txt", "README.rst"):
         if (root / readme).exists():
             lines.append(f"  📄 {readme}")
@@ -354,15 +372,24 @@ def _get_project_skeleton(work_dir: str = ".") -> str:
 
 
 def _detect_tech(dir_path: Path, sub_entries: list) -> str:
-    """快速识别目录的技术栈 — 委托给 LanguageFactory"""
-    strategy = LanguageFactory().detect(str(dir_path))
-    if strategy is None:
-        return ""
-    lang_name = strategy.name.capitalize()
-    fw_info = strategy.detect_framework(dir_path, [])
-    if fw_info:
-        return f"{lang_name}/{fw_info['name']}"
-    return lang_name
+    """快速识别目录的技术栈 — 仅用已有的目录列表，不做递归扫描"""
+    factory = LanguageFactory.instance()
+    sub_names = {e.name for e in sub_entries}
+    # 1. 检查项目描述文件
+    for strategy in factory.all_strategies():
+        for pf in strategy.project_files:
+            if pf in sub_names or (dir_path / pf).exists():
+                return strategy.name.capitalize()
+    # 2. 根据子文件扩展名启发式检测
+    ext_counts: dict[str, int] = {}
+    for e in sub_entries:
+        if e.is_file():
+            s = factory.detect_by_extension(e.name)
+            if s:
+                ext_counts[s.name] = ext_counts.get(s.name, 0) + 1
+    if ext_counts:
+        return max(ext_counts, key=ext_counts.get).capitalize()
+    return ""
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1217,6 +1244,7 @@ class ChatClient:
         self._session_boundary_added = False
         self._memory_summary: list[str] = []
         self._thinking_budget = thinking_budget  # 0 = 禁用，>0 = 启用扩展思考
+        self._phase: list[str] = ["idle"]  # 共享状态，供 spinner 显示当前阶段
         if self._memory_enabled:
             self._load_memory()
             self._compress_old_messages()  # 加载后立即压缩，避免旧消息撑爆上下文
@@ -1230,6 +1258,7 @@ class ChatClient:
             _READ_CACHE.clear()
             _RUN_CACHE.clear()
             _RUN_COUNTER.clear()
+            self._phase[0] = "scanning project..."
             t0 = time.time()
             skeleton = _get_project_skeleton(".")
             logger.info(f"[perf] skeleton scan: {time.time() - t0:.2f}s")
@@ -1246,6 +1275,7 @@ class ChatClient:
             else:
                 enhanced_input = f"{skeleton}\n\n{user_input}"
             self.messages.append({"role": "user", "content": enhanced_input})
+            self._phase[0] = "saving memory..."
             t0 = time.time()
             self._save_memory()
             logger.info(f"[perf] save_memory: {time.time() - t0:.2f}s")
@@ -1259,13 +1289,16 @@ class ChatClient:
             except Exception as e:
                 logger.debug(f"后台进程列表获取失败: {e}")
             self.messages.append({"role": "user", "content": bg_info + user_input})
+            self._phase[0] = "saving memory..."
             self._save_memory()
         all_tool_calls: list = []
         session_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "calls": 0}
         _reset_tool_budget()
 
         for _ in range(self._max_rounds):
+            self._phase[0] = "compressing context..."
             recent = compress(self.messages)
+            self._phase[0] = "calling LLM..."
             t0 = time.time()
             input_tokens_est = sum(len(m.get("content", "")) for m in recent if isinstance(m.get("content"), str))
 
@@ -1291,6 +1324,7 @@ class ChatClient:
             if not tcs:
                 self._append_assistant(text, tcs)
                 self._save_memory()
+                self._phase[0] = "idle"
                 yield "usage", dict(session_usage)
                 yield "done", all_tool_calls
                 return
@@ -1326,6 +1360,7 @@ class ChatClient:
             self._append_assistant(text, tcs)
             self._save_memory()
 
+        self._phase[0] = "idle"
         yield "usage", dict(session_usage)
         yield "hint", "round_limit"
         yield "done", all_tool_calls

@@ -640,16 +640,21 @@ class REPL:
             spinner_warning_shown[0] = False
             while not stop[0]:
                 elapsed = time.time() - start
+                phase = self.client._phase[0] if hasattr(self.client, '_phase') else ""
+                if phase and phase not in ("idle", ""):
+                    phase_str = f" [{phase}]"
+                else:
+                    phase_str = ""
                 if elapsed > 60 and not spinner_warning_shown[0]:
                     spinner_warning_shown[0] = True
                 if elapsed > 60:
-                    msg = f"等待中... ({int(elapsed)}s)"
+                    msg = f"等待中... ({int(elapsed)}s){phase_str}"
                     print(f"\r\033[33m{frames[i]}\033[0m \033[33m{msg}\033[0m \033[2m按 Ctrl+C 取消\033[0m", end="", flush=True)
-                elif elapsed > 20:
-                    msg = f"思考中... ({int(elapsed)}s)"
+                elif elapsed > 10:
+                    msg = f"思考中... ({int(elapsed)}s){phase_str}"
                     print(f"\r\033[36m{frames[i]}\033[0m \033[33m{msg}\033[0m", end="", flush=True)
                 else:
-                    print(f"\r\033[36m{frames[i]}\033[0m \033[2m思考中...\033[0m", end="", flush=True)
+                    print(f"\r\033[36m{frames[i]}\033[0m \033[2m思考中...{phase_str}\033[0m", end="", flush=True)
                 i = (i + 1) % len(frames)
                 threading.Event().wait(0.12)
             clear_len = 55 if spinner_warning_shown[0] else 30
@@ -942,7 +947,7 @@ class REPL:
         self.client = None
 
     def _cmd_model(self, arg: str):
-        from patchflow.core.config import list_models, set_active_model, get_config
+        from patchflow.core.config import get_config, list_models, set_active_model
 
         models = list_models()
         cfg = get_config()

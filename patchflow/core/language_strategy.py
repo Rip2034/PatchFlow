@@ -798,15 +798,22 @@ class LanguageFactory:
     def get(self, name: str) -> LanguageStrategy | None:
         return self._strategies.get(name)
 
-    def detect(self, work_dir: str) -> LanguageStrategy | None:
-        """根据项目文件检测语言"""
+    def detect(self, work_dir: str, fast: bool = False) -> LanguageStrategy | None:
+        """根据项目文件检测语言
+
+        Args:
+            work_dir: 项目根目录路径
+            fast: 如果为 True，跳过 rglob 递归扫描（仅检查根目录的项目文件）
+        """
         wd = Path(work_dir)
         # 1. 按项目描述文件检测 (pom.xml → java, package.json → js/ts, etc.)
         for strategy in self._strategies.values():
             for pf in strategy.project_files:
                 if (wd / pf).exists():
                     return strategy
-        # 2. 按源文件扩展名检测（启发式）
+        if fast:
+            return None
+        # 2. 按源文件扩展名检测（启发式，可能很慢）
         ext_counts: dict[str, int] = {}
         for ext, lang_name in self._ext_index.items():
             count = sum(1 for _ in wd.rglob(f"*{ext}"))
