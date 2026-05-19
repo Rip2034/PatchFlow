@@ -35,6 +35,7 @@ def call_llm(
     max_tokens: int = 4096,
     model_alias: str | None = None,
     budget=None,
+    shared_system_prefix: str | None = None,
 ) -> dict | None:
     """调用 LLM API（自动根据 provider 选择底层 SDK）
 
@@ -56,10 +57,15 @@ def call_llm(
                        指定后覆盖 provider/api_key/api_base
                        用于多 Agent 场景：不同角色用不同模型
         budget:        可选的 TokenBudget 实例，用于追踪和限制 token 消耗
+        shared_system_prefix: 共享系统前缀，多个 Agent 共用同一个前缀时，
+                              会被 Anthropic prompt cache 缓存命中
 
     Returns:
         dict: 解析后的 JSON 结果，或 None（所有重试都失败时）
     """
+    # 拼接共享前缀 + 角色指令，使多个 Agent 调用的前缀部分被缓存
+    if shared_system_prefix:
+        system_prompt = shared_system_prefix + "\n\n---\n\n" + system_prompt
     # 如果指定了别名，从别名配置读取 provider/api_key/api_base
     if model_alias:
         from patchflow.core.config import _load_json, _user_config_dir

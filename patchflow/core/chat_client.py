@@ -18,6 +18,7 @@ from patchflow.core.config import get_config, get_normalized_provider
 from patchflow.core.language_strategy import LanguageFactory
 from patchflow.core.project.context_manager import compress
 from patchflow.utils import logger
+from patchflow.utils.diff import diff_text, format_summary
 
 # ═══════════════════════════════════════════════════════════
 # 开发任务意图检测 — 用于智能记忆
@@ -383,6 +384,12 @@ _TOOL_BUDGET = {
 # 跨轮次持久化（仅在新对话开始时清空）
 _READ_CACHE: set[str] = set()
 
+# 运行命令缓存 — 相同命令返回缓存结果，避免 LLM 重复运行
+_RUN_CACHE: dict[str, str] = {}
+
+# 运行命令计数 — 检测重复模式（loop detection）
+_RUN_COUNTER: dict[str, int] = {}
+
 def _reset_tool_budget():
     for v in _TOOL_BUDGET.values():
         v["count"] = 0
@@ -545,8 +552,8 @@ _STRONG_MODEL_PATTERNS = [
     "claude-4", "claude-opus-4", "claude-sonnet-4", "claude-3.5", "claude-3-5",
     # OpenAI
     "gpt-4", "gpt-4o", "gpt-4.1", "gpt-4-", "o1", "o3", "o4",
-    # DeepSeek V3/R1 系列（在 tool calling benchmark 中表现优秀）
-    "deepseek-v3", "deepseek-r1", "deepseek-chat",
+    # DeepSeek V3/R1/V4 系列（在 tool calling benchmark 中表现优秀）
+    "deepseek-v3", "deepseek-v4", "deepseek-r1", "deepseek-chat",
     # Google
     "gemini-2", "gemini-pro-2",
     # 其他经过验证的强模型
@@ -744,6 +751,9 @@ def _execute_tool(name: str, args: dict,
         p = Path(filename)
         p.parent.mkdir(parents=True, exist_ok=True)
 
+        # 记录原始内容用于 diff
+        original = p.read_text(encoding="utf-8") if p.exists() else ""
+
         # AI 标记：如果文件被修改或新建，添加注释头
         strategy = LanguageFactory().detect_by_extension(p.suffix.lower())
         if strategy is not None:
@@ -755,7 +765,20 @@ def _execute_tool(name: str, args: dict,
                 content = ai_marker + content
 
         p.write_text(content, encoding="utf-8")
-        logger.info(f"write_file: {filename} ({len(content)} chars)")
+
+        # 显示 diff
+        if original and original != content:
+            diff = diff_text(original, content, context_lines=2)
+            summary = format_summary(diff)
+            diff_lines = diff.split("\n")
+            if len(diff_lines) > 60:
+                diff = "\n".join(diff_lines[:60]) + f"\n... ({len(diff_lines) - 60} more lines)"
+            logger.info(f"write_file: {filename} ({len(content)} chars, {summary})\n{diff}")
+        elif not original:
+            logger.info(f"write_file: {filename} ({len(content)} chars, new file)")
+        else:
+            logger.info(f"write_file: {filename} ({len(content)} chars, no changes)")
+
         return f"OK: wrote {len(content)} chars to {filename}"
 
     elif name == "delete_file":
@@ -921,6 +944,19 @@ def _execute_tool(name: str, args: dict,
                 f"Use /stop {bg.pid} to stop\n"
             )
 
+        # ── 命令缓存：相同命令返回缓存结果 ──
+        cmd_key = command.strip()
+        if cmd_key in _RUN_CACHE:
+            logger.info(f"run_code (cached): {command[:80]}")
+            return _RUN_CACHE[cmd_key]
+
+        # ── 循环检测：同一命令模式重复 3+ 次 → 警告 LLM ──
+        cmd_pattern = re.sub(r'[\d"]+', '', cmd_key)[:80]
+        count = _RUN_COUNTER.get(cmd_pattern, 0) + 1
+        _RUN_COUNTER[cmd_pattern] = count
+        if count >= 3:
+            logger.warn(f"[LoopDetect] 命令模式已重复 {count} 次: {cmd_pattern}...")
+
         # 普通命令 → 实时执行
         logger.info(f"run_code: {command}")
         captured_output = []
@@ -940,9 +976,11 @@ def _execute_tool(name: str, args: dict,
             truncated = "\n(output truncated, full output too long)"
 
         if result.ok:
-            return f"exit: 0\nstdout:\n{output_text}{truncated}"
+            out = f"exit: 0\nstdout:\n{output_text}{truncated}"
         else:
-            return f"exit: {result.exit_code}\nstdout:\n{output_text[:1500]}{truncated}\nstderr:\n{result.stderr[:1500]}"
+            out = f"exit: {result.exit_code}\nstdout:\n{output_text[:1500]}{truncated}\nstderr:\n{result.stderr[:1500]}"
+        _RUN_CACHE[cmd_key] = out
+        return out
 
     elif name == "list":
         dirpath = args.get("path", ".") or "."
@@ -1190,6 +1228,8 @@ class ChatClient:
         # ── 首次对话：自动注入项目骨架图 + 项目规则 + 重置读缓存 ──
         if not self.messages:
             _READ_CACHE.clear()
+            _RUN_CACHE.clear()
+            _RUN_COUNTER.clear()
             skeleton = _get_project_skeleton(".")
 
             rules_text = ""
@@ -1507,10 +1547,10 @@ class ChatClient:
 
     # ── 跨会话记忆持久化 ──
 
-    _MAX_MEMORY_BYTES = 200_000   # 200 KB，总内存上限
-    _TOOL_COMPRESS_BYTES = 80_000  # 80 KB，超此值先压缩工具结果
-    _HEAVY_COMPRESS_BYTES = 150_000  # 150 KB，超此值压缩旧 assistant 回复
-    _MIN_KEEP_TURNS = 3           # 压缩时最少保留最近 3 个完整对话回合
+    _MAX_MEMORY_BYTES = 80_000    # 80 KB，总内存上限
+    _TOOL_COMPRESS_BYTES = 50_000  # 50 KB，超此值先压缩工具结果
+    _HEAVY_COMPRESS_BYTES = 70_000  # 70 KB，超此值压缩旧 assistant 回复
+    _MIN_KEEP_TURNS = 2           # 压缩时最少保留最近 2 个完整对话回合
     _MAX_L1_SUMMARIES = 20        # L1 摘要超过此数触发 LLM 蒸馏
     _MAX_L2_SUMMARIES = 10        # L2 摘要超过此数触发 LLM 蒸馏 → L3
 
@@ -1779,35 +1819,47 @@ class ChatClient:
     def _compress_old_messages(self):
         """将消息列表中的旧消息压缩为摘要
 
-        策略：从最早的消息开始，一旦 total > MAX_MEMORY_BYTES，
-        就把最早的一整轮对话（从 user 到该轮结束）提取关键信息，
-        追加到 _memory_summary，然后丢弃原始消息。
+        策略：从最早的消息开始，一旦 total > MAX_MEMORY_BYTES 或消息数 > 500，
+        就把最早的一整轮对话提取关键信息，追加到 _memory_summary，然后丢弃原始消息。
 
         始终保留至少 _MIN_KEEP_TURNS 轮完整的原始消息。
+        如果消息数仍超 500，降到 1 轮。
         """
         if not self.messages:
             return
 
+        MAX_MSG_COUNT = 500
+
         test = json.dumps({"messages": self.messages, "summary": self._memory_summary},
                           ensure_ascii=False)
-        if len(test.encode("utf-8")) <= self._MAX_MEMORY_BYTES:
+        size_ok = len(test.encode("utf-8")) <= self._MAX_MEMORY_BYTES
+        count_ok = len(self.messages) <= MAX_MSG_COUNT
+        if size_ok and count_ok:
             return
 
         # 找到所有非摘要 user 消息的索引
         user_indices = [i for i, m in enumerate(self.messages)
                         if m.get("role") == "user" and not m.get("_memory_summary")]
 
-        keep_count = min(self._MIN_KEEP_TURNS, len(user_indices))
+        # 消息数过多 → 只保留 1 轮
+        if len(self.messages) > MAX_MSG_COUNT:
+            keep_turns = 1
+        else:
+            keep_turns = self._MIN_KEEP_TURNS
+
+        keep_count = min(keep_turns, len(user_indices))
         if keep_count <= 0:
             return
         earliest_keep = user_indices[-keep_count]
 
-        # 从最早的消息开始压缩，直到大小达标
+        # 从最早的消息开始压缩，直到大小和数量都达标
         while earliest_keep > 0:
             candidate = self.messages[earliest_keep:]
             test = json.dumps({"messages": candidate, "summary": self._memory_summary},
                               ensure_ascii=False)
-            if len(test.encode("utf-8")) <= self._MAX_MEMORY_BYTES:
+            size_ok = len(test.encode("utf-8")) <= self._MAX_MEMORY_BYTES
+            count_ok = len(candidate) <= MAX_MSG_COUNT
+            if size_ok and count_ok:
                 break
             # 找到最早的一个完整用户回合
             next_boundary = None
@@ -1829,6 +1881,7 @@ class ChatClient:
             self.messages = self.messages[next_boundary:]
             user_indices = [i for i, m in enumerate(self.messages)
                             if m.get("role") == "user" and not m.get("_memory_summary")]
+            keep_count = min(keep_turns, len(user_indices))
             earliest_keep = user_indices[-keep_count] if len(user_indices) >= keep_count else 0
 
             if len(self._memory_summary) > 50:

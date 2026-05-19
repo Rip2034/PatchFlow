@@ -51,6 +51,7 @@ Review this fix. Output ONLY the JSON."""
         user_message=user_message,
         model=model,
         model_alias=model_alias,
+        shared_system_prefix=blackboard.get("shared_system_prefix"),
     )
 
     if result is None:

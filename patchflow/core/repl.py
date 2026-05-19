@@ -203,7 +203,6 @@ class REPL:
         self.client: ChatClient | None = None
         self._history: list[str] = []
         self._hist_idx: int = 0
-        self._last_ctrl_c: float = 0.0
 
     def run(self):
         """启动 REPL 主循环
@@ -318,22 +317,19 @@ class REPL:
                     continue
 
                 if user_input.startswith("/"):
-                    if self._handle_cmd(user_input):
+                    handled, should_exit = self._handle_cmd(user_input)
+                    if should_exit:
                         return
-                    continue
+                    if handled:
+                        continue
+                    # 未知命令 → 可能是粘贴的代码（如 /** 注释），回退为对话输入
 
                 self._chat(user_input)
 
             except KeyboardInterrupt:
                 _CANCELLED.set()
-                now = time.time()
-                if self._last_ctrl_c and now - self._last_ctrl_c < 3:
-                    console.print("\n  [bold yellow]确认退出[/bold yellow]")
-                    self._do_exit()
-                    return
-                self._last_ctrl_c = now
-                console.print("\n  [yellow]已取消[/yellow] [dim](再次 Ctrl+C 退出, /exit 也可退出)[/dim]")
-                continue
+                self._do_exit()
+                return
             except EOFError:
                 self._do_exit()
                 return
@@ -354,29 +350,122 @@ class REPL:
         def _width(s: str) -> int:
             return sum(2 if ord(c) > 0x2e80 else 1 for c in s)
 
+        def _clear_line() -> None:
+            """ANSI 清行，比空格填充更可靠（不会因换行导致残留）"""
+            sys.stdout.write("\033[2K\r")
+
+        NEWLINE_GLYPH = "↵"  # ↵ 表示换行
+
+        def _visible(text: str) -> str:
+            """将不可见字符渲染为可视符号"""
+            return text.replace("\r", NEWLINE_GLYPH).replace("\n", NEWLINE_GLYPH)
+
+        def _redraw():
+            """单次重绘输入行，长文本截断显示尾部，换行符显示为 ↵"""
+            raw = "".join(chars)
+            text = _visible(raw)
+            w = _width(text)
+            nonlocal last_w
+
+            DISPLAY_MAX = 100
+            if w <= DISPLAY_MAX:
+                display = text
+                display_cursor = sum(1 for _ in text[:cursor]) if cursor <= len(raw) else len(text)
+                prefix_w = 0
+                prefix_visible = ""
+            else:
+                tail_chars: list[str] = []
+                tail_w = 0
+                for c in reversed(text):
+                    cw = _width(c)
+                    if tail_w + cw > DISPLAY_MAX:
+                        break
+                    tail_chars.append(c)
+                    tail_w += cw
+                tail_chars.reverse()
+                display = "".join(tail_chars)
+                prefix_visible = f"\033[2m…{len(raw)} chars\033[0m  "
+                prefix_w = len(f"…{len(raw)} chars  ")
+                pre_cursor = len(text) - len(display)
+                visible_cursor = sum(1 for _ in text[:cursor]) if cursor <= len(raw) else len(text)
+                display_cursor = max(0, visible_cursor - pre_cursor)
+
+            _clear_line()
+            sys.stdout.write(prompt_str + prefix_visible + display)
+            after = _width(display[display_cursor:])
+            if after:
+                sys.stdout.write("\b" * after)
+            sys.stdout.flush()
+            last_w = prefix_w + _width(display)
+
         chars: list[str] = []
         cursor = 0
         hist_idx = self._hist_idx
         last_w = 0
         sys.stdout.write(prompt_str)
         sys.stdout.flush()
+
+        def _is_paste_context() -> bool:
+            """\r/\n 后短暂等待，判断是否粘贴流中的换行"""
+            time.sleep(0.03)  # 30ms 足够粘贴缓冲填充
+            try:
+                return msvcrt.kbhit()
+            except Exception:
+                return False
+
+        def _read_paste_batch(first_char: str = "") -> list[str]:
+            """读取粘贴缓冲区的全部字符"""
+            batch = []
+            if first_char:
+                batch.append(first_char)
+            while msvcrt.kbhit():
+                batch.append(msvcrt.getwch())
+            return batch
+
+        def _apply_batch(batch: list[str]) -> None:
+            """将批量字符插入 chars 缓冲区"""
+            nonlocal cursor
+            for c in batch:
+                if c == "\b" or c == "\x7f":
+                    if cursor > 0:
+                        cursor -= 1
+                        chars.pop(cursor)
+                elif c == "\x03":
+                    raise KeyboardInterrupt
+                elif c == "\x1a":
+                    raise EOFError
+                else:
+                    chars.insert(cursor, c)
+                    cursor += 1
+
         while True:
             ch = msvcrt.getwch()
-            if ch == "\r" or ch == "\n":
-                console.print()
-                break
+
+            # ── \r/\n：等 30ms 判断是粘贴流中的换行还是用户按回车 ──
+            if ch in ("\r", "\n"):
+                if _is_paste_context():
+                    chars.insert(cursor, ch)
+                    cursor += 1
+                    _apply_batch(_read_paste_batch())
+                    _redraw()
+                    continue
+                else:
+                    _clear_line()
+                    console.print()
+                    break
+
+            # ── 粘贴检测：普通字符后缓冲还有内容 → 批量读出，一次重绘 ──
+            if ch not in ("\b", "\x7f", "\x03", "\x1a", "\xe0") \
+                    and msvcrt.kbhit():
+                _apply_batch(_read_paste_batch(ch))
+                _redraw()
+                continue
+
             if ch == "\b" or ch == "\x7f":
                 if cursor > 0:
                     cursor -= 1
                     chars.pop(cursor)
-                    text = "".join(chars)
-                    w = _width(text)
-                    sys.stdout.write("\r" + " " * max(prompt_w + w, prompt_w + last_w) + "\r" + prompt_str + text)
-                    last_w = w
-                    after = _width(text[cursor:])
-                    if after:
-                        sys.stdout.write("\b" * after)
-                    sys.stdout.flush()
+                    _redraw()
                 continue
             if ch == "\x03":
                 raise KeyboardInterrupt
@@ -399,11 +488,7 @@ class REPL:
                         hist_idx -= 1
                         chars = list(self._history[hist_idx])
                         cursor = len(chars)
-                        text = "".join(chars)
-                        w = _width(text)
-                        sys.stdout.write("\r" + " " * max(prompt_w + w, prompt_w + last_w) + "\r" + prompt_str + text)
-                        last_w = w
-                        sys.stdout.flush()
+                        _redraw()
                 elif nxt == "P":
                     if hist_idx < len(self._history) - 1:
                         hist_idx += 1
@@ -412,22 +497,11 @@ class REPL:
                         hist_idx = len(self._history)
                         chars = []
                     cursor = len(chars)
-                    text = "".join(chars)
-                    w = _width(text)
-                    sys.stdout.write("\r" + " " * max(prompt_w + w, prompt_w + last_w) + "\r" + prompt_str + text)
-                    last_w = w
-                    sys.stdout.flush()
+                    _redraw()
                 continue
             chars.insert(cursor, ch)
             cursor += 1
-            text = "".join(chars)
-            w = _width(text)
-            sys.stdout.write("\r" + " " * max(prompt_w + w, prompt_w + last_w) + "\r" + prompt_str + text)
-            last_w = w
-            after = _width(text[cursor:])
-            if after:
-                sys.stdout.write("\b" * after)
-            sys.stdout.flush()
+            _redraw()
 
         self._hist_idx = hist_idx
         result = "".join(chars)
@@ -461,13 +535,14 @@ class REPL:
             console.print("[red]  ✓ 已加入黑名单[/red]")
         return result
 
-    def _handle_cmd(self, raw: str) -> bool:
+    def _handle_cmd(self, raw: str) -> tuple[bool, bool]:
+        """返回 (handled, should_exit) — handled=False 时回退为对话输入"""
         raw = raw.strip()
         cmd = raw.split()[0].lower()
         arg = raw[len(cmd):].strip()
 
         if cmd == "/exit" or cmd == "/quit":
-            return True
+            return True, True
         elif cmd == "/help":
             for line in HELP_TEXT.strip().split("\n"):
                 console.print(Text.from_markup(line))
@@ -502,9 +577,9 @@ class REPL:
         elif cmd == "/ps":
             self._cmd_ps()
         else:
-            console.print(f"[red]未知命令: {cmd}[/red] [dim]输入 /help 查看帮助[/dim]")
+            return False, False  # 非已知命令 → 回退为对话输入
 
-        return False
+        return True, False
 
     def _chat(self, user_input: str):
         """处理用户输入，启动流式对话
@@ -819,7 +894,7 @@ class REPL:
 
         if streaming_text.strip():
             safe_text = streaming_text.encode("utf-8", errors="replace").decode("utf-8")
-            md = Markdown(safe_text, code_theme="monokai")
+            md = Markdown(safe_text, code_theme="monokai", code_width=min(_console_width - 8, 76))
             try:
                 console.print(md)
             except UnicodeEncodeError:

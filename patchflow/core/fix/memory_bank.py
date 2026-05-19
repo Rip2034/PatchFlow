@@ -76,8 +76,10 @@ class FixMemoryBank:
                 m_parts = set(m.error_signature.split(":")[-1].split("_"))
                 overlap = len(sig_parts & m_parts)
                 score += overlap * 3
-                if m.success and score > 0:
-                    score += 1
+                if m.success:
+                    score += 8  # 成功的模式大幅加分
+                else:
+                    score -= 5  # 失败的模式降权
                 if score > 0:
                     scored.append((score, m.timestamp, m))
             scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
@@ -94,9 +96,24 @@ class FixMemoryBank:
             failures = [m for m in self._entries
                          if m.error_signature == sig and not m.success
                          and (not strategy_name or m.strategy_used == strategy_name)]
-            if len(failures) >= 3:
+            if len(failures) >= 2:
                 return True, f"跨会话已有 {len(failures)} 次失败: {sig} (strategy={strategy_name})"
             return False, ""
+
+    def get_avoid_patterns(self, error_type: str, root_cause: str) -> list[str]:
+        """返回应避免的修复模式（从历史失败中提取）"""
+        with self._lock:
+            sig = self.generate_signature(error_type, root_cause)
+            sig_parts = set(sig.split(":")[-1].split("_"))
+            avoid = []
+            for m in self._entries:
+                if m.success:
+                    continue
+                m_parts = set(m.error_signature.split(":")[-1].split("_"))
+                overlap = len(sig_parts & m_parts)
+                if m.error_type == error_type or overlap >= 2:
+                    avoid.append(m.fix_pattern[:100])
+            return avoid[:3]
 
     def load(self) -> None:
         with self._lock:

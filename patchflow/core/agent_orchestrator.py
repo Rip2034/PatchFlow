@@ -40,6 +40,70 @@ from patchflow.utils.agent_display import AgentPipelineDisplay, _get_model_displ
 from patchflow.utils.diff import diff_text, format_summary
 
 
+def _patches_are_similar(patches_a: list[dict], patches_b: list[dict]) -> bool:
+    """检测两组补丁是否实质相同（无效重做检测）"""
+    if not patches_a or not patches_b:
+        return False
+    files_a = {p.get("file", "") for p in patches_a}
+    files_b = {p.get("file", "") for p in patches_b}
+    if files_a != files_b:
+        return False
+    # 比较补丁内容的相似度
+    for pa, pb in zip(sorted(patches_a, key=lambda p: p.get("file", "")),
+                       sorted(patches_b, key=lambda p: p.get("file", ""))):
+        old_a = (pa.get("old", "") or "").strip()
+        old_b = (pb.get("old", "") or "").strip()
+        new_a = (pa.get("new", "") or "").strip()
+        new_b = (pb.get("new", "") or "").strip()
+        if old_a != old_b or new_a != new_b:
+            # 允许轻微差异（空格/换行）
+            if old_a.replace(" ", "").replace("\n", "") != old_b.replace(" ", "").replace("\n", ""):
+                return False
+            if new_a.replace(" ", "").replace("\n", "") != new_b.replace(" ", "").replace("\n", ""):
+                return False
+    return True
+
+
+def _build_shared_system_prefix(blackboard) -> str:
+    """构建跨 Agent 共享的 system prompt 前缀
+
+    三个 Agent (Analyzer/Fixer/Reviewer) 使用相同的前缀，
+    Anthropic prompt cache 可以跨调用命中，大幅提升缓存命中率。
+    """
+    parts = ["You are PatchFlow, an AI coding assistant. Work in a multi-agent pipeline.\n"]
+
+    task = blackboard.get("task", "")
+    if task:
+        parts.append(f"## Task\n{task[:500]}")
+
+    ctx = blackboard.get("context", {})
+    if isinstance(ctx, dict) and ctx:
+        parts.append("## Project Context")
+        for k, v in ctx.items():
+            if isinstance(v, dict):
+                for vk, vv in v.items():
+                    if isinstance(vv, (str, int, float)):
+                        parts.append(f"- {k}.{vk}: {vv}")
+            elif isinstance(v, list):
+                parts.append(f"- {k}: {', '.join(str(x) for x in v[:10])}")
+            elif isinstance(v, str):
+                parts.append(f"- {k}: {v[:200]}")
+
+    code = blackboard.get("code", {})
+    if isinstance(code, dict) and code:
+        parts.append("\n## Code Files")
+        for fpath, content in code.items():
+            truncated = content[:1500] if isinstance(content, str) else str(content)[:1500]
+            parts.append(f"### {fpath}\n```\n{truncated}\n```")
+
+    err = blackboard.get("error", "")
+    if err:
+        parts.append(f"\n## Error Output\n```\n{err[:1000]}\n```")
+
+    parts.append("\n## Rules\n- Output ONLY valid JSON\n- Make minimal changes\n- Keep existing code style")
+    return "\n\n".join(parts)
+
+
 class AgentOrchestrator:
     """多 Agent 调度器"""
 
@@ -177,6 +241,12 @@ class AgentOrchestrator:
 
         logger.info(f"  AgentOrch 任务: {blackboard['task'][:80]}")
 
+        # ── 构建共享 System Prompt 前缀（跨 Agent 缓存复用）──
+        # 三个 Agent 使用同一个前缀，Anthropic prompt cache 可跨调用命中
+        shared_prefix = _build_shared_system_prefix(blackboard)
+        blackboard["shared_system_prefix"] = shared_prefix
+        logger.debug(f"[AgentOrch] 共享 system 前缀: {len(shared_prefix)} chars")
+
         # ── 保存快照 ──
         display.set_detail(0, "Saving snapshot...")
         files_to_snapshot = list(blackboard.get("code", {}).keys())
@@ -218,8 +288,16 @@ class AgentOrchestrator:
                                  model_alias=analyzer_alias)
         self.turn_count += 1
         error_type = analysis.get("error_type", "")
+        root_cause = analysis.get("root_cause", "")
+        confidence = analysis.get("confidence", 0)
+        impact_files = analysis.get("impact_files", [])
         display.set_completed(0, f"Error: {error_type}" if error_type else analysis.get("summary", ""))
-        logger.info(f"  Analyzer: {blackboard.summary()}")
+        logger.info(f"[AgentOrch] === Analyzer 分析结果 ===")
+        logger.info(f"[AgentOrch]   错误类型: {error_type}")
+        logger.info(f"[AgentOrch]   根因: {root_cause[:120]}")
+        logger.info(f"[AgentOrch]   置信度: {confidence:.0%}")
+        logger.info(f"[AgentOrch]   涉及文件: {', '.join(impact_files[:5]) or '(none)'}")
+        logger.info(f"[AgentOrch]   Blackboard: {blackboard.summary()}")
 
         # ── Step 2: 置信度检查 ──
         # 如果 Analyzer 对分析结果没有把握，上报用户不再继续
@@ -246,8 +324,15 @@ class AgentOrchestrator:
                                            model=self.model, model_alias=fixer_alias)
         self.turn_count += 1
         patch_count = len(blackboard["fix_plan"].get("patches", []))
+        patches = blackboard["fix_plan"].get("patches", [])
         display.set_completed(1, f"{patch_count} patches generated" if patch_count else "No patches generated")
-        logger.info(f"  Fixer: {blackboard.summary()}")
+        logger.info(f"[AgentOrch] === Fixer 生成 {patch_count} 个补丁 ===")
+        for i, patch in enumerate(patches):
+            fp = patch.get("file", "?")
+            desc = patch.get("description", "")[:80]
+            logger.info(f"[AgentOrch]   补丁 {i+1}: {fp} — {desc}")
+        if not patches:
+            logger.info(f"[AgentOrch]   Blackboard: {blackboard.summary()}")
 
         # 没有生成任何补丁 → 无法修复
         if not blackboard["fix_plan"].get("patches"):
@@ -288,8 +373,17 @@ class AgentOrchestrator:
                               model_alias=reviewer_alias)
         self.turn_count += 1
         score = review.get("score", 0)
+        issues = review.get("issues", [])
+        feedback = review.get("feedback", "")
         display.set_completed(2, f"Score: {score}/10 (approved)" if review.get("approved") else f"Score: {score}/10 (needs redo)")
-        logger.info(f"  Reviewer: {blackboard.summary()}")
+        logger.info(f"[AgentOrch] === Reviewer 审查结果 ===")
+        logger.info(f"[AgentOrch]   评分: {score}/10 {'(通过)' if review.get('approved') else '(需重做)'}")
+        if issues:
+            for issue in issues[:5]:
+                logger.info(f"[AgentOrch]   问题: {str(issue)[:100]}")
+        if feedback:
+            logger.info(f"[AgentOrch]   反馈: {feedback[:120]}")
+        logger.info(f"[AgentOrch]   Blackboard: {blackboard.summary()}")
 
         # ── Step 5: 审查不通过 → 带 feedback 重做 ──
         # 回滚 → Fixer 重新修复（带上 Reviewer 的反馈意见）→ 重新审查
@@ -301,6 +395,7 @@ class AgentOrchestrator:
             self.snapshot.rollback(snap_id)
 
             # 检查熔断器
+            self.breaker.record_failure(analysis.get("error_type", ""), analysis.get("root_cause", ""))
             should_retry, reason = self.breaker.should_retry(
                 analysis.get("error_type", ""), analysis.get("root_cause", ""), "agent_fix"
             )
@@ -309,6 +404,9 @@ class AgentOrchestrator:
                 self._record_fix_outcome(analysis, patched_files, False, "agent_fix")
                 display.finish(False)
                 return False
+
+            # 记录首次补丁用于相似度比较
+            first_patches = patches
 
             # 带 feedback 重新修复
             blackboard["review_feedback"] = review.get("feedback", "")
@@ -327,7 +425,16 @@ class AgentOrchestrator:
                 return False
 
             patch_count2 = len(blackboard["fix_plan"].get("patches", []))
+            redo_patches = blackboard["fix_plan"].get("patches", [])
             display.set_completed(1, f"{patch_count2} patches (redo)")
+
+            # ── 补丁相似度检测：重做后补丁与首次几乎一样 → 无效重做 ──
+            if _patches_are_similar(first_patches, redo_patches):
+                display.set_failed(1, "二次修复未实质性修改（与首次相同）")
+                display.finish(False)
+                logger.error("[AgentOrch] 二次修复与首次几乎相同，停止无效重做")
+                self._record_fix_outcome(analysis, patched_files, False, "agent_fix")
+                return False
 
             # 重新保存快照对二次修复后的内容
             snap_id = self.snapshot.save(files_to_snapshot)
@@ -351,9 +458,13 @@ class AgentOrchestrator:
             display.set_completed(2, f"Score: {score2}/10 (approved)" if review.get("approved") else f"Score: {score2}/10 (rejected)")
 
             if not review.get("approved", False):
-                display.set_failed(2, f"二次审查未通过 ({review.get('score',0)})")
+                # 评分未改善 → 停止
+                if score2 <= score:
+                    logger.error(f"[AgentOrch] 重做后评分未改善 ({score} → {score2})，停止")
+                else:
+                    logger.error(f"[AgentOrch] 二次审查仍未通过 (score: {score2})")
+                display.set_failed(2, f"二次审查未通过 ({score2}/10)")
                 display.finish(False)
-                logger.error(f"[AgentOrch] 二次审查仍未通过 (score: {review.get('score',0)})")
                 self._record_fix_outcome(analysis, patched_files, False, "agent_fix")
                 self.snapshot.rollback(snap_id)
                 return False
@@ -386,13 +497,20 @@ class AgentOrchestrator:
         if not error_type or not root_cause:
             return ""
         similar = self.memory_bank.query(error_type, root_cause)
-        if not similar:
+        avoid = self.memory_bank.get_avoid_patterns(error_type, root_cause)
+        if not similar and not avoid:
             return ""
         parts = []
-        for m in similar[:3]:
-            status = "ok" if m.success else "failed"
-            parts.append(f"  [{status}] {m.fix_pattern[:80]}")
-        return "Similar past fixes:\n" + "\n".join(parts)
+        if similar:
+            parts.append("Similar past fixes:")
+            for m in similar[:3]:
+                status = "SUCCESS" if m.success else "FAILED"
+                parts.append(f"  [{status}] {m.fix_pattern[:80]}")
+        if avoid:
+            parts.append("\nAVOID these approaches (failed before):")
+            for a in avoid:
+                parts.append(f"  - DO NOT: {a}")
+        return "\n".join(parts)
 
     def _record_fix_outcome(self, analysis: dict, file_paths: list[str],
                             success: bool, strategy: str) -> None:
@@ -411,13 +529,18 @@ class AgentOrchestrator:
         )
 
     def _print_diff_report(self, original_files: dict[str, str]):
-        diff_lines = []
+        if not original_files:
+            return
+        logger.info(f"[AgentOrch] ═══ 变更报告 ({len(original_files)} files) ═══")
         for filepath, original in original_files.items():
             from pathlib import Path
             current = Path(self.work_dir / filepath).read_text(encoding="utf-8") if Path(self.work_dir / filepath).exists() else ""
             diff = diff_text(original, current, context_lines=2)
             if diff.strip():
                 summary = format_summary(diff)
-                diff_lines.append(f"{filepath}: {summary}")
-        if diff_lines:
-            logger.info("  Diff: " + "; ".join(diff_lines))
+                diff_lines = diff.split("\n")
+                if len(diff_lines) > 50:
+                    diff = "\n".join(diff_lines[:50]) + f"\n... ({len(diff_lines) - 50} more lines)"
+                logger.info(f"[AgentOrch] --- {filepath} ({summary}) ---\n{diff}")
+            else:
+                logger.info(f"[AgentOrch] --- {filepath} (no changes) ---")
