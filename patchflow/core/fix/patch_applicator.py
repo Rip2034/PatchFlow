@@ -118,18 +118,23 @@ class PatchApplicator:
               work_dir: str = ".", diff_tracker: DiffTracker | None = None) -> bool:
         if not patches:
             return False
-        from patchflow.core.concurrency import AtomicWrite, get_file_lock_manager
+        from patchflow.core.concurrency import get_file_lock_manager
+        from patchflow.core.fs import relative_path, resolve_write_path, safe_atomic_write
 
         wd = Path(work_dir)
-        target = wd / file_path
-        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            rel = relative_path(wd, file_path)
+            target = resolve_write_path(wd, rel, max(len((p.new or "").encode("utf-8", errors="replace")) for p in patches))
+        except Exception as e:
+            logger.error(f"Patcher rejected unsafe path {file_path}: {e}")
+            return False
 
         flm = get_file_lock_manager()
-        with flm.lock(file_path):
+        with flm.lock(rel):
             existing = ""
             if target.exists():
                 try:
-                    existing = target.read_text(encoding="utf-8")
+                    existing = target.read_text(encoding="utf-8", errors="replace")
                 except UnicodeDecodeError:
                     pass
 
@@ -141,7 +146,7 @@ class PatchApplicator:
                 if not existing:
                     if diff_tracker:
                         diff_tracker.record(file_path, "", patch.new)
-                    AtomicWrite.write(str(target), patch.new)
+                    safe_atomic_write(wd, rel, patch.new)
                     logger.info(f"Patcher 新建: {file_path}")
                     return True
 
@@ -150,7 +155,7 @@ class PatchApplicator:
                     replaced = existing.replace(patch.old, patch.new, 1)
                     if diff_tracker:
                         diff_tracker.record(file_path, existing, replaced)
-                    AtomicWrite.write(str(target), replaced)
+                    safe_atomic_write(wd, rel, replaced)
                     logger.info(f"Patcher 精确替换: {file_path}")
                     return True
 
@@ -159,7 +164,7 @@ class PatchApplicator:
                 if len_ratio > 0.6:
                     if diff_tracker:
                         diff_tracker.record(file_path, existing, patch.new)
-                    AtomicWrite.write(str(target), patch.new)
+                    safe_atomic_write(wd, rel, patch.new)
                     logger.info(f"Patcher 全文覆盖: {file_path}")
                     return True
 
@@ -171,7 +176,7 @@ class PatchApplicator:
                         replaced = _replace_in_original(existing, old_stripped, patch.new.strip())
                         if diff_tracker:
                             diff_tracker.record(file_path, existing, replaced)
-                        AtomicWrite.write(str(target), replaced)
+                        safe_atomic_write(wd, rel, replaced)
                         logger.info(f"Patcher 宽松替换: {file_path}")
                         return True
 
@@ -188,7 +193,7 @@ class PatchApplicator:
                 return False
             if diff_tracker:
                 diff_tracker.record(file_path, existing, last.new)
-            AtomicWrite.write(str(target), last.new)
+            safe_atomic_write(wd, rel, last.new)
             logger.warn(f"Patcher 兜底覆盖: {file_path} ({len(last.new)}B)")
             return True
 

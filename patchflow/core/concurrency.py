@@ -106,6 +106,9 @@ class AtomicWrite:
         target = Path(file_path)
         target.parent.mkdir(parents=True, exist_ok=True)
 
+        # 统一换行符为 LF，避免 Windows CRLF 触发 linter 报错
+        content = content.replace("\r\n", "\n").replace("\r", "\n")
+
         fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.")
         try:
             os.write(fd, content.encode(encoding))

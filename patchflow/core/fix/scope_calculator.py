@@ -131,7 +131,7 @@ class DepGraph:
 
         for filepath in self.graph:
             try:
-                content = (self.work_dir / filepath).read_text(encoding="utf-8")
+                content = (self.work_dir / filepath).read_text(encoding="utf-8", errors="replace")
                 for pat in patterns:
                     if pat in content:
                         return filepath

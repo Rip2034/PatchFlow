@@ -121,7 +121,7 @@ def _detect_indent(work_dir: Path, exts: set[str]) -> int:
         if any(part.startswith(".") for part in f.parts):
             continue
         try:
-            for line in f.read_text(encoding="utf-8").split("\n"):
+            for line in f.read_text(encoding="utf-8", errors="replace").split("\n"):
                 stripped = line.rstrip()
                 if not stripped:
                     continue
@@ -310,7 +310,7 @@ class ContextCollector:
         if not self.cache_path.exists():
             return None
         try:
-            return json.loads(self.cache_path.read_text(encoding="utf-8"))
+            return json.loads(self.cache_path.read_text(encoding="utf-8", errors="replace"))
         except (json.JSONDecodeError, OSError):
             return None
 

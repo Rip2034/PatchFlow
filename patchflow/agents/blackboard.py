@@ -296,7 +296,7 @@ class Blackboard:
             file_parts = [f"# === {file_rel} ({len(sym_list)} symbols) ==="]
 
             try:
-                source = (wd / file_rel).read_text(encoding="utf-8")
+                source = (wd / file_rel).read_text(encoding="utf-8", errors="replace")
                 source_lines = source.split("\n")
             except Exception:
                 source_lines = []

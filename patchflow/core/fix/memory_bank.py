@@ -120,7 +120,7 @@ class FixMemoryBank:
             if not self.storage_path.exists():
                 return
             try:
-                data = json.loads(self.storage_path.read_text(encoding="utf-8"))
+                data = json.loads(self.storage_path.read_text(encoding="utf-8", errors="replace"))
                 self._entries = []
                 for item in data:
                     self._entries.append(FixMemory(

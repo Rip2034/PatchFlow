@@ -314,7 +314,7 @@ def config_set(key: str, value: str):
     """
     from patchflow.core.config import set_user_config
 
-    valid_top = ("api_key", "model", "max_retries", "provider", "api_base", "token_budget")
+    valid_top = ("api_key", "model", "max_retries", "provider", "api_base", "token_budget", "image_model")
     valid_agents = ("agents.analyzer", "agents.fixer", "agents.reviewer")
     if key not in valid_top and key not in valid_agents:
         logger.error(f"未知配置项: {key}")
@@ -659,7 +659,7 @@ def status(work_dir: str):
     context_file = patchflow_dir / "context.json"
     if context_file.exists():
         import json
-        data = json.loads(context_file.read_text(encoding="utf-8"))
+        data = json.loads(context_file.read_text(encoding="utf-8", errors="replace"))
         cached_at = data.get("_cached_at", "unknown")
         lines.append(f"[green]Context:[/green] cached at {cached_at}")
     else:

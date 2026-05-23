@@ -36,7 +36,9 @@ def call_llm(
     model_alias: str | None = None,
     budget=None,
     shared_system_prefix: str | None = None,
-) -> dict | None:
+    images: list | None = None,
+    raw: bool = False,
+) -> dict | str | None:
     """调用 LLM API（自动根据 provider 选择底层 SDK）
 
     这是 Generator / Fixer / Planner 等模块的统一 LLM 入口。
@@ -59,9 +61,11 @@ def call_llm(
         budget:        可选的 TokenBudget 实例，用于追踪和限制 token 消耗
         shared_system_prefix: 共享系统前缀，多个 Agent 共用同一个前缀时，
                               会被 Anthropic prompt cache 缓存命中
+        images:        可选的 ImageContent 列表，用于多模态输入（截图、设计稿等）
+        raw:            True 时跳过 JSON 解析，直接返回原始文本（ReActAgent 使用）
 
     Returns:
-        dict: 解析后的 JSON 结果，或 None（所有重试都失败时）
+        dict: 解析后的 JSON 结果，raw=True 时返回 str，或 None（所有重试都失败时）
     """
     # 拼接共享前缀 + 角色指令，使多个 Agent 调用的前缀部分被缓存
     if shared_system_prefix:
@@ -123,10 +127,10 @@ def call_llm(
         try:
             if provider in ("deepseek", "openai"):
                 result = _call_openai_compat(
-                    system_prompt, user_message, model, max_tokens, api_key, api_base, provider
+                    system_prompt, user_message, model, max_tokens, api_key, api_base, provider, images, raw=raw
                 )
             else:
-                result = _call_anthropic(system_prompt, user_message, model, max_tokens, api_key, api_base)
+                result = _call_anthropic(system_prompt, user_message, model, max_tokens, api_key, api_base, images, raw=raw)
 
             if result is not None:
                 if budget is not None:
@@ -159,7 +163,7 @@ def call_llm(
     return None
 
 
-def _call_anthropic(system_prompt, user_message, model, max_tokens, api_key, api_base="") -> dict | None:
+def _call_anthropic(system_prompt, user_message, model, max_tokens, api_key, api_base="", images=None, raw=False) -> dict | str | None:
     """通过 Anthropic 原生 SDK 调用"""
     base_url = api_base or None
     if base_url:
@@ -170,6 +174,13 @@ def _call_anthropic(system_prompt, user_message, model, max_tokens, api_key, api
             base_url = base_url[:-len("/v1")]
     client = Anthropic(api_key=api_key, base_url=base_url)
 
+    # 多模态：有图片时构建 content block 数组
+    if images:
+        from patchflow.core.multimodal import _build_user_content
+        content = _build_user_content(user_message, images, "anthropic")
+    else:
+        content = user_message
+
     try:
         logger.llm(f"[anthropic] 调用 {model}...")
 
@@ -177,10 +188,12 @@ def _call_anthropic(system_prompt, user_message, model, max_tokens, api_key, api
             model=model,
             max_tokens=max_tokens,
             system=system_prompt,
-            messages=[{"role": "user", "content": user_message}],
+            messages=[{"role": "user", "content": content}],
         )
 
         text = response.content[0].text
+        if raw:
+            return text
         return _parse_json(text)
 
     except Exception as e:
@@ -188,7 +201,7 @@ def _call_anthropic(system_prompt, user_message, model, max_tokens, api_key, api
         return None
 
 
-def _call_openai_compat(system_prompt, user_message, model, max_tokens, api_key, api_base, provider) -> dict | None:
+def _call_openai_compat(system_prompt, user_message, model, max_tokens, api_key, api_base, provider, images=None, raw=False) -> dict | str | None:
     """通过 OpenAI 兼容 SDK 调用（DeepSeek、OpenAI、vllm 等都用这个）"""
 
     # DeepSeek 的 key 命名格式
@@ -196,11 +209,18 @@ def _call_openai_compat(system_prompt, user_message, model, max_tokens, api_key,
         api_base = "https://api.deepseek.com" if provider == "deepseek" else "https://api.openai.com/v1"
 
     from httpx import Timeout
-    client = OpenAI(api_key=api_key, base_url=api_base, timeout=Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0))
+    client = OpenAI(api_key=api_key, base_url=api_base, timeout=Timeout(connect=15.0, read=180.0, write=60.0, pool=10.0))
+
+    # 多模态：有图片时构建 content block 数组
+    if images:
+        from patchflow.core.multimodal import _build_user_content
+        user_content = _build_user_content(user_message, images, provider)
+    else:
+        user_content = user_message
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message},
+        {"role": "user", "content": user_content},
     ]
 
     try:
@@ -235,6 +255,8 @@ def _call_openai_compat(system_prompt, user_message, model, max_tokens, api_key,
         logger.llm(f"[{provider}] 响应完成 ({elapsed:.1f}s)")
 
         text = response.choices[0].message.content
+        if raw:
+            return text
         return _parse_json(text)
 
     except Exception as e:

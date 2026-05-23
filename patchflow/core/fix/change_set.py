@@ -9,6 +9,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+from patchflow.core.fs import relative_path, safe_atomic_write
 from patchflow.core.fix.snapshot_manager import SnapshotManager
 from patchflow.utils import logger
 
@@ -47,11 +48,12 @@ class ChangeSet:
         self._current_snapshot_id: str | None = None
 
     def add(self, file: str, new_content: str, reason: str = "") -> FileChange:
+        file = relative_path(self.work_dir, file)
         full_path = self.work_dir / file
         old_content = ""
         if full_path.exists():
             try:
-                old_content = full_path.read_text(encoding="utf-8")
+                old_content = full_path.read_text(encoding="utf-8", errors="replace")
             except (UnicodeDecodeError, OSError):
                 pass
         change = FileChange(file=file, old_content=old_content, new_content=new_content, reason=reason)
@@ -107,18 +109,16 @@ class ChangeSet:
         self.changes.clear()
 
     def apply_all(self) -> int:
-        from patchflow.core.concurrency import AtomicWrite, get_file_lock_manager
+        from patchflow.core.concurrency import get_file_lock_manager
 
         flm = get_file_lock_manager()
         applied = 0
         for change in self.changes:
-            target = self.work_dir / change.file
             with flm.lock(change.file):
                 try:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    AtomicWrite.write(str(target), change.new_content)
+                    safe_atomic_write(self.work_dir, change.file, change.new_content)
                     applied += 1
-                except OSError as e:
+                except Exception as e:
                     logger.error(f"ChangeSet 写入失败 {change.file}: {e}")
         logger.info(f"ChangeSet 应用: {applied}/{len(self.changes)} 文件")
         return applied
@@ -143,7 +143,7 @@ class ChangeSet:
         if not target.exists():
             return ""
         try:
-            return target.read_text(encoding="utf-8")
+            return target.read_text(encoding="utf-8", errors="replace")
         except (UnicodeDecodeError, OSError):
             return ""
 

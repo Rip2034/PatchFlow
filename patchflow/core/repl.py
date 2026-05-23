@@ -296,6 +296,7 @@ class REPL:
             "  Run [bold]/init[/bold] to create instructions for PatchFlow in your project\n"
             "  Run [bold]/ps[/bold] to see running servers, [bold]/stop <pid>[/bold] to stop them\n"
             "  Run [bold]/memory[/bold] to check memory status\n"
+            "  Screenshots in clipboard are auto-attached to your message\n"
             f"  [dim]{'-' * (inner_w - 4)}[/dim]\n"
             "  [bold]What's new[/bold]\n"
             "  Check the changelog for updates\n"
@@ -314,7 +315,12 @@ class REPL:
 
                 user_input = user_input.strip()
                 if not user_input:
-                    continue
+                    try:
+                        from patchflow.core.multimodal import _has_clipboard_image
+                        if not _has_clipboard_image():
+                            continue
+                    except ImportError:
+                        continue
 
                 if user_input.startswith("/"):
                     handled, should_exit = self._handle_cmd(user_input)
@@ -360,34 +366,55 @@ class REPL:
             return text.replace("\r", _newline_glyph).replace("\n", _newline_glyph)
 
         def _redraw():
-            """单次重绘输入行，长文本截断显示尾部，换行符显示为 ↵"""
+            """单次重绘输入行，长文本在光标附近截断显示，换行符显示为 ↵"""
             raw = "".join(chars)
             text = _visible(raw)
             w = _width(text)
             nonlocal last_w
 
-            _display_max = 100
+            # 可用显示宽度 = 终端宽度 - 提示符宽度 - 2 个留白字符
+            prompt_w = _width(prompt_str)
+            _display_max = max(40, _term_w - prompt_w - 2)
+
             if w <= _display_max:
                 display = text
                 display_cursor = sum(1 for _ in text[:cursor]) if cursor <= len(raw) else len(text)
-                prefix_w = 0
                 prefix_visible = ""
             else:
-                tail_chars: list[str] = []
-                tail_w = 0
-                for c in reversed(text):
+                # 光标位置（字符数，非显示宽度）
+                cursor_chars = sum(1 for _ in text[:cursor]) if cursor <= len(raw) else len(text)
+                # 以光标为中心，尽量显示周围内容
+                cursor_display_w = sum(_width(c) for c in text[:cursor_chars])
+
+                # 从光标向前扫描，取一半显示宽度的内容
+                half_w = _display_max // 2
+                pre_w = 0
+                pre_chars = 0
+                for c in reversed(text[:cursor_chars]):
                     cw = _width(c)
-                    if tail_w + cw > _display_max:
+                    if pre_w + cw > half_w:
                         break
-                    tail_chars.append(c)
-                    tail_w += cw
-                tail_chars.reverse()
-                display = "".join(tail_chars)
-                prefix_visible = f"\033[2m…{len(raw)} chars\033[0m  "
-                prefix_w = len(f"…{len(raw)} chars  ")
-                pre_cursor = len(text) - len(display)
-                visible_cursor = sum(1 for _ in text[:cursor]) if cursor <= len(raw) else len(text)
-                display_cursor = max(0, visible_cursor - pre_cursor)
+                    pre_w += cw
+                    pre_chars += 1
+
+                start_idx = cursor_chars - pre_chars
+                # 从 start_idx 向后取 _display_max 宽度
+                post_w = 0
+                post_chars = 0
+                for c in text[start_idx:]:
+                    cw = _width(c)
+                    if post_w + cw > _display_max:
+                        break
+                    post_w += cw
+                    post_chars += 1
+
+                display = text[start_idx:start_idx + post_chars]
+                display_cursor = pre_chars  # 在 display 中的字符位置
+
+                if start_idx == 0:
+                    prefix_visible = ""
+                else:
+                    prefix_visible = "\033[2m←\033[0m"
 
             _clear_line()
             sys.stdout.write(prompt_str + prefix_visible + display)
@@ -395,7 +422,8 @@ class REPL:
             if after:
                 sys.stdout.write("\b" * after)
             sys.stdout.flush()
-            last_w = prefix_w + _width(display)
+            last_w = (len(prefix_visible.replace("\033[2m", "").replace("\033[0m", ""))
+                      + _width(display))
 
         chars: list[str] = []
         cursor = 0
@@ -450,7 +478,25 @@ class REPL:
                     continue
                 else:
                     _clear_line()
-                    console.print()
+                    result = "".join(chars).replace("\r\n", "\n").replace("\r", "\n")
+                    lines = result.split("\n")
+                    while lines and not lines[-1].strip():
+                        lines.pop()
+                    if not lines:
+                        break
+                    console.print()  # 空行分隔
+                    for line in lines:
+                        if line.strip():
+                            console.print(Text.assemble(
+                                ("  ", ""),
+                                ("> ", "bold cyan"),
+                                (line, ""),
+                            ))
+                        else:
+                            console.print(Text.assemble(
+                                ("  ", ""),
+                                (">", "cyan"),
+                            ))
                     break
 
             # ── 粘贴检测：普通字符后缓冲还有内容 → 批量读出，一次重绘 ──
@@ -475,13 +521,11 @@ class REPL:
                 if nxt == "K":
                     if cursor > 0:
                         cursor -= 1
-                        sys.stdout.write("\b")
-                        sys.stdout.flush()
+                        _redraw()
                 elif nxt == "M":
                     if cursor < len(chars):
-                        sys.stdout.write(chars[cursor])
                         cursor += 1
-                        sys.stdout.flush()
+                        _redraw()
                 elif nxt == "H":
                     if self._history and hist_idx > 0:
                         hist_idx -= 1
@@ -649,16 +693,15 @@ class REPL:
                     spinner_warning_shown[0] = True
                 if elapsed > 60:
                     msg = f"等待中... ({int(elapsed)}s){phase_str}"
-                    print(f"\r\033[33m{frames[i]}\033[0m \033[33m{msg}\033[0m \033[2m按 Ctrl+C 取消\033[0m", end="", flush=True)
+                    print(f"\033[2K\r\033[33m{frames[i]}\033[0m \033[33m{msg}\033[0m \033[2m按 Ctrl+C 取消\033[0m", end="", flush=True)
                 elif elapsed > 10:
                     msg = f"思考中... ({int(elapsed)}s){phase_str}"
-                    print(f"\r\033[36m{frames[i]}\033[0m \033[33m{msg}\033[0m", end="", flush=True)
+                    print(f"\033[2K\r\033[36m{frames[i]}\033[0m \033[33m{msg}\033[0m", end="", flush=True)
                 else:
-                    print(f"\r\033[36m{frames[i]}\033[0m \033[2m思考中...{phase_str}\033[0m", end="", flush=True)
+                    print(f"\033[2K\r\033[36m{frames[i]}\033[0m \033[2m思考中...{phase_str}\033[0m", end="", flush=True)
                 i = (i + 1) % len(frames)
                 threading.Event().wait(0.12)
-            clear_len = 55 if spinner_warning_shown[0] else 30
-            print("\r" + " " * clear_len + "\r", end="", flush=True)
+            print("\033[2K\r", end="", flush=True)
 
         spinner_thread = threading.Thread(target=_start_spinner, args=(stop_spinner,), daemon=True)
         spinner_thread.start()
@@ -710,6 +753,11 @@ class REPL:
                         elif name == "review_code":
                             fn = args.get("filepath", "?")
                             console.print(f"  [yellow]review[/yellow] [dim]{fn}[/dim]")
+                        elif name == "generate_image":
+                            p = args.get("prompt", "")
+                            fn = args.get("filename", "")
+                            preview = p[:60] + "..." if len(p) > 60 else p
+                            console.print(f"  [magenta]generate_image[/magenta] [dim]{preview} -> {fn}[/dim]")
 
                     elif evt == "tool_result":
                         name = data["name"]
@@ -804,6 +852,22 @@ class REPL:
                             else:
                                 first = result.split("\n")[0]
                                 console.print(f"    [yellow]{first}[/yellow]")
+                        elif name == "generate_image":
+                            if result.startswith("OK:"):
+                                lines = result.split("\n")
+                                saved_path = ""
+                                file_size = ""
+                                for line in lines:
+                                    if line.startswith("Saved to:"):
+                                        saved_path = line.replace("Saved to:", "").strip()
+                                    elif line.startswith("Size:"):
+                                        file_size = line.replace("Size:", "").strip()
+                                console.print(f"    [green]✔ image saved[/green] [dim]{saved_path} ({file_size})[/dim]")
+                            elif result.startswith("ERROR"):
+                                first_line = result.split("\n")[0]
+                                console.print(f"    [red]✘ generate failed[/red] [dim]{first_line[7:]}[/dim]")
+                            else:
+                                console.print(f"    [dim]{result[:120]}[/dim]")
 
                     elif evt == "usage":
                         session_usage = data
@@ -878,21 +942,17 @@ class REPL:
 
         if session_usage["calls"] > 0:
             u = session_usage
-            console.print(f"  [dim]━━━ Token: {u['total_tokens']} total "
-                          f"({u['input_tokens']} in + {u['output_tokens']} out) "
-                          f"· {u['calls']} LLM call{'s' if u['calls'] > 1 else ''}"
-                          f" · /context 查看详情[/dim]")
-
-        if streaming_text.strip():
-            # 在 AI 回复前显示上下文摘要
-            if self.client and len(self.client.messages) > 2:
-                from patchflow.core.project.context_manager import estimate_message_tokens
-                msgs = self.client.messages
-                tok = sum(estimate_message_tokens(m) for m in msgs)
-                console.print(f"  [dim]上下文: {len(msgs)} 条消息, ~{tok} token[/dim]")
+            console.print(f"  [dim]── {u['total_tokens']} tokens · {u['calls']} call{'s' if u['calls'] > 1 else ''}[/dim]")
 
         if run_failures and files_written:
-            task = streaming_text[:200] if streaming_text else "修复运行错误"
+            # 从失败命令的输出中提取错误摘要作为任务描述
+            # 不依赖 LLM 回复文本（LLM 可能在总结而非报错）
+            err_parts: list[str] = []
+            for tc in run_failures[:5]:
+                cmd = tc.get("args", {}).get("command", "")[:60]
+                result = tc.get("result", "")[:200]
+                err_parts.append(f"$ {cmd}\n{result}")
+            task = "Fix the following errors:\n\n" + "\n\n".join(err_parts)
             console.print(f"  [bold yellow]检测到 {len(run_failures)} 个运行失败，启动多 Agent 修复...[/bold yellow]")
             self._auto_fix(run_failures, files_written, task)
 
@@ -921,11 +981,11 @@ class REPL:
             p = Path(fp)
             if p.exists():
                 try:
-                    file_contents[fp] = p.read_text(encoding="utf-8")
+                    file_contents[fp] = p.read_text(encoding="utf-8", errors="replace")
                 except Exception as e:
                     logger.debug(f"读取文件失败 {fp}: {e}")
 
-        console.print(f"  [bold yellow]⚡ 启动多 Agent 修复: {task[:80]}[/bold yellow]")
+        console.print(f"  [bold yellow]启动多 Agent 修复: {task[:80]}[/bold yellow]")
 
         bb = Blackboard(
             task=task,
@@ -1279,7 +1339,7 @@ class REPL:
 
         if rules_file.exists():
             console.print(f"  [yellow]规则文件已存在: {rules_file}[/yellow]")
-            content = rules_file.read_text(encoding="utf-8")
+            content = rules_file.read_text(encoding="utf-8", errors="replace")
             console.print("  [dim]当前内容:[/dim]")
             for line in content.strip().split("\n"):
                 console.print(f"    [dim]{line}[/dim]")
@@ -1291,7 +1351,7 @@ class REPL:
         project_info = []
         if pkg_file.exists():
             try:
-                pkg = json.loads(pkg_file.read_text(encoding="utf-8"))
+                pkg = json.loads(pkg_file.read_text(encoding="utf-8", errors="replace"))
                 name = pkg.get("name", "")
                 desc = pkg.get("description", "")
                 deps = list(pkg.get("dependencies", {}).keys())[:5]

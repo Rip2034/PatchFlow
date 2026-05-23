@@ -46,8 +46,8 @@ def diff_files(old_path: str, new_path: str, context_lines: int = 3) -> str:
     old_p = Path(old_path)
     new_p = Path(new_path)
 
-    old_text = old_p.read_text(encoding="utf-8") if old_p.exists() else ""
-    new_text = new_p.read_text(encoding="utf-8") if new_p.exists() else ""
+    old_text = old_p.read_text(encoding="utf-8", errors="replace") if old_p.exists() else ""
+    new_text = new_p.read_text(encoding="utf-8", errors="replace") if new_p.exists() else ""
 
     return diff_text(old_text, new_text, context_lines)
 

@@ -17,7 +17,6 @@ ReActAgent 强制 LLM 在每个步骤显式输出它的思考过程，
   4. 支持最终回答（Finish action），不需要工具时退出
 """
 
-import json
 import re
 from pathlib import Path
 
@@ -144,13 +143,12 @@ class ReActAgent:
         # 解析参数 — 支持多种格式
         args: dict = {}
         if raw_args:
-            # 先尝试 JSON 格式
+            # 先尝试 JSON 格式（使用安全解析器，带容错回退）
             if raw_args.startswith("{"):
-                try:
-                    args = json.loads(raw_args)
+                from patchflow.core.chat_client import _safe_json_parse
+                args = _safe_json_parse(raw_args)
+                if args:
                     return (tool_name, args, "")
-                except json.JSONDecodeError:
-                    pass
 
             # key=value 格式
             for part in self._split_args(raw_args):
@@ -212,26 +210,35 @@ class ReActAgent:
 
     @staticmethod
     def _extract_content_from_response(text: str) -> str | None:
-        """从 LLM 回复中提取 write_file 的 content（代码块）"""
-        # 找 Markdown 代码块
-        pattern = r'```(?:\w+)?\n(.*?)```'
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            return match.group(1).strip()
+        """从 LLM 回复中提取 write_file 的 content
+
+        优先级：
+          1. Markdown 代码块（```...```）—— 多个块时取最长的
+          2. Action 行之后的非结构化续行内容
+        """
+        # 找 Markdown 代码块——支持多种写法
+        # 多个代码块时取最长的（通常是真正的文件内容）
+        pattern = r'```(?:\w*)?\s*\n(.*?)```'
+        matches = re.findall(pattern, text, re.DOTALL)
+        if matches:
+            return max(matches, key=len).strip()
 
         # 找 Action 行之后的每行缩进内容
         action_match = re.search(r'Action:\s*write_file\[.*?\]', text, re.IGNORECASE)
         if action_match:
             after = text[action_match.end():]
             lines = after.strip().split("\n")
-            # 收集续行（非 Thought/Finish/Observation/Action 开头的行）
-            # 实际上 write_file 的 content 通常在下一行开始
             content_lines = []
             for line in lines:
                 if re.match(r'^(Thought|Finish|Action|Observation)\s*[:[]', line, re.IGNORECASE):
                     break
                 content_lines.append(line)
             if content_lines:
+                # 清理首尾空行
+                while content_lines and not content_lines[0].strip():
+                    content_lines.pop(0)
+                while content_lines and not content_lines[-1].strip():
+                    content_lines.pop()
                 return "\n".join(content_lines).strip()
 
         return None
@@ -271,26 +278,21 @@ class ReActAgent:
             if on_event:
                 on_event("step", {"step": step_count, "max": self.max_steps})
 
-            # 调用 LLM（带扩展思考如果启用）
+            # 调用 LLM（raw=True 跳过 JSON 解析，获取 ReAct 格式的原始文本）
             from patchflow.core.llm_client import call_llm
-            raw_result = call_llm(
+            text = call_llm(
                 system_prompt=system,
                 user_message=self._build_user_message(messages, observations),
                 model=self.model,
                 max_tokens=2048,
+                raw=True,
             )
 
-            if raw_result is None:
+            if text is None:
                 logger.error(f"[ReAct] LLM 调用失败 (step {step_count})")
                 if on_event:
                     on_event("error", "LLM call failed")
                 return ""
-
-            # 从 LLM 响应中提取文本（call_llm 可能返回 dict 或 str）
-            if isinstance(raw_result, dict):
-                text = raw_result.get("content", "") or str(raw_result)
-            else:
-                text = str(raw_result)
 
             # 提取 Thought
             thought = self._extract_thought(text)
@@ -329,9 +331,15 @@ class ReActAgent:
                 result = f"ERROR: tool execution failed: {e}"
                 logger.error(f"[ReAct] 工具执行异常: {tool_name} → {e}")
 
-            # 截断过长的结果
-            if len(result) > 3000:
-                result = result[:1500] + f"\n... [truncated, {len(result)} chars total] ...\n" + result[-500:]
+            # 截断过长的结果（read 结果保留更多，避免读代码时反复读取）
+            max_len = 40000 if tool_name == "read" else 8000
+            if len(result) > max_len:
+                head = int(max_len * 0.75)
+                tail = max_len - head
+                result = result[:head] + (
+                    f"\n\n... [{len(result) - max_len} more chars truncated, "
+                    f"use read with offset/limit to get specific sections] ...\n\n"
+                ) + result[-tail:]
 
             logger.info(f"[ReAct] step {step_count}: {tool_name} → {len(result)} chars")
 

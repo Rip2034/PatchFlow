@@ -101,7 +101,7 @@ class LanguageStrategy(ABC):
     def validate(self, work_dir: str) -> ValidationResult:
         """验证代码是否可用（编译 + 运行）— 子类必须覆写"""
         from patchflow.core.fix.validator import ValidationResult
-        return ValidationResult(ok=True, message=f"No validator for {self.name}", language=self.name)
+        return ValidationResult(status="skipped", message=f"No validator for {self.name}", language=self.name)
 
     def parse_project_meta(self, work_dir: Path) -> dict:
         """从项目配置文件读取元数据（名称、版本、包管理器等）"""
@@ -172,7 +172,7 @@ class PythonStrategy(LanguageStrategy):
 
     def parse_imports(self, filepath: str, work_dir: str) -> list[str]:
         try:
-            tree = ast.parse(Path(filepath).read_text(encoding="utf-8"))
+            tree = ast.parse(Path(filepath).read_text(encoding="utf-8", errors="replace"))
         except (SyntaxError, UnicodeDecodeError, OSError):
             return []
         imports = []
@@ -211,7 +211,7 @@ class PythonStrategy(LanguageStrategy):
             return ValidationResult(ok=False, error=parse("No entry file found (app.py or main.py)"), language="python")
         logger.step(f"验证入口文件: {entry.name}")
         try:
-            source = entry.read_text(encoding="utf-8")
+            source = entry.read_text(encoding="utf-8", errors="replace")
             compile(source, str(entry), "exec")
             logger.info("编译验证通过")
         except SyntaxError as e:
@@ -230,7 +230,7 @@ class PythonStrategy(LanguageStrategy):
         pyproject = work_dir / "pyproject.toml"
         if pyproject.exists():
             meta["package_manager"] = "poetry/pdm"
-            content = pyproject.read_text(encoding="utf-8")
+            content = pyproject.read_text(encoding="utf-8", errors="replace")
             for pat, key in [(r'name\s*=\s*"(.+?)"', "name"), (r'requires-python\s*=\s*"(.+?)"', "python_version")]:
                 m = re.search(pat, content)
                 if m:
@@ -239,7 +239,7 @@ class PythonStrategy(LanguageStrategy):
             setup_py = work_dir / "setup.py"
             if setup_py.exists():
                 meta["package_manager"] = "setuptools"
-                content = setup_py.read_text(encoding="utf-8")
+                content = setup_py.read_text(encoding="utf-8", errors="replace")
                 m = re.search(r'name\s*=\s*["\'](.+?)["\']', content)
                 if m:
                     meta["name"] = m.group(1)
@@ -253,11 +253,11 @@ class PythonStrategy(LanguageStrategy):
         deps = []
         pyproject = work_dir / "pyproject.toml"
         if pyproject.exists():
-            content = pyproject.read_text(encoding="utf-8")
+            content = pyproject.read_text(encoding="utf-8", errors="replace")
             deps.extend(re.findall(r'(?:^|\s)([\w-]+)\s*[>=<]', content))
         req = work_dir / "requirements.txt"
         if req.exists():
-            deps.extend(re.findall(r'^([\w-]+)', req.read_text(encoding="utf-8"), re.MULTILINE))
+            deps.extend(re.findall(r'^([\w-]+)', req.read_text(encoding="utf-8", errors="replace"), re.MULTILINE))
         return sorted(set(deps))
 
     def detect_framework(self, work_dir: Path, deps: list[str]) -> dict | None:
@@ -272,7 +272,7 @@ class PythonStrategy(LanguageStrategy):
         rel_count = abs_count = 0
         for fp in py_files[:50]:
             try:
-                for line in fp.read_text(encoding="utf-8").split("\n")[:10]:
+                for line in fp.read_text(encoding="utf-8", errors="replace").split("\n")[:10]:
                     line = line.strip()
                     if line.startswith("from ."):
                         rel_count += 1
@@ -289,7 +289,7 @@ class PythonStrategy(LanguageStrategy):
         snake = camel = 0
         for fp in py_files[:30]:
             try:
-                for line in fp.read_text(encoding="utf-8").split("\n")[:20]:
+                for line in fp.read_text(encoding="utf-8", errors="replace").split("\n")[:20]:
                     for m in re.finditer(r'\bdef\s+(\w+)', line):
                         name = m.group(1)
                         if "_" in name:
@@ -333,7 +333,7 @@ class JavaScriptStrategy(LanguageStrategy):
 
     def parse_imports(self, filepath: str, work_dir: str) -> list[str]:
         try:
-            content = Path(filepath).read_text(encoding="utf-8")
+            content = Path(filepath).read_text(encoding="utf-8", errors="replace")
         except (UnicodeDecodeError, OSError):
             return []
         imports = []
@@ -359,6 +359,44 @@ class JavaScriptStrategy(LanguageStrategy):
         from patchflow.utils.runner import run
 
         wd = Path(work_dir)
+
+        # 优先使用 npm scripts（适用于 Vite/React/Vue 等前端项目）
+        pkg_json = wd / "package.json"
+        if pkg_json.exists():
+            try:
+                pkg = json.loads(pkg_json.read_text(encoding="utf-8", errors="replace"))
+                scripts = pkg.get("scripts", {})
+                # 收集所有可用的验证脚本
+                candidates = [s for s in ("build", "type-check", "lint", "test") if s in scripts]
+                if candidates:
+                    last_error = None
+                    for script_name in candidates:
+                        logger.step(f"验证: npm run {script_name}")
+                        result = run(f"npm run {script_name}", cwd=str(wd), timeout=120)
+                        if result.ok:
+                            logger.success("运行验证通过")
+                            return ValidationResult(ok=True, language="javascript")
+                        error_text = result.stderr.strip() or result.stdout.strip() or f"exit={result.exit_code}"
+                        logger.warn(f"npm run {script_name} 失败: {error_text[:120]}")
+                        last_error = error_text
+                    # 所有候选脚本都失败了
+                    logger.warn("所有 npm scripts 验证均失败，回退到 node entry")
+                    # fall through to node entry check below
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # 回退 1：语法检查（node --check，快速且不依赖运行时环境）
+        entry = self.find_entry_file(wd)
+        if entry is not None:
+            logger.step(f"语法检查: node --check {entry.name}")
+            result = run(f"node --check {shlex.quote(entry.name)}", cwd=str(wd))
+            if result.ok:
+                logger.success("语法检查通过")
+                return ValidationResult(ok=True, language="javascript")
+            # 语法检查失败，记录但继续尝试其他方式
+            logger.warn(f"语法检查失败: {(result.stderr or result.stdout)[:120]}")
+
+        # 回退 2：node entry.js（仅当语法检查不可用时）
         entry = self.find_entry_file(wd)
         if entry is None:
             return ValidationResult(ok=False, error=parse("No entry file found for JavaScript"), language="javascript")
@@ -377,7 +415,7 @@ class JavaScriptStrategy(LanguageStrategy):
         if pkg.exists():
             meta["package_manager"] = "npm/yarn"
             try:
-                content = json.loads(pkg.read_text(encoding="utf-8"))
+                content = json.loads(pkg.read_text(encoding="utf-8", errors="replace"))
                 meta["name"] = content.get("name", "")
             except (json.JSONDecodeError, OSError):
                 pass
@@ -388,7 +426,7 @@ class JavaScriptStrategy(LanguageStrategy):
         if not pkg.exists():
             return []
         try:
-            data = json.loads(pkg.read_text(encoding="utf-8"))
+            data = json.loads(pkg.read_text(encoding="utf-8", errors="replace"))
             deps = list(data.get("dependencies", {}).keys())
             deps.extend(data.get("devDependencies", {}).keys())
             return sorted(set(deps))
@@ -479,7 +517,7 @@ class JavaStrategy(LanguageStrategy):
 
     def parse_imports(self, filepath: str, work_dir: str) -> list[str]:
         try:
-            content = Path(filepath).read_text(encoding="utf-8")
+            content = Path(filepath).read_text(encoding="utf-8", errors="replace")
         except (UnicodeDecodeError, OSError):
             return []
         imports = []
@@ -569,7 +607,7 @@ class JavaStrategy(LanguageStrategy):
         meta = {"name": "", "python_version": "", "package_manager": ""}
         if (work_dir / "pom.xml").exists():
             meta["package_manager"] = "maven"
-            content = (work_dir / "pom.xml").read_text(encoding="utf-8")
+            content = (work_dir / "pom.xml").read_text(encoding="utf-8", errors="replace")
             m = re.search(r'<name>(.+?)</name>', content)
             if m:
                 meta["name"] = m.group(1)
@@ -605,7 +643,7 @@ class GoStrategy(LanguageStrategy):
 
     def parse_imports(self, filepath: str, work_dir: str) -> list[str]:
         try:
-            content = Path(filepath).read_text(encoding="utf-8")
+            content = Path(filepath).read_text(encoding="utf-8", errors="replace")
         except (UnicodeDecodeError, OSError):
             return []
         imports = []
@@ -644,7 +682,7 @@ class GoStrategy(LanguageStrategy):
         go_mod = work_dir / "go.mod"
         if go_mod.exists():
             meta["package_manager"] = "go modules"
-            first_line = go_mod.read_text(encoding="utf-8").split("\n")[0]
+            first_line = go_mod.read_text(encoding="utf-8", errors="replace").split("\n")[0]
             m = re.match(r'module\s+(\S+)', first_line)
             if m:
                 meta["name"] = m.group(1)
@@ -683,7 +721,7 @@ class RustStrategy(LanguageStrategy):
 
     def parse_imports(self, filepath: str, work_dir: str) -> list[str]:
         try:
-            content = Path(filepath).read_text(encoding="utf-8")
+            content = Path(filepath).read_text(encoding="utf-8", errors="replace")
         except (UnicodeDecodeError, OSError):
             return []
         imports = []
@@ -735,7 +773,7 @@ class RustStrategy(LanguageStrategy):
         cargo = work_dir / "Cargo.toml"
         if cargo.exists():
             meta["package_manager"] = "cargo"
-            content = cargo.read_text(encoding="utf-8")
+            content = cargo.read_text(encoding="utf-8", errors="replace")
             m = re.search(r'name\s*=\s*"(.+?)"', content)
             if m:
                 meta["name"] = m.group(1)
@@ -747,7 +785,7 @@ class RustStrategy(LanguageStrategy):
             return []
         deps = []
         in_deps = False
-        for line in cargo.read_text(encoding="utf-8").split("\n"):
+        for line in cargo.read_text(encoding="utf-8", errors="replace").split("\n"):
             line = line.strip()
             if line.startswith("[dependencies"):
                 in_deps = True

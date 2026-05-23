@@ -16,6 +16,13 @@ from openai import OpenAI
 
 from patchflow.core.config import get_config, get_normalized_provider
 from patchflow.core.language_strategy import LanguageFactory
+from patchflow.core.multimodal import (
+    _build_user_content,
+    _extract_images,
+    _strip_image_blocks_from_history,
+    _strip_images_with_warning,
+    _supports_vision,
+)
 from patchflow.core.project.context_manager import compress
 from patchflow.utils import logger
 from patchflow.utils.diff import diff_text, format_summary
@@ -157,11 +164,42 @@ TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image",
+            "description": "Generate an image using an AI image model and save it to a local file. Use this when the user asks to create, generate, or draw an image. IMPORTANT: Keep the prompt concise (under 120 characters) — long prompts may cause server timeout. Focus on key visual elements only. Supports .png, .jpg, .webp formats.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Image description in English, MAX 45 CHARACTERS. Use keyword-dense comma-separated format. Example: 'anime girl, black hair, big eyes, cherry blossoms'. Longer prompts will be truncated."
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Full path where the image will be saved, e.g. 'C:/Users/name/Desktop/anime.png' or '~/Desktop/artwork.png'. Must end with .png, .jpg, or .webp."
+                    },
+                    "size": {
+                        "type": "string",
+                        "enum": ["1024x1024", "1792x1024", "1024x1792"],
+                        "description": "Image dimensions. Default is '1024x1024'."
+                    },
+                    "quality": {
+                        "type": "string",
+                        "enum": ["medium", "high"],
+                        "description": "Image quality. 'medium' is faster and less likely to time out. 'high' for best detail. Default is 'medium'."
+                    },
+                },
+                "required": ["prompt", "filename"]
+            }
+        }
+    },
 ]
 
 SYSTEM_PROMPT = (
     "You are PatchFlow, an AI coding assistant.\n"
-    "You have tools: write_file, read, delete_file, rename_file, run_code, list, search, review_code.\n\n"
+    "You have tools: write_file, read, delete_file, rename_file, run_code, list, search, review_code, generate_image.\n\n"
     "CRITICAL — READ BEFORE RESPONDING:\n"
     "When a user message contains tool_result blocks, those are the output of "
     "tools you just called. Your reply MUST be based on what those results ACTUALLY show.\n"
@@ -175,9 +213,9 @@ SYSTEM_PROMPT = (
     "    → This tells you exactly what's wrong. Read the relevant file, find 'x', fix it.\n"
     "  NEVER run node -e to check bytes/encoding. NEVER create test files.\n"
     "  NEVER inspect raw bytes. The error message tells you what's wrong.\n\n"
-    "AFTER write_file — ALWAYS read to verify:\n"
-    "  read(files=filename) after write_file to check the file was written correctly.\n"
-    "  If the file content is corrupted (all one line, wrong encoding), fix and re-write.\n\n"
+    "AFTER write_file — verify only if the change is complex:\n"
+    "  For simple fixes (formatting, lint, CRLF, one-line changes), the write result is sufficient.\n"
+    "  Only re-read to verify for multi-line refactors or new file creation.\n\n"
     "CODE REVIEW — USE review_code AFTER READING FILES:\n"
     "- After reading a file, call review_code to check for issues.\n"
     "- It detects: syntax errors, hardcoded secrets, null pointer risks, TODO/FIXME, debug prints, empty catch blocks, magic numbers, long functions.\n"
@@ -210,10 +248,12 @@ SYSTEM_PROMPT = (
     "Do NOT call review_code during Phase 1 or 2. Only in Phase 3.\n"
     "ALWAYS use read with array for 2+ files. One-by-one read wastes budget.\n\n"
     "READ TIPS:\n"
-    "- First read gives a truncated view (head+tail). Use this to get the structure.\n"
-    "- For deep analysis, use offset/limit to read specific sections.\n"
-    "- Example: read(files='User.java', offset=150, limit=300) reads lines 150-449.\n"
-    "- Read one section at a time — don't over-read.\n\n"
+    "- For simple fixes (lint errors, formatting, CRLF, typos) — read the file ONCE, fix it, done.\n"
+    "  Do NOT deep-dive the codebase or read dependency files for trivial fixes.\n"
+    "- NEVER re-read the same file. The full content is already in context.\n"
+    "- Files under 15000 chars are returned in FULL — no need to paginate.\n"
+    "- Read once, understand, act. Repeated reads waste time and tokens.\n"
+    "- read(files=[\'a.js\',\'b.js\']) reads multiple files in ONE call. Use this.\n"
     "RUN_CODE TIPS:\n"
     "- Short commands (python app.py, pytest) run synchronously and return output.\n"
     "- Long-running commands (npm run dev, vite, flask run) auto-run in background.\n"
@@ -404,6 +444,7 @@ _TOOL_BUDGET = {
     "delete_file":     {"max": 5,  "count": 0},
     "run_code":        {"max": 15, "count": 0},
     "search":          {"max": 8,  "count": 0},
+    "generate_image":  {"max": 5,  "count": 0},
     "_total":          {"max": 70, "count": 0},
 }
 
@@ -461,7 +502,7 @@ def _safe_json_parse(text: str) -> dict:
     if repaired:
         return repaired
 
-    logger.warn(f"JSON 解析失败: {str(text)[:100]}")
+    logger.warn(f"JSON 解析失败: {text[:80].replace(chr(10), ' ')}")
     return {}
 
 
@@ -519,7 +560,12 @@ def _unescape_json_str(s: str) -> str:
 
 
 def _fuzzy_json_parse(text: str) -> dict | None:
-    """模糊解析 JSON，处理 write_file 的 content 含未转义代码的情况"""
+    """模糊解析 JSON，处理 write_file 的 content 含未转义代码的情况
+
+    核心策略：不从前面贪婪匹配，而是从 JSON 末尾反向查找 content 的闭合边界。
+    JSON 结构为 {"filename": "...", "content": "..."}，
+    我们从末尾的 } 向前找闭合 content 的 "，从而精确定位 content 范围。
+    """
     import re
 
     result = {}
@@ -531,26 +577,40 @@ def _fuzzy_json_parse(text: str) -> dict | None:
     else:
         return None
 
-    # 提取 content：这是最常出问题的字段
-    # content 可能包含换行、引号、特殊字符
-    # 用更宽松的方式提取：从 "content": " 开始到最后 " 之前
-    m = re.search(r'"content"\s*:\s*"(.*)', text, re.DOTALL)
-    if m:
-        raw = m.group(1)
-        # 去掉末尾多余的 ", "} 等
-        raw = raw.rstrip().rstrip(",")
-        if raw.endswith('"}'):
-            raw = raw[:-2]
-        elif raw.endswith('"'):
-            raw = raw[:-1]
-        elif raw.endswith("'}"):
-            raw = raw[:-2]
-        elif raw.endswith("}"):
-            raw = raw[:-1]
-        raw = _unescape_json_str(raw)
-        result["content"] = raw
+    # 查找 content 字段的起始位置（"content": " 之后）
+    content_start_match = re.search(r'"content"\s*:\s*"', text)
+    if not content_start_match:
+        return result if result else None
 
-    return result if result else None
+    content_start = content_start_match.end()
+
+    # ── 从末尾反向查找 content 的结束位置 ──
+    # JSON 末尾格式: ...content..."}
+    # 我们需要找到闭合 content 值的 "（它是 JSON 字符串的结束引号）
+    s = text.rstrip()
+    end_pos = len(s)
+
+    # 跳过末尾的 }
+    if end_pos > 0 and s[end_pos - 1] == '}':
+        end_pos -= 1
+    # 跳过 } 与闭合 " 之间的空白
+    while end_pos > 0 and s[end_pos - 1] in ' \t\n\r':
+        end_pos -= 1
+    # 跳过闭合的 "
+    if end_pos > 0 and s[end_pos - 1] == '"':
+        end_pos -= 1
+
+    if end_pos <= content_start:
+        # 边界情况：没有找到合理的结束位置
+        raw = text[content_start:]
+        raw = raw.rstrip().rstrip(',').rstrip('"').rstrip("'").rstrip('}')
+    else:
+        raw = text[content_start:end_pos]
+
+    raw = _unescape_json_str(raw)
+    result["content"] = raw
+
+    return result
 
 
 # 危险命令确认回调 — 由 REPL 设置
@@ -561,6 +621,46 @@ def set_confirm_callback(cb: Callable[[str, str], str] | None):
     """设置危险命令确认回调。cb(command, reason) -> "allow"/"reject"/"whitelist"/"blacklist" """
     global _confirm_run_callback
     _confirm_run_callback = cb
+
+
+# ═══════════════════════════════════════════════════════════
+# 图像生成客户端 — 模块级全局变量（避免 _execute_tool 重构为方法）
+# ═══════════════════════════════════════════════════════════
+
+_image_openai_client = None
+_image_model_name = ""
+_image_provider = ""
+_image_api_key = ""
+_image_api_base = ""
+
+
+def _print_colored_diff(diff_lines: list[str]):
+    """用 Rich 颜色输出 diff — 高对比度，Windows 终端友好"""
+    from rich.console import Console as _RC
+    _rc = _RC()
+    for line in diff_lines:
+        if line.startswith("+") and not line.startswith("+++"):
+            _rc.print(f"  [bold green]■ {line}[/bold green]")
+        elif line.startswith("-") and not line.startswith("---"):
+            _rc.print(f"  [bold red]─ {line}[/bold red]")
+        elif line.startswith("---"):
+            _rc.print(f"  [bold white]{line}[/bold white]")
+        elif line.startswith("+++"):
+            _rc.print(f"  [bold white]{line}[/bold white]")
+        elif line.startswith("@@"):
+            _rc.print(f"  [bold cyan]{line}[/bold cyan]")
+        else:
+            _rc.print(f"  [dim]{line}[/dim]")
+
+
+def set_image_client(client, model_name: str, provider: str, api_key: str = "", api_base: str = ""):
+    """设置图像生成用的 OpenAI 客户端。由 ChatClient.__init__ 调用。"""
+    global _image_openai_client, _image_model_name, _image_provider, _image_api_key, _image_api_base
+    _image_openai_client = client
+    _image_model_name = model_name
+    _image_provider = provider
+    _image_api_key = api_key
+    _image_api_base = api_base
 
 
 # ═══════════════════════════════════════════════════════════
@@ -579,6 +679,8 @@ _STRONG_MODEL_PATTERNS = [
     "claude-4", "claude-opus-4", "claude-sonnet-4", "claude-3.5", "claude-3-5",
     # OpenAI
     "gpt-4", "gpt-4o", "gpt-4.1", "gpt-4-", "o1", "o3", "o4",
+    # Image generation models
+    "gpt-image", "dall-e",
     # DeepSeek V3/R1/V4 系列（在 tool calling benchmark 中表现优秀）
     "deepseek-v3", "deepseek-v4", "deepseek-r1", "deepseek-chat",
     # Google
@@ -678,6 +780,59 @@ def _safe_path(filename: str) -> str | None:
     return None
 
 
+def _extract_outline(lines: list[str], offset: int = 0) -> str:
+    """从代码行中提取函数/类/方法定义作为结构大纲，用于截断提示
+
+    Args:
+        lines: 代码行列表
+        offset: 行号偏移量（用于显示绝对行号），0-based
+    """
+    import re
+    patterns = [
+        # Python/Ruby/Crystal
+        re.compile(r'^\s*(def |class |async def )'),
+        # Java/Kotlin/Scala/C++/C#/TypeScript/Swift/Rust
+        re.compile(r'^\s*(public |private |protected |static |async |unsafe |fn |func |fun |override |virtual |final |abstract |sealed |open |data class |object |companion object |suspend fun |inline fun )'),
+        # Go
+        re.compile(r'^\s*(func |type |var |const )'),
+        # JS/TS/ES6+
+        re.compile(r'^\s*(const |let |var |function |class |interface |enum |type |export |import )'),
+        # C/C++/Java 返回类型 + 函数名 (eg: "int main(", "void Foo::bar(")
+        re.compile(r'^\s*[\w<>[\]:,\s]+\s+\w+\s*\([^)]*\)\s*(\{|;)'),
+        # SQL / DDL
+        re.compile(r'^\s*(CREATE |ALTER |DROP |INSERT |SELECT |UPDATE |DELETE )'),
+        # Shell/make
+        re.compile(r'^\s*[\w.\-/]+:\s*$'),
+        # YAML/TOML 顶级键
+        re.compile(r'^\s*[\w.-]+\s*:'),
+    ]
+    outline: list[str] = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#') or stripped.startswith('//') or stripped.startswith('/*') or stripped.startswith('*'):
+            continue
+        for pat in patterns:
+            if pat.match(line):
+                outline.append(f"  L{offset + i}: {stripped[:120]}")
+                break
+        if len(outline) >= 60:
+            outline.append(f"  ... ({len(lines) - i - 1} more lines, structure truncated)")
+            break
+    return "\n".join(outline) if outline else ""
+
+
+def _extract_retry_seconds(error_text: str) -> float | None:
+    """从限流错误信息中提取建议重试秒数。如 'try again in 23.436s' → 23.436"""
+    import re
+    m = re.search(r'try again in ([\d.]+)s', error_text)
+    if m:
+        return float(m.group(1))
+    m = re.search(r'Retry after ([\d.]+)s', error_text)
+    if m:
+        return float(m.group(1))
+    return None
+
+
 def _check_command_abuse(command: str) -> str | None:
     """检测模型是否在滥用 run_code 来替代专用工具
 
@@ -762,6 +917,8 @@ def _execute_tool(name: str, args: dict,
         if not filename:
             return "ERROR: write_file — could not parse filename from LLM output"
         content = args.get("content", "")
+        # 统一换行符为 LF，避免 Windows CRLF 触发 prettier/eslint 报错
+        content = content.replace("\r\n", "\n").replace("\r", "\n")
         raw = Path(filename)
         if raw.is_absolute() or _safe_path(filename):
             filename = raw.name
@@ -778,28 +935,24 @@ def _execute_tool(name: str, args: dict,
         p.parent.mkdir(parents=True, exist_ok=True)
 
         # 记录原始内容用于 diff
-        original = p.read_text(encoding="utf-8") if p.exists() else ""
+        original = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
 
-        # AI 标记：如果文件被修改或新建，添加注释头
-        strategy = LanguageFactory().detect_by_extension(p.suffix.lower())
-        if strategy is not None:
-            comment_char = strategy.comment_syntax
-            # 只在文件头部没有 AI marker 时添加
-            first_line = content.split("\n")[0].strip() if content else ""
-            if comment_char not in first_line or "ai" not in first_line.lower():
-                ai_marker = f"{comment_char} AI-generated (PatchFlow)\n"
-                content = ai_marker + content
+        # 使用二进制写入，避免 Windows 文本模式把 \n 转成 \r\n
+        p.write_bytes(content.encode("utf-8", errors="replace"))
 
-        p.write_text(content, encoding="utf-8")
+        # 清除命令缓存 — 文件已变更，之前的 run_code 结果可能过期
+        _RUN_CACHE.clear()
 
-        # 显示 diff
+        # 显示 diff（带颜色）
         if original and original != content:
             diff = diff_text(original, content, context_lines=2)
             summary = format_summary(diff)
             diff_lines = diff.split("\n")
             if len(diff_lines) > 60:
-                diff = "\n".join(diff_lines[:60]) + f"\n... ({len(diff_lines) - 60} more lines)"
-            logger.info(f"write_file: {filename} ({len(content)} chars, {summary})\n{diff}")
+                diff_lines = diff_lines[:60]
+                diff_lines.append(f"... ({len(diff.split(chr(10))) - 60} more lines)")
+            logger.info(f"write_file: {filename} ({len(content)} chars, {summary})")
+            _print_colored_diff(diff_lines)
         elif not original:
             logger.info(f"write_file: {filename} ({len(content)} chars, new file)")
         else:
@@ -830,6 +983,7 @@ def _execute_tool(name: str, args: dict,
         if traversal:
             return traversal
         p.unlink()
+        _RUN_CACHE.clear()
         logger.info(f"delete_file: {fn}")
         return f"OK: deleted {fn}"
 
@@ -847,6 +1001,7 @@ def _execute_tool(name: str, args: dict,
             return traversal
         dst.parent.mkdir(parents=True, exist_ok=True)
         src.rename(dst)
+        _RUN_CACHE.clear()
         logger.info(f"rename_file: {source} -> {dest}")
         return f"OK: moved {source} -> {dest}"
 
@@ -873,9 +1028,8 @@ def _execute_tool(name: str, args: dict,
                 return f"ERROR: file not found: {filename}{hint}"
             if not p.is_file():
                 return f"ERROR: not a file: {filename}"
-            content = p.read_text(encoding="utf-8")
+            content = p.read_text(encoding="utf-8", errors="replace")
             logger.info(f"read (paginated): {filename} ({len(content)} chars)")
-            _READ_CACHE.add(filename)
             lines = content.split("\n")
             total_lines = len(lines)
             if offset < 0:
@@ -894,9 +1048,6 @@ def _execute_tool(name: str, args: dict,
         parts = []
         for f in files:
             normal = str(Path(f.strip()).as_posix())
-            if normal in _READ_CACHE:
-                parts.append(f"# === {f} ===\n(already read — in context)")
-                continue
             fp = Path(normal)
             if not fp.exists():
                 hint = _suggest_files(normal)
@@ -905,22 +1056,48 @@ def _execute_tool(name: str, args: dict,
             if not fp.is_file():
                 parts.append(f"# === {f} ===\n(not a file — is a directory)")
                 continue
-            content = fp.read_text(encoding="utf-8")
+            # 重复读取警告：同一轮次已读过该文件
+            if normal in _READ_CACHE:
+                parts.append(
+                    f"# === {f} ===\n"
+                    f"[NOTICE: You already read this file earlier in this conversation. "
+                    f"The content is unchanged. Skip re-reading and use what you have.]"
+                )
+                continue
+            content = fp.read_text(encoding="utf-8", errors="replace")
             _READ_CACHE.add(normal)
             logger.info(f"read: {normal} ({len(content)} chars)")
-            # 截断大文件
-            if len(content) > 5000:
+            # 截断大文件（阈值 120000 字符 ≈ 2000-3000 行）
+            if len(content) > 120000:
                 lines = content.split("\n")
                 total_lines = len(lines)
-                head_lines, tail_lines = 150, 50
+                head_lines = min(800, total_lines // 3)
+                tail_lines = min(250, total_lines - head_lines)
                 if total_lines > head_lines + tail_lines:
                     head = "\n".join(lines[:head_lines])
                     tail = "\n".join(lines[-tail_lines:])
                     omitted = total_lines - head_lines - tail_lines
+                    omitted_start = head_lines
+                    omitted_end = total_lines - tail_lines - 1
+                    # 提取被跳过区域的完整结构大纲（带绝对行号）
+                    mid = lines[omitted_start:total_lines - tail_lines]
+                    nav = _extract_outline(mid, offset=omitted_start)
+                    if nav:
+                        nav_hint = (
+                            f"\n# ═══ STRUCTURE OF LINES {omitted_start}-{omitted_end} ═══\n"
+                            f"# Use read(files='{normal}', offset=N, limit=80) to read any section\n"
+                            f"{nav}\n"
+                            f"# ═══ END STRUCTURE ═══\n"
+                        )
+                    else:
+                        nav_hint = (
+                            f"\n# ... [{omitted} lines skipped, no structural patterns detected] ...\n"
+                            f"# Use read(files='{normal}', offset={omitted_start}, limit=100) to explore\n"
+                        )
                     content = (
-                        f"[lines 0-{head_lines-1} of {total_lines}]\n{head}\n\n"
-                        f"# ... [truncated {omitted} lines — use read(files='{normal}', offset={head_lines},limit=N) to continue] ...\n\n"
-                        f"[lines {total_lines-tail_lines}-{total_lines-1} of {total_lines}]\n{tail}"
+                        f"# === {normal} L1-{head_lines} of {total_lines} ({len(content)} chars) ===\n{head}\n"
+                        f"{nav_hint}"
+                        f"# === {normal} L{omitted_end + 2}-{total_lines} of {total_lines} ===\n{tail}"
                     )
             parts.append(f"# === {f} ===\n{content}")
         return "\n\n".join(parts)
@@ -1003,6 +1180,9 @@ def _execute_tool(name: str, args: dict,
 
         if result.ok:
             out = f"exit: 0\nstdout:\n{output_text}{truncated}"
+            # 如果命令修改了文件（prettier --write、eslint --fix 等），清除缓存
+            if any(kw in cmd_key for kw in ("--write", "--fix", "format", "prettier")):
+                _RUN_CACHE.clear()
         else:
             out = f"exit: {result.exit_code}\nstdout:\n{output_text[:1500]}{truncated}\nstderr:\n{result.stderr[:1500]}"
         _RUN_CACHE[cmd_key] = out
@@ -1157,6 +1337,146 @@ def _execute_tool(name: str, args: dict,
             return f"review_code: {filepath} — 审查超时（跳过 linter），已完成模式检查"
         return review_result[0] if review_result else f"review_code: {filepath} — 审查完成"
 
+    elif name == "generate_image":
+        prompt = args.get("prompt", "")
+        filename = args.get("filename", "")
+        size = args.get("size", "") or "1024x1024"
+
+        if not prompt:
+            return "ERROR: generate_image requires a prompt"
+        if not filename:
+            return "ERROR: generate_image requires a filename"
+
+        # 解析路径：展开 ~（用户目录），支持绝对路径输出到桌面等位置
+        from pathlib import Path as _Path
+        resolved = _Path(filename).expanduser().resolve()
+        suffix = resolved.suffix.lower()
+        if suffix not in (".png", ".jpg", ".jpeg", ".webp"):
+            return f"ERROR: unsupported image format '{suffix}'. Use .png, .jpg, or .webp."
+
+        if _image_openai_client is None:
+            return (
+                "ERROR: 未配置图像生成模型。请在 ~/.patchflow/config.json 的 models 中添加一个支持图像生成的模型，"
+                "然后设置 image_model 指向该模型别名。"
+            )
+        # 确保父目录存在
+        try:
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return f"ERROR: cannot create directory {resolved.parent}: {e}"
+
+        # 构建 API 参数 — 只传递显式提供的可选参数，避免模型不支持
+        api_kwargs: dict = {
+            "model": _image_model_name,
+            "prompt": prompt,
+            "size": size,
+            "n": 1,
+        }
+        quality = args.get("quality", "medium")
+        api_kwargs["quality"] = quality
+        style = args.get("style", "")
+        if style:
+            api_kwargs["style"] = style
+
+        # 调用图像生成 API
+        import httpx
+        import time as _time
+
+        max_retries = 2
+        last_error = ""
+        data = None
+
+        # 创建 httpx Client 作为回退（不信任系统代理，避免 GFW 干扰）
+        _httpx_img_client = None
+
+        def _get_httpx_client():
+            nonlocal _httpx_img_client
+            if _httpx_img_client is None:
+                _httpx_img_client = httpx.Client(
+                    timeout=300.0,
+                    trust_env=False,  # 不走系统代理，避免不通的代理干扰
+                    http2=False,
+                )
+            return _httpx_img_client
+
+        for attempt in range(max_retries + 1):
+            try:
+                if attempt > 0:
+                    delay = 5 * attempt
+                    logger.info(f"generate_image 重试 {attempt}/{max_retries}，等待 {delay}s...")
+                    _time.sleep(delay)
+
+                api_url = f"{_image_api_base.rstrip('/')}/images/generations"
+                client = _get_httpx_client()
+                resp = client.post(api_url, json=api_kwargs, headers={
+                    "Authorization": f"Bearer {_image_api_key}",
+                    "Content-Type": "application/json",
+                })
+                if resp.status_code != 200:
+                    last_error = f"image generation failed ({resp.status_code}): {resp.text[:300]}"
+                    if resp.status_code >= 500:
+                        continue
+                    full_url = f"{_image_api_base.rstrip('/')}/images/generations"
+                    if resp.status_code == 404:
+                        return (f"ERROR: image generation not supported (404). "
+                                f"Request URL: {full_url} — this endpoint does not exist.")
+                    return f"ERROR: {last_error}"
+                data = resp.json()
+                image_url = data.get("data", [{}])[0].get("url") if data.get("data") else None
+                b64_data = data.get("data", [{}])[0].get("b64_json") if data.get("data") else None
+                break
+            except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError,
+                    httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+                last_error = str(e)
+                logger.warn(f"generate_image attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries:
+                    logger.error(f"generate_image API error after {max_retries + 1} attempts: {last_error}")
+                    return (f"ERROR: image generation request failed after {max_retries + 1} attempts: {last_error}\n"
+                            f"Hint: Check network connectivity to {_image_api_base}. If behind a firewall, "
+                            f"configure a proxy via 'patchflow config set image.api_base <proxy-url>'")
+            except httpx.HTTPError as e:
+                logger.error(f"generate_image API error: {e}")
+                return (f"ERROR: image generation request failed: {e}\n"
+                        f"Hint: Network error connecting to image API. Check your proxy/VPN settings.")
+            except Exception as e:
+                last_error = str(e)
+                logger.warn(f"generate_image attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries:
+                    logger.error(f"generate_image error after {max_retries + 1} attempts: {last_error}")
+                    return f"ERROR: image generation failed after {max_retries + 1} attempts: {last_error}"
+
+        if data is None:
+            return f"ERROR: image generation failed: {last_error}"
+
+        if not image_url and not b64_data:
+            return "ERROR: image generation returned no image data"
+
+        # 下载并保存
+        try:
+            import base64
+
+            if b64_data:
+                image_bytes = base64.b64decode(b64_data)
+            else:
+                client = _get_httpx_client()
+                resp = client.get(image_url)
+                resp.raise_for_status()
+                image_bytes = resp.content
+
+            resolved.write_bytes(image_bytes)
+            file_size_kb = len(image_bytes) / 1024
+
+            logger.info(f"generate_image: {prompt[:80]}... -> {resolved} ({file_size_kb:.1f} KB, {size})")
+            return (
+                f"OK: image generated successfully\n"
+                f"Saved to: {resolved}\n"
+                f"Size: {file_size_kb:.1f} KB\n"
+                f"Dimensions: {size}\n"
+                f"Prompt: {prompt}"
+            )
+        except (httpx.HTTPError, OSError) as e:
+            return f"ERROR: failed to download/save image: {e}"
+
     return f"ERROR: unknown tool: {name}"
 
 
@@ -1215,6 +1535,9 @@ class ChatClient:
         if not _model_trusted:
             logger.info(f"模型 {self.model} 不在已知强模型列表中，写/删操作需确认")
 
+        from httpx import Timeout
+        _api_timeout = Timeout(connect=15.0, read=180.0, write=60.0, pool=10.0)
+
         if self.provider == "anthropic":
             base_url = self.api_base or None
             if base_url:
@@ -1223,17 +1546,44 @@ class ChatClient:
                     base_url = base_url[:-len("/v1/messages")]
                 elif base_url.endswith("/v1"):
                     base_url = base_url[:-len("/v1")]
-            self._anthropic = Anthropic(api_key=self.api_key, timeout=120, base_url=base_url)
+            self._anthropic = Anthropic(api_key=self.api_key, timeout=_api_timeout, base_url=base_url)
             self._openai = None
         else:
             base_url = self.api_base or None
             self._openai = OpenAI(
                 api_key=self.api_key,
                 base_url=base_url,
-                timeout=120,
-                max_retries=2,
+                timeout=_api_timeout,
+                max_retries=0,
             )
             self._anthropic = None
+
+        # 图像生成客户端（独立于聊天客户端，调用 images.generate API）
+        image_cfg = cfg.get("image", {})
+        self._image_client = None
+        self._image_model = ""
+        self._image_provider = ""
+        if image_cfg:
+            img_api_key = image_cfg.get("api_key", "")
+            img_provider = image_cfg.get("provider", "")
+            img_model = image_cfg.get("model", "")
+            img_base = image_cfg.get("api_base", "")
+            if img_api_key and img_provider and img_model and img_base:
+                _img_timeout = Timeout(connect=10.0, read=300.0, write=60.0, pool=10.0)
+                import httpx as _httpx
+                _img_http_client = _httpx.Client(trust_env=False, timeout=_img_timeout)
+                self._image_client = OpenAI(
+                    api_key=img_api_key,
+                    base_url=img_base,
+                    timeout=_img_timeout,
+                    max_retries=0,
+                    http_client=_img_http_client,
+                )
+                self._image_model = img_model
+                self._image_provider = img_provider
+            set_image_client(self._image_client, self._image_model, self._image_provider, img_api_key, img_base)
+        else:
+            set_image_client(None, "", "", "", "")
 
         self.messages: list[dict] = []
         self._memory_enabled = memory_enabled
@@ -1261,24 +1611,28 @@ class ChatClient:
             self._phase[0] = "scanning project..."
             t0 = time.time()
             skeleton = _get_project_skeleton(".")
-            logger.info(f"[perf] skeleton scan: {time.time() - t0:.2f}s")
+            logger.debug(f"[perf] skeleton scan: {time.time() - t0:.2f}s")
 
             rules_text = ""
             rules_file = Path(".patchflow/rules.md")
             if rules_file.exists():
                 try:
-                    rules_text = rules_file.read_text(encoding="utf-8").strip()
+                    rules_text = rules_file.read_text(encoding="utf-8", errors="replace").strip()
                 except Exception as e:
                     logger.debug(f"读取规则文件失败: {e}")
             if rules_text:
                 enhanced_input = f"{skeleton}\n\nProject Rules:\n{rules_text}\n\n{user_input}"
             else:
                 enhanced_input = f"{skeleton}\n\n{user_input}"
-            self.messages.append({"role": "user", "content": enhanced_input})
+            cleaned_text, images = _extract_images(enhanced_input, self._work_dir)
+            content = _build_user_content(cleaned_text, images, self.provider)
+            if images and not _supports_vision(self.model):
+                content = _strip_images_with_warning(cleaned_text, images)
+            self.messages.append({"role": "user", "content": content})
             self._phase[0] = "saving memory..."
             t0 = time.time()
             self._save_memory()
-            logger.info(f"[perf] save_memory: {time.time() - t0:.2f}s")
+            logger.debug(f"[perf] save_memory: {time.time() - t0:.2f}s")
         else:
             bg_info = ""
             try:
@@ -1288,7 +1642,12 @@ class ChatClient:
                     bg_info = "\n[Background processes running: " + ", ".join(f"PID {p.pid}: {p.command[:40]}" for p in running) + "]\n"
             except Exception as e:
                 logger.debug(f"后台进程列表获取失败: {e}")
-            self.messages.append({"role": "user", "content": bg_info + user_input})
+            full_text = bg_info + user_input
+            cleaned_text, images = _extract_images(full_text, self._work_dir)
+            content = _build_user_content(cleaned_text, images, self.provider)
+            if images and not _supports_vision(self.model):
+                content = _strip_images_with_warning(cleaned_text, images)
+            self.messages.append({"role": "user", "content": content})
             self._phase[0] = "saving memory..."
             self._save_memory()
         all_tool_calls: list = []
@@ -1307,7 +1666,7 @@ class ChatClient:
                 thinking_text = ""
             else:
                 text, tcs, usage, thinking_text = self._call_anthropic(recent)
-            logger.info(f"[perf] LLM call: {time.time() - t0:.2f}s, "
+            logger.debug(f"[perf] LLM call: {time.time() - t0:.2f}s, "
                          f"messages={len(recent)}, input_est={input_tokens_est // 1000}K chars")
 
             session_usage["input_tokens"] += usage.get("input_tokens", 0)
@@ -1367,14 +1726,31 @@ class ChatClient:
 
     def _append_assistant(self, text, tcs):
         """把 assistant 回复 + 工具结果追加到消息历史"""
-        max_result_chars = 1000
 
-        def _truncate(content: str) -> str:
-            if len(content) <= max_result_chars:
+        # 按工具类型分配截断预算 — read 需要更大空间避免反复重读
+        def _tool_budget(tool_name: str) -> int:
+            if tool_name == "read":
+                return 30000
+            if tool_name in ("list", "search"):
+                return 4000
+            if tool_name == "run_code":
+                return 3000
+            if tool_name == "review_code":
+                return 2000
+            return 1000
+
+        def _truncate(content: str, tool_name: str) -> str:
+            limit = _tool_budget(tool_name)
+            if len(content) <= limit:
                 return content
-            head = content[:500]
-            tail = content[-250:]
-            return f"{head}\n\n... [truncated {len(content) - max_result_chars} chars, full result in REPL] ...\n\n{tail}"
+            head = int(limit * 0.75)
+            tail = limit - head
+            return (
+                f"{content[:head]}\n\n"
+                f"... [truncated {len(content) - limit} chars, "
+                f"full result visible in REPL] ...\n\n"
+                f"{content[-tail:]}"
+            )
 
         if self._openai:
             # OpenAI 格式
@@ -1383,20 +1759,28 @@ class ChatClient:
                 msg["tool_calls"] = tcs
             self.messages.append(msg)
             for tc in tcs:
+                tool_name = tc["function"]["name"]
                 self.messages.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
-                    "content": _truncate(tc.get("result", "")),
+                    "content": _truncate(tc.get("result", ""), tool_name),
                 })
-            # 弱模型强制提示
+            # 后续提示：只对非读工具做提醒（读工具结果已在上方完整展示）
             tool_names = [tc["function"]["name"] for tc in tcs]
-            self.messages.append({
-                "role": "user",
-                "content": (
+            read_count = sum(1 for n in tool_names if n == "read")
+            if read_count > 0:
+                hint = (
+                    f"(system: you just read {read_count} file(s). "
+                    f"The full content is above. Do NOT re-read the same files — "
+                    f"use the content you already have. If you need a specific section, "
+                    f"use read with offset/limit, not full re-read.)"
+                )
+            else:
+                hint = (
                     f"(system: you just called {', '.join(tool_names)}. "
                     f"Read the tool results above and respond based on what you actually saw.)"
-                ),
-            })
+                )
+            self.messages.append({"role": "user", "content": hint})
         else:
             # Anthropic 格式：assistant 消息包含 tool_use 块
             content = []
@@ -1414,11 +1798,11 @@ class ChatClient:
             # Anthropic：工具结果用 user 消息，content 必须是 content block 数组格式
             tr_blocks = []
             for tc in tcs:
-                result_text = _truncate(tc.get("result", ""))
+                tool_name = tc["function"]["name"]
+                result_text = _truncate(tc.get("result", ""), tool_name)
                 tr_blocks.append({
                     "type": "tool_result",
                     "tool_use_id": tc["id"],
-                    # 关键：传 content block 数组而非纯字符串
                     "content": [{"type": "text", "text": result_text}],
                 })
             self.messages.append({"role": "user", "content": tr_blocks})
@@ -1429,7 +1813,7 @@ class ChatClient:
         """Anthropic 原生工具调用，支持扩展思考"""
         kwargs: dict = {
             "model": self.model,
-            "max_tokens": 2048,
+            "max_tokens": 8192,
             "system": SYSTEM_PROMPT,
             "messages": messages,
             "tools": _get_anthropic_tools(),
@@ -1437,12 +1821,21 @@ class ChatClient:
         if self._thinking_budget > 0 and self.provider == "anthropic":
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": self._thinking_budget}
 
-        try:
-            response = self._anthropic.messages.create(**kwargs)
-        except Exception as e:
-            error_msg = f"[API 请求失败: {e}]"
-            logger.error(f"Anthropic API 调用异常: {e}")
-            return error_msg, [], {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, ""
+        for retry in range(3):
+            try:
+                response = self._anthropic.messages.create(**kwargs)
+                break
+            except Exception as e:
+                err_str = str(e)
+                is_rate_limit = "429" in err_str or "rate" in err_str.lower() or "overloaded" in err_str.lower()
+                if is_rate_limit and retry < 2:
+                    wait = _extract_retry_seconds(err_str) or (2 ** retry) * 5
+                    logger.warn(f"API 限流，{wait:.1f}s 后重试 ({retry + 1}/3)...")
+                    time.sleep(wait)
+                    continue
+                error_msg = f"[API 请求失败: {e}]"
+                logger.error(f"Anthropic API 调用异常: {e}")
+                return error_msg, [], {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}, ""
 
         text_parts = []
         thinking_parts = []
@@ -1484,73 +1877,89 @@ class ChatClient:
             return obj
 
         clean_messages = sanitize(messages)
+
+        # 非 vision 模型：清除历史消息中的所有 image_url block
+        if not _supports_vision(self.model):
+            clean_messages = _strip_image_blocks_from_history(clean_messages)
+
         api_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + clean_messages
 
         text_parts = []
         tool_calls_acc: dict[int, dict] = {}
         usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
-        try:
-            stream_deadline = time.time() + 180
-            stream_client = OpenAI(
-                api_key=self.api_key,
-                base_url=self.api_base,
-                timeout=120,
-                max_retries=0,
-            )
-            response = stream_client.chat.completions.create(
-                model=self.model,
-                messages=api_messages,
-                tools=TOOLS,
-                tool_choice="auto",
-                max_tokens=4096,
-                stream=True,
-                stream_options={"include_usage": True},
-            )
+        for retry in range(3):
+            try:
+                stream_deadline = time.time() + 300
+                response = self._openai.chat.completions.create(
+                    model=self.model,
+                    messages=api_messages,
+                    tools=TOOLS,
+                    tool_choice="auto",
+                    max_tokens=8192,
+                    stream=True,
+                    stream_options={"include_usage": True},
+                )
 
-            time.time()
-            for chunk in response:
-                if time.time() - stream_deadline > 0:
-                    logger.warn("OpenAI streaming total time > 180s, discarding partial tool calls")
-                    tool_calls_acc.clear()
-                    break
-                if chunk.usage:
-                    usage = {
-                        "input_tokens": chunk.usage.prompt_tokens or 0,
-                        "output_tokens": chunk.usage.completion_tokens or 0,
-                        "total_tokens": chunk.usage.total_tokens or 0,
-                    }
+                for chunk in response:
+                    if time.time() > stream_deadline:
+                        logger.warn("OpenAI streaming total time > 300s, discarding partial tool calls")
+                        tool_calls_acc.clear()
+                        break
+                    if chunk.usage:
+                        usage = {
+                            "input_tokens": chunk.usage.prompt_tokens or 0,
+                            "output_tokens": chunk.usage.completion_tokens or 0,
+                            "total_tokens": chunk.usage.total_tokens or 0,
+                        }
 
-                if not chunk.choices:
+                    if not chunk.choices:
+                        continue
+
+                    delta = chunk.choices[0].delta
+                    if delta is None:
+                        continue
+
+                    if delta.content:
+                        text_parts.append(delta.content)
+
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            idx = tc.index
+                            if idx not in tool_calls_acc:
+                                tool_calls_acc[idx] = {
+                                    "id": tc.id or "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                }
+                            if tc.id:
+                                tool_calls_acc[idx]["id"] = tc.id
+                            if tc.function:
+                                if tc.function.name:
+                                    tool_calls_acc[idx]["function"]["name"] += tc.function.name
+                                if tc.function.arguments:
+                                    tool_calls_acc[idx]["function"]["arguments"] += tc.function.arguments
+                break  # success
+            except UnicodeDecodeError as e:
+                if retry < 2:
+                    wait = (2 ** retry) * 3
+                    logger.warn(f"UTF-8 解码错误(pos={e.start}-{e.end}): {e.reason}，{wait:.0f}s 后重试 ({retry + 1}/3)...")
+                    time.sleep(wait)
                     continue
-
-                delta = chunk.choices[0].delta
-                if delta is None:
+                error_msg = f"[UTF-8 解码失败: {e}]"
+                logger.error(f"API 返回数据含非法字节: pos={e.start}-{e.end}, reason={e.reason}")
+                return error_msg, [], usage
+            except Exception as e:
+                err_str = str(e)
+                is_rate_limit = "429" in err_str or "rate" in err_str.lower()
+                if is_rate_limit and retry < 2:
+                    wait = _extract_retry_seconds(err_str) or (2 ** retry) * 5
+                    logger.warn(f"API 限流，{wait:.1f}s 后重试 ({retry + 1}/3)...")
+                    time.sleep(wait)
                     continue
-
-                if delta.content:
-                    text_parts.append(delta.content)
-
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        idx = tc.index
-                        if idx not in tool_calls_acc:
-                            tool_calls_acc[idx] = {
-                                "id": tc.id or "",
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            }
-                        if tc.id:
-                            tool_calls_acc[idx]["id"] = tc.id
-                        if tc.function:
-                            if tc.function.name:
-                                tool_calls_acc[idx]["function"]["name"] += tc.function.name
-                            if tc.function.arguments:
-                                tool_calls_acc[idx]["function"]["arguments"] += tc.function.arguments
-        except Exception as e:
-            error_msg = f"[API 请求失败: {e}]"
-            logger.error(f"OpenAI API 调用异常: {e}")
-            return error_msg, [], usage
+                error_msg = f"[API 请求失败: {e}]"
+                logger.error(f"OpenAI API 调用异常: {e}")
+                return error_msg, [], usage
 
         final_text = "".join(text_parts).strip()
         final_tcs = list(tool_calls_acc.values()) if tool_calls_acc else []
@@ -1636,7 +2045,7 @@ class ChatClient:
         """
         try:
             if self._memory_path.exists():
-                data = json.loads(self._memory_path.read_text(encoding="utf-8"))
+                data = json.loads(self._memory_path.read_text(encoding="utf-8", errors="replace"))
                 self._memory_summary = data.get("summary", [])
                 raw = data.get("messages", [])
                 if raw or self._memory_summary:
@@ -1859,10 +2268,10 @@ class ChatClient:
                 "_saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
             raw = json.dumps(data, ensure_ascii=False, indent=2)
-            self._memory_path.write_text(raw, encoding="utf-8")
-            logger.info(f"{_log_tag} 已持久化 ({len(self._memory_summary)} 摘要 + {len(stripped)} 消息, "
-                        f"{len(raw.encode('utf-8')) // 1024}KB)")
-        except OSError as e:
+            self._memory_path.write_bytes(raw.encode("utf-8", errors="replace"))
+            logger.debug(f"{_log_tag} 已持久化 ({len(self._memory_summary)} 摘要 + {len(stripped)} 消息, "
+                        f"{len(raw.encode('utf-8', errors='replace')) // 1024}KB)")
+        except (OSError, UnicodeError, ValueError) as e:
             logger.warn(f"记忆保存失败: {e}")
 
     def _compress_old_messages(self):
@@ -1881,7 +2290,7 @@ class ChatClient:
 
         test = json.dumps({"messages": self.messages, "summary": self._memory_summary},
                           ensure_ascii=False)
-        size_ok = len(test.encode("utf-8")) <= self._MAX_MEMORY_BYTES
+        size_ok = len(test.encode("utf-8", errors="replace")) <= self._MAX_MEMORY_BYTES
         count_ok = len(self.messages) <= _max_msg_count
         if size_ok and count_ok:
             return
@@ -1906,7 +2315,7 @@ class ChatClient:
             candidate = self.messages[earliest_keep:]
             test = json.dumps({"messages": candidate, "summary": self._memory_summary},
                               ensure_ascii=False)
-            size_ok = len(test.encode("utf-8")) <= self._MAX_MEMORY_BYTES
+            size_ok = len(test.encode("utf-8", errors="replace")) <= self._MAX_MEMORY_BYTES
             count_ok = len(candidate) <= _max_msg_count
             if size_ok and count_ok:
                 break
@@ -1937,7 +2346,7 @@ class ChatClient:
                 logger.info("记忆摘要已达 50 条，丢弃最早的 10 条")
                 self._memory_summary = self._memory_summary[-40:]
 
-        logger.info(f"记忆压缩: {len(self._memory_summary)} 条摘要, "
+        logger.debug(f"记忆压缩: {len(self._memory_summary)} 条摘要, "
                     f"{len(self.messages)} 条消息 ({self._MAX_MEMORY_BYTES // 1024}KB 限制)")
 
     def _summarize_round(self, msgs: list[dict]) -> str:

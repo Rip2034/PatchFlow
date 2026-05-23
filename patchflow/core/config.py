@@ -178,7 +178,7 @@ def set_user_config(key: str, value: str):
         user_cfg["agents"][role] = value
     else:
         if key not in ("api_key", "model", "max_retries", "provider", "api_base",
-                       "token_budget"):
+                       "token_budget", "image_model"):
             raise ValueError(f"未知配置项: {key}")
         if key in ("max_retries", "token_budget"):
             value = int(value) if value else 0
@@ -244,18 +244,20 @@ def get_config() -> dict:
     # 项目级配置覆盖（最高优先级，但不能覆盖 models / active / provider）
     config.update({k: v for k, v in project_raw.items() if v and k not in ("models", "active", "provider")})
 
-    # embedding 配置（语义搜索用，默认关闭）
-    embed_defaults = {"provider": "none", "model": "", "api_key": "", "api_base": ""}
-    embed_cfg = dict(embed_defaults)
-
-    embed_raw = user_raw.get("embedding", {}) or project_raw.get("embedding", {})
-    embed_cfg.update(embed_raw)
-
-    config["embedding"] = embed_cfg
-
     # 多 Agent 角色-模型映射（analyzer / fixer / reviewer 可选不同模型）
     agents_raw = user_raw.get("agents", {}) or project_raw.get("agents", {})
     config["agents"] = dict(agents_raw)
+
+    # 图像生成模型配置（可选，generate_image 工具使用）
+    image_alias = user_raw.get("image_model", "") or project_raw.get("image_model", "")
+    if image_alias and image_alias in models:
+        im = models[image_alias]
+        config["image"] = {
+            "provider": im.get("provider", ""),
+            "model": im.get("model", ""),
+            "api_key": im.get("api_key", ""),
+            "api_base": im.get("api_base", ""),
+        }
 
     return config
 

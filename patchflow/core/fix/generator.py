@@ -95,20 +95,20 @@ def write_files(files: list[dict], work_dir: str = ".") -> list[str]:
     Returns:
         list[str]: 写入的文件路径列表
     """
-    from patchflow.core.concurrency import AtomicWrite, get_file_lock_manager
+    from patchflow.core.concurrency import get_file_lock_manager
+    from patchflow.core.fs import relative_path, safe_atomic_write
 
     written = []
     wd = Path(work_dir)
     flm = get_file_lock_manager()
 
     for f in files:
-        file_path = wd / f["file"]
-        file_path.parent.mkdir(parents=True, exist_ok=True)
+        rel = relative_path(wd, f["file"])
 
         content = f["content"]
-        with flm.lock(f["file"]):
-            AtomicWrite.write(str(file_path), content)
+        with flm.lock(rel):
+            file_path = safe_atomic_write(wd, rel, content)
         logger.info(f"写入文件: {file_path} ({len(content)} 字符)")
-        written.append(str(file_path))
+        written.append(rel)
 
     return written

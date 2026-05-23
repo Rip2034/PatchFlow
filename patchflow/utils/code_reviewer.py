@@ -175,7 +175,7 @@ def _basic_python_check(filepath: str, work_dir: str) -> list[dict]:
     fp = Path(work_dir) / filepath
     if not fp.exists():
         return []
-    content = fp.read_text(encoding="utf-8")
+    content = fp.read_text(encoding="utf-8", errors="replace")
     issues = []
     try:
         compile(content, filepath, "exec")

@@ -243,7 +243,9 @@ class AgentSandbox:
 
         # 文件操作
         target = guard.validate_write("src/app.py", len(new_content))
-        target.write_text(new_content)
+        # 统一换行符为 LF，避免 Windows CRLF 触发 linter 报错
+        new_content = new_content.replace("\r\n", "\n").replace("\r", "\n")
+        target.write_bytes(new_content.encode("utf-8", errors="replace"))
 
         # 命令执行
         ok, reason = guard.validate_command("python main.py")

@@ -185,7 +185,7 @@ class CodeGraph:
         rel = str(fpath.relative_to(wd)).replace("\\", "/")
 
         try:
-            source = fpath.read_text(encoding="utf-8")
+            source = fpath.read_text(encoding="utf-8", errors="replace")
         except (UnicodeDecodeError, OSError):
             return
 
@@ -288,7 +288,7 @@ class CodeGraph:
         for file_rel, symbols in file_symbols.items():
             filepath = wd / file_rel
             try:
-                source = filepath.read_text(encoding="utf-8")
+                source = filepath.read_text(encoding="utf-8", errors="replace")
                 source_lines = source.split("\n")
             except (UnicodeDecodeError, OSError):
                 continue
@@ -434,7 +434,7 @@ class CodeGraph:
                 return False
             try:
                 filepath = wd / sym.file_rel
-                source = filepath.read_text(encoding="utf-8")
+                source = filepath.read_text(encoding="utf-8", errors="replace")
             except (UnicodeDecodeError, OSError):
                 return False
             lines = source.split("\n")[sym.start_line - 1:sym.end_line]

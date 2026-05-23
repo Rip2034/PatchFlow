@@ -302,7 +302,7 @@ def _ts_extract_name(node) -> str | None:
     """从 tree-sitter 节点中提取名称字段"""
     name_node = node.child_by_field_name("name")
     if name_node and name_node.text:
-        return name_node.text.decode("utf-8")
+        return name_node.text.decode("utf-8", errors="replace")
     return None
 
 
@@ -642,7 +642,7 @@ class LazyConflictDetector:
         """加载冲突索引"""
         if self.conflicts_path.exists():
             try:
-                data = json.loads(self.conflicts_path.read_text(encoding="utf-8"))
+                data = json.loads(self.conflicts_path.read_text(encoding="utf-8", errors="replace"))
                 self._agent_writes = defaultdict(list, data.get("cross_agent_writes", {}))
                 self._entity_index = data.get("entities", {})
             except (json.JSONDecodeError, OSError):

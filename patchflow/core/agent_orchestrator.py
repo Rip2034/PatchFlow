@@ -164,7 +164,7 @@ class AgentOrchestrator:
                 if any(rel.startswith(prefix) for prefix in (".patchflow/", ".venv/", "node_modules/", "venv/", "__pycache__/")):
                     continue
                 try:
-                    code[rel] = f.read_text(encoding="utf-8")
+                    code[rel] = f.read_text(encoding="utf-8", errors="replace")
                 except Exception:
                     continue
 
@@ -351,7 +351,7 @@ class AgentOrchestrator:
             if fp:
                 p = Path(self.work_dir) / fp
                 if p.exists():
-                    original_files[fp] = p.read_text(encoding="utf-8")
+                    original_files[fp] = p.read_text(encoding="utf-8", errors="replace")
 
         # ── 应用补丁到文件系统 ──
         if not apply_agent_patches(blackboard, work_dir=self.work_dir, diff_tracker=self.diff_tracker):
@@ -534,7 +534,8 @@ class AgentOrchestrator:
         logger.info(f"[AgentOrch] ═══ 变更报告 ({len(original_files)} files) ═══")
         for filepath, original in original_files.items():
             from pathlib import Path
-            current = Path(self.work_dir / filepath).read_text(encoding="utf-8") if Path(self.work_dir / filepath).exists() else ""
+            current_path = Path(self.work_dir) / filepath
+            current = current_path.read_text(encoding="utf-8", errors="replace") if current_path.exists() else ""
             diff = diff_text(original, current, context_lines=2)
             if diff.strip():
                 summary = format_summary(diff)

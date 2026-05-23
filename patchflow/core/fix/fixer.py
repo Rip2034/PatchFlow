@@ -56,7 +56,7 @@ def fix(error_text: str, file_path: str, model: str | None = None,
         logger.error(f"Fixer: 文件不存在: {file_path}")
         return None
 
-    current_code = p.read_text(encoding="utf-8")
+    current_code = p.read_text(encoding="utf-8", errors="replace")
 
     context_block = ""
     if project_context:
@@ -152,7 +152,7 @@ def fix_multi(error_text: str, scope_files: list[str], model: str | None = None,
         p = Path(f)
         if p.exists():
             try:
-                content = p.read_text(encoding="utf-8")
+                content = p.read_text(encoding="utf-8", errors="replace")
                 ext = p.suffix.lower().lstrip(".") or "text"
                 code_blocks += f"\n```{ext}\n{content}\n```\n"
             except (UnicodeDecodeError, OSError):
@@ -183,7 +183,7 @@ def fix_snippets(error_text: str, file_path: str, model: str | None = None,
     p = Path(file_path)
     if not p.exists():
         return []
-    current_code = p.read_text(encoding="utf-8")
+    current_code = p.read_text(encoding="utf-8", errors="replace")
     ext = p.suffix.lower().lstrip(".") or "text"
 
     diff_block = f"\nRecent changes (for context):\n{diff_context}\n" if diff_context else ""
@@ -217,17 +217,17 @@ def apply_fix(fix_result: dict, work_dir: str = ".") -> bool:
     Returns:
         bool: 写入是否成功
     """
-    from patchflow.core.concurrency import AtomicWrite, get_file_lock_manager
+    from patchflow.core.concurrency import get_file_lock_manager
+    from patchflow.core.fs import relative_path, safe_atomic_write
 
     wd = Path(work_dir)
-    file_path = wd / fix_result["file"]
     content = fix_result["content"]
 
     try:
-        file_path.parent.mkdir(parents=True, exist_ok=True)
+        rel = relative_path(wd, fix_result["file"])
         flm = get_file_lock_manager()
-        with flm.lock(fix_result["file"]):
-            AtomicWrite.write(str(file_path), content)
+        with flm.lock(rel):
+            file_path = safe_atomic_write(wd, rel, content)
         logger.info(f"应用修复: {file_path} ({len(content)} 字符)")
         return True
     except Exception as e:

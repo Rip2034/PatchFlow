@@ -1,17 +1,16 @@
-"""项目语义索引 — embedding + 符号提取 + 语义搜索
+"""项目语义索引 — 符号提取 + LLM 语义搜索
 
 为 PatchFlow 提供大项目的"理解"能力。
 当项目有上百个文件时，AI 需要快速找到相关代码。
 
 核心功能：
-  1. 启动时扫描项目 → 提取符号（类名、函数名）→ 生成 embedding → 持久化
-  2. search_files(query) → 语义搜索（embedding 相似度），返回最相关的文件
+  1. 启动时扫描项目 → 提取符号（类名、函数名）→ 持久化
+  2. search_files(query) → LLM 语义排序，返回最相关的文件
   3. search_code(pattern) → 正则搜索代码内容，返回匹配行及行号
   4. get_file_meta(path) → 快速获取文件摘要（类名、方法签名）
 
 设计要点：
-  - embedding 可用则用语义搜索，不可用自动降级为关键词匹配
-  - embedding API 失败后，当前 session 不再重试（_mark_embed_unavailable）
+  - 语义搜索使用聊天 LLM 对文件摘要进行相关性排序
   - 符号提取用正则（纯 Python 实现，不依赖语言服务器）
   - 索引持久化到 .patchflow/index/ 目录，下次启动直接加载
 """
@@ -23,32 +22,6 @@ from pathlib import Path
 
 from patchflow.core.config import get_config
 from patchflow.utils import logger
-
-# ═══════════════════════════════════════════════════════════
-# Embedding 可用性缓存 — 失败后 session 内不再重试
-# ═══════════════════════════════════════════════════════════
-
-_embed_available: bool | None = None
-
-def _is_embed_available() -> bool:
-    """检查 embedding 是否可用（缓存结果，失败后不再重试）"""
-    global _embed_available
-    if _embed_available is not None:
-        return _embed_available
-    cfg = get_config()["embedding"]
-    if cfg["provider"] in ("", "none"):
-        _embed_available = False
-        return False
-    if not cfg["api_key"]:
-        _embed_available = False
-        return False
-    _embed_available = True
-    return True
-
-def _mark_embed_unavailable():
-    """标记 embedding 不可用（API 调用失败后调用）"""
-    global _embed_available
-    _embed_available = False
 
 # ═══════════════════════════════════════════════════════════
 # 忽略规则（与 chat_client 的 list_files 保持一致）
@@ -295,45 +268,6 @@ def _scan_files(work_dir: str, max_files: int = 8000) -> list[Path]:
 
 
 # ═══════════════════════════════════════════════════════════
-# Embedding 调用
-# ═══════════════════════════════════════════════════════════
-
-def _batch_embed(texts: list[str]) -> list[list[float]] | None:
-    """调用 embedding API 生成向量"""
-    if not _is_embed_available():
-        return None
-
-    cfg = get_config()["embedding"]
-    from openai import OpenAI
-
-    try:
-        client = OpenAI(api_key=cfg["api_key"], base_url=cfg["api_base"])
-        resp = client.embeddings.create(model=cfg["model"], input=texts)
-        return [d.embedding for d in resp.data]
-    except Exception as e:
-        _mark_embed_unavailable()
-        logger.info(f"embedding 不可用，将使用关键词匹配: {e}")
-        return None
-
-
-# ═══════════════════════════════════════════════════════════
-# 余弦相似度（用 numpy 或纯 Python）
-# ═══════════════════════════════════════════════════════════
-
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    try:
-        import numpy as np
-        va = np.array(a)
-        vb = np.array(b)
-        return float(np.dot(va, vb) / (np.linalg.norm(va) * np.linalg.norm(vb)))
-    except ImportError:
-        dot = sum(x * y for x, y in zip(a, b))
-        na = sum(x * x for x in a) ** 0.5
-        nb = sum(y * y for y in b) ** 0.5
-        return dot / (na * nb) if na and nb else 0.0
-
-
-# ═══════════════════════════════════════════════════════════
 # Git 自动忽略
 # ═══════════════════════════════════════════════════════════
 
@@ -348,7 +282,7 @@ def _ensure_gitignore(work_dir: str = "."):
         gitignore.write_text(".patchflow/\n", encoding="utf-8")
         logger.info("已创建 .gitignore 并添加 .patchflow/")
         return
-    content = gitignore.read_text(encoding="utf-8")
+    content = gitignore.read_text(encoding="utf-8", errors="replace")
     for line in content.split("\n"):
         if line.strip() == ".patchflow/" or line.strip() == ".patchflow":
             return
@@ -369,7 +303,6 @@ class CodebaseIndex:
         self.index_dir = Path(work_dir) / ".patchflow" / "index"
         self.index_path = self.index_dir / "files.json"
         self._entries: dict[str, dict] = {}
-        self._embeddings: dict[str, list[float]] = {}
         self._built = False
 
     def is_built(self) -> bool:
@@ -377,47 +310,12 @@ class CodebaseIndex:
             return True
         return self.index_path.exists()
 
-    def _embed_path(self) -> Path:
-        return self.index_dir / "embeddings.npy"
-
-    def _embed_paths_path(self) -> Path:
-        return self.index_dir / "embed_paths.json"
-
-    def _save_embeddings(self, file_paths: list[str], embeddings_list: list[list[float]]):
-        """保存 embedding 到二进制文件"""
-        if not embeddings_list:
-            return
-        self.index_dir.mkdir(parents=True, exist_ok=True)
-        import numpy as np
-        arr = np.array(embeddings_list, dtype=np.float32)
-        np.save(str(self._embed_path()), arr)
-        self._embed_paths_path().write_text(
-            json.dumps(file_paths, ensure_ascii=False), encoding="utf-8"
-        )
-        logger.info(f"保存 embedding: {arr.shape} → {self._embed_path().name}")
-
-    def _load_embeddings(self) -> dict[str, list[float]]:
-        """从二进制文件加载 embedding"""
-        npy = self._embed_path()
-        pjson = self._embed_paths_path()
-        if not npy.exists() or not pjson.exists():
-            return {}
-        try:
-            import numpy as np
-            arr = np.load(str(npy))
-            paths: list[str] = json.loads(pjson.read_text(encoding="utf-8"))
-            return {p: arr[i].tolist() for i, p in enumerate(paths) if i < len(arr)}
-        except Exception as e:
-            logger.warn(f"加载 embedding 失败: {e}")
-            return {}
-
     def load(self) -> bool:
         if not self.index_path.exists():
             return False
         try:
-            data = json.loads(self.index_path.read_text(encoding="utf-8"))
+            data = json.loads(self.index_path.read_text(encoding="utf-8", errors="replace"))
             self._entries = data.get("files", {})
-            self._embeddings = self._load_embeddings()
             self._built = True
             return True
         except (json.JSONDecodeError, OSError):
@@ -426,7 +324,7 @@ class CodebaseIndex:
     def build(self, force: bool = False,
               max_files: int = 5000, max_file_size: int = 200_000,
               max_seconds: int = 30) -> int:
-        """扫描项目 → 提取符号 → 生成 embedding → 持久化
+        """扫描项目 → 提取符号 → 持久化
 
         Args:
             force: 强制重建
@@ -447,8 +345,6 @@ class CodebaseIndex:
         logger.info(f"发现 {len(files)} 个文件 (limit={max_files})")
 
         entries: dict[str, dict] = {}
-        summaries: list[str] = []
-        file_paths: list[str] = []
         skipped_large = 0
         skipped_timeout = False
 
@@ -478,8 +374,6 @@ class CodebaseIndex:
                 "symbols": symbols,
                 "summary": summary,
             }
-            summaries.append(summary)
-            file_paths.append(key)
 
         if skipped_large:
             logger.info(f"跳过 {skipped_large} 个大文件 (> {max_file_size // 1000}KB)")
@@ -491,19 +385,11 @@ class CodebaseIndex:
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         _ensure_gitignore(str(self.work_dir))
 
-        if summaries:
-            embeddings_list = _batch_embed(summaries)
-            if embeddings_list:
-                self._embeddings = dict(zip(file_paths, embeddings_list))
-                self._save_embeddings(file_paths, embeddings_list)
-                logger.info(f"生成 {len(embeddings_list)} 个 embedding")
-
         self._entries = entries
         self._built = True
 
-        # files.json 只存文本元数据，不含 embedding 向量
         data = {
-            "files": {k: {kk: vv for kk, vv in v.items() if kk != "embedding"} for k, v in entries.items()},
+            "files": entries,
             "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "file_count": len(entries),
         }
@@ -514,35 +400,62 @@ class CodebaseIndex:
         return len(entries)
 
     def search_files(self, query: str, top_k: int = 10) -> list[dict]:
-        """语义搜索：返回最相关的文件列表"""
+        """LLM 语义排序：返回最相关的文件列表"""
         if not self._entries:
             if not self.load():
                 return []
 
-        has_embeddings = _is_embed_available() and bool(self._embeddings)
+        cfg = get_config()
+        if not cfg.get("api_key"):
+            return []
 
-        if has_embeddings:
-            emb_list = _batch_embed([query])
-            if emb_list:
-                query_vec = emb_list[0]
-                scored = []
-                for key, entry in self._entries.items():
-                    emb = self._embeddings.get(key)
-                    if not emb:
-                        continue
-                    score = _cosine_similarity(query_vec, emb)
-                    scored.append((score, entry))
-                scored.sort(key=lambda x: x[0], reverse=True)
-                results = [entry for _, entry in scored[:top_k]]
-                return results
+        # 构建文件摘要列表供 LLM 排序
+        items = list(self._entries.items())
+        if len(items) <= top_k:
+            return [entry for _, entry in items]
 
-        query_lower = query.lower()
-        fallback = []
-        for key, entry in self._entries.items():
-            text = (entry["summary"] + " " + " ".join(entry.get("symbols", []))).lower()
-            if any(term in text for term in query_lower.split()) or query_lower in entry["path"].lower():
-                fallback.append(entry)
-        return fallback[:top_k]
+        from openai import OpenAI
+
+        file_lines = []
+        for i, (_, entry) in enumerate(items):
+            file_lines.append(f"{i}: {entry['summary']}")
+
+        prompt = (
+            f'Query: "{query}"\n\n'
+            f"Files:\n" + "\n".join(file_lines) + "\n\n"
+            f"Return the indices of the top {top_k} most relevant files, comma-separated, on a single line."
+        )
+
+        client = OpenAI(api_key=cfg["api_key"], base_url=cfg["api_base"])
+        resp = client.chat.completions.create(
+            model=cfg["model"],
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+            temperature=0,
+        )
+        content = resp.choices[0].message.content.strip()
+
+        # 解析 LLM 返回的索引
+        indices = [int(n) for n in re.findall(r"\d+", content) if int(n) < len(items)]
+        seen = set()
+        ranked = []
+        for idx in indices:
+            if idx not in seen:
+                seen.add(idx)
+                ranked.append(items[idx][1])
+                if len(ranked) >= top_k:
+                    break
+
+        # LLM 没返回足够结果时，按原始顺序补齐
+        if len(ranked) < top_k:
+            for i, (_, entry) in enumerate(items):
+                if i not in seen:
+                    ranked.append(entry)
+                    seen.add(i)
+                    if len(ranked) >= top_k:
+                        break
+
+        return ranked
 
     def get_file_meta(self, filepath: str) -> dict | None:
         key = filepath.replace("\\", "/")

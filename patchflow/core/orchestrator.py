@@ -146,16 +146,18 @@ class Orchestrator:
             logger.error("代码生成失败，终止")
             return False
 
+        from patchflow.core.fs import relative_path
+        target_files = [relative_path(self.work_dir, f["file"]) for f in files]
+        self.state["snapshot_id"] = self.snapshot.save(target_files)
+        original_files = {}
+        for f in target_files:
+            p = Path(self.work_dir) / f
+            original_files[f] = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
+
         written = write_files(files, work_dir=self.work_dir)
         self.state["files_written"] = written
 
         # ── Phase 2: 保存快照（记录原始文件内容，用于后续 diff 和回滚）──
-        self.state["snapshot_id"] = self.snapshot.save(written)
-        original_files = {}
-        for f in written:
-            p = Path(f)
-            if p.exists():
-                original_files[f] = p.read_text(encoding="utf-8")
 
         # ── Phase 3: 验证 + 修复循环（核心逻辑）──
         # 循环条件：熔断器 turn < max_retries
@@ -362,7 +364,8 @@ class Orchestrator:
         """生成修复前后的 diff 报告"""
         self._diff_report = []
         for filepath, original in original_files.items():
-            current = Path(filepath).read_text(encoding="utf-8") if Path(filepath).exists() else ""
+            current_path = Path(self.work_dir) / filepath
+            current = current_path.read_text(encoding="utf-8", errors="replace") if current_path.exists() else ""
             diff = diff_text(original, current, context_lines=2)
             if diff.strip():
                 summary = format_summary(diff)

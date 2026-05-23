@@ -1,10 +1,4 @@
-"""验证系统 — 判断代码是否"真的可用"（多语言）
-
-这是 PatchFlow 的核心质量关卡。LLM 输出的代码"看起来对"不算数，
-必须真正跑起来通过验证。
-
-所有语言相关的验证逻辑已迁移至 LanguageStrategy 子类中。
-"""
+"""Validation entry point for project code."""
 
 from pathlib import Path
 
@@ -14,37 +8,47 @@ from patchflow.utils import logger
 
 
 class ValidationResult:
-    """验证结果"""
-    def __init__(self, ok: bool, error: ParsedError | None = None,
-                 message: str = "", language: str = ""):
-        self.ok = ok
+    """Result of a validation attempt.
+
+    status values:
+    - passed: validation ran and succeeded
+    - failed: validation ran and failed
+    - skipped: validation was intentionally skipped by a language strategy
+    - unsupported: no suitable validator could be selected
+    """
+
+    def __init__(self, ok: bool | None = None, error: ParsedError | None = None,
+                 message: str = "", language: str = "", status: str | None = None):
+        self.status = status or ("passed" if ok else "failed")
+        self.ok = self.status == "passed"
         self.error = error
         self.message = message
         self.language = language
 
     def __repr__(self):
-        return f"ValidationResult(ok={self.ok}, lang={self.language})"
+        return f"ValidationResult(status={self.status}, lang={self.language})"
 
 
 def detect_project_type(work_dir: str = ".") -> str:
-    """检测项目类型（基于 LanguageFactory 自动检测）"""
     factory = LanguageFactory()
     strategy = factory.detect(work_dir)
     return strategy.name if strategy else "unknown"
 
 
 def validate(work_dir: str = ".") -> ValidationResult:
-    """对工作目录中的代码执行验证
-
-    自动检测项目类型，通过 LanguageStrategy 多态分发到对应语言验证器。
-    """
+    """Validate code in work_dir via the detected language strategy."""
     wd = str(Path(work_dir).resolve())
     factory = LanguageFactory()
     strategy = factory.detect(wd)
 
     if strategy is None:
-        logger.info("项目类型: unknown，无法确定语言，跳过验证")
-        return ValidationResult(ok=True, message="未知项目类型，跳过验证", language="unknown")
+        logger.info("Project type: unknown; validation unsupported")
+        return ValidationResult(
+            status="unsupported",
+            message="Unknown project type; validation unsupported",
+            language="unknown",
+        )
 
-    logger.info(f"项目类型: {strategy.name}，使用 {strategy.run_command or strategy.compile_command or 'N/A'} 验证")
+    command = strategy.run_command or strategy.compile_command or "N/A"
+    logger.info(f"Project type: {strategy.name}; validator: {command}")
     return strategy.validate(wd)
