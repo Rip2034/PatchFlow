@@ -6,7 +6,9 @@ AI 可以直接 write_file，read，edit_file，run_code，list，search，grep�
 
 import json
 import os
+import queue
 import re
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -63,11 +65,9 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "files": {
-                        "anyOf": [
-                            {"type": "string", "description": "单个文件路径"},
-                            {"type": "array", "items": {"type": "string"}, "description": "多个文件路径"}
-                        ],
-                        "description": "要读取的文件路径，如 'app.py' 或 ['app.py', 'utils.py']"
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "要读取的文件路径。单个文件也放数组里，如 ['app.py'] 或 ['app.py', 'utils.py']"
                     },
                     "offset": {"type": "integer", "description": "起始行号（0-based），默认 0，仅单文件时有效"},
                     "limit": {"type": "integer", "description": "最大读取行数，默认全部（大文件自动截断）"},
@@ -200,6 +200,17 @@ TOOLS = [
 SYSTEM_PROMPT = (
     "You are PatchFlow, an AI coding assistant.\n"
     "You have tools: write_file, read, delete_file, rename_file, run_code, list, search, review_code, generate_image.\n\n"
+    "MANDATORY TOOL USAGE — NEVER respond with text describing what you would do.\n"
+    "ALWAYS call the appropriate tool instead. Act first, explain after.\n"
+    "  - 'view project structure' / 'show me the project' → list(path='.', max_depth=2)\n"
+    "  - 'read X file' / 'show me the code' → read(files=['path/to/file'])\n"
+    "  - 'search for X' / 'find where X is used' → search(query='X')\n"
+    "  - 'create X' / 'write X' / 'add a feature' / 'fix the bug' → read first, then write_file\n"
+    "  - 'run X' / 'execute' / 'test' / 'install' → run_code(command='...')\n"
+    "  - 'review X' / 'check the code' / 'any issues with' → review_code(filepath='...')\n"
+    "  - 'delete X' / 'remove X file' → delete_file(filename='...')\n"
+    "  - 'rename X' / 'move X to Y' → rename_file(source='...', dest='...')\n"
+    "  - 'generate an image of X' / 'draw X' → generate_image(prompt='...', filename='...')\n\n"
     "CRITICAL — READ BEFORE RESPONDING:\n"
     "When a user message contains tool_result blocks, those are the output of "
     "tools you just called. Your reply MUST be based on what those results ACTUALLY show.\n"
@@ -635,22 +646,9 @@ _image_api_base = ""
 
 
 def _print_colored_diff(diff_lines: list[str]):
-    """用 Rich 颜色输出 diff — 高对比度，Windows 终端友好"""
-    from rich.console import Console as _RC
-    _rc = _RC()
-    for line in diff_lines:
-        if line.startswith("+") and not line.startswith("+++"):
-            _rc.print(f"  [bold green]■ {line}[/bold green]")
-        elif line.startswith("-") and not line.startswith("---"):
-            _rc.print(f"  [bold red]─ {line}[/bold red]")
-        elif line.startswith("---"):
-            _rc.print(f"  [bold white]{line}[/bold white]")
-        elif line.startswith("+++"):
-            _rc.print(f"  [bold white]{line}[/bold white]")
-        elif line.startswith("@@"):
-            _rc.print(f"  [bold cyan]{line}[/bold cyan]")
-        else:
-            _rc.print(f"  [dim]{line}[/dim]")
+    """用 Rich 颜色输出 diff — 委托给 patchflow.utils.diff"""
+    from patchflow.utils.diff import print_colored_diff
+    print_colored_diff(diff_lines)
 
 
 def set_image_client(client, model_name: str, provider: str, api_key: str = "", api_base: str = ""):
@@ -678,7 +676,7 @@ _STRONG_MODEL_PATTERNS = [
     # Anthropic
     "claude-4", "claude-opus-4", "claude-sonnet-4", "claude-3.5", "claude-3-5",
     # OpenAI
-    "gpt-4", "gpt-4o", "gpt-4.1", "gpt-4-", "o1", "o3", "o4",
+    "gpt-5", "gpt-4", "gpt-4o", "gpt-4.1", "gpt-4-", "o1", "o3", "o4",
     # Image generation models
     "gpt-image", "dall-e",
     # DeepSeek V3/R1/V4 系列（在 tool calling benchmark 中表现优秀）
@@ -1887,21 +1885,66 @@ class ChatClient:
         text_parts = []
         tool_calls_acc: dict[int, dict] = {}
         usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        use_stream_options = True  # 第一次尝试带 stream_options
+        use_tool_choice = True     # 第一次尝试带 tool_choice
 
         for retry in range(3):
             try:
                 stream_deadline = time.time() + 300
-                response = self._openai.chat.completions.create(
+                kwargs = dict(
                     model=self.model,
                     messages=api_messages,
                     tools=TOOLS,
-                    tool_choice="auto",
                     max_tokens=8192,
                     stream=True,
-                    stream_options={"include_usage": True},
+                    temperature=0.1,
                 )
+                if use_tool_choice:
+                    kwargs["tool_choice"] = "auto"
+                if use_stream_options:
+                    kwargs["stream_options"] = {"include_usage": True}
 
-                for chunk in response:
+                response = self._openai.chat.completions.create(**kwargs)
+
+                # 用独立线程消费流，主线程轮询 _CANCELLED 实现可中断的流式读取
+                # Windows 上 Ctrl+C 不会立即中断 socket read，必须用 response.close() 强制断开
+                chunks: list = []
+                stream_error: list[BaseException | None] = [None]
+                stream_done = threading.Event()
+
+                def _consume():
+                    try:
+                        for chunk in response:
+                            chunks.append(chunk)
+                    except BaseException as e:
+                        stream_error[0] = e
+                    finally:
+                        stream_done.set()
+
+                consumer = threading.Thread(target=_consume, daemon=True)
+                consumer.start()
+
+                try:
+                    while not stream_done.is_set():
+                        consumer.join(timeout=0.2)
+                        from patchflow.utils.runner import _CANCELLED
+                        if _CANCELLED.is_set():
+                            try:
+                                response.close()
+                            except Exception:
+                                pass
+                            consumer.join(timeout=2)
+                            return "", [], usage
+                finally:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+
+                if stream_error[0] is not None:
+                    raise stream_error[0]
+
+                for chunk in chunks:
                     if time.time() > stream_deadline:
                         logger.warn("OpenAI streaming total time > 300s, discarding partial tool calls")
                         tool_calls_acc.clear()
@@ -1950,8 +1993,20 @@ class ChatClient:
                 logger.error(f"API 返回数据含非法字节: pos={e.start}-{e.end}, reason={e.reason}")
                 return error_msg, [], usage
             except Exception as e:
-                err_str = str(e)
-                is_rate_limit = "429" in err_str or "rate" in err_str.lower()
+                err_str = str(e).lower()
+                # 端点不支持 stream_options → 重试但不带 stream_options
+                if use_stream_options and ("stream_options" in err_str or "include_usage" in err_str):
+                    use_stream_options = False
+                    logger.warn("API 不支持 stream_options，关闭后重试...")
+                    time.sleep(1)
+                    continue
+                # 端点不支持 tool_choice → 重试但不带 tool_choice
+                if use_tool_choice and ("tool_choice" in err_str or "tool_choice" in err_str):
+                    use_tool_choice = False
+                    logger.warn("API 不支持 tool_choice，关闭后重试...")
+                    time.sleep(1)
+                    continue
+                is_rate_limit = "429" in err_str or "rate" in err_str
                 if is_rate_limit and retry < 2:
                     wait = _extract_retry_seconds(err_str) or (2 ** retry) * 5
                     logger.warn(f"API 限流，{wait:.1f}s 后重试 ({retry + 1}/3)...")
@@ -1963,6 +2018,16 @@ class ChatClient:
 
         final_text = "".join(text_parts).strip()
         final_tcs = list(tool_calls_acc.values()) if tool_calls_acc else []
+
+        # 如果 API 没返回 usage 数据（部分端点不支持 stream_options），用字符数估算
+        if usage["total_tokens"] == 0 and final_text:
+            est_input = sum(len(m.get("content", "")) if isinstance(m.get("content"), str) else 0 for m in api_messages) // 4
+            est_output = len(final_text) // 4
+            for tc in final_tcs:
+                est_output += len(tc.get("function", {}).get("arguments", "")) // 4
+            usage = {"input_tokens": est_input, "output_tokens": est_output,
+                     "total_tokens": est_input + est_output, "_estimated": True}
+            logger.debug(f"Token 用量未返回，已估算: {est_input}+{est_output}")
 
         return final_text, final_tcs, usage
 

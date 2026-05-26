@@ -70,6 +70,7 @@ HELP_TEXT = """[bold bright_white]可用命令:[/bold bright_white]
   [cyan]/init[/cyan]    创建项目规则文件 (.patchflow/rules.md)
   [cyan]/stop[/cyan]    停止后台进程，如 /stop 2
   [cyan]/ps[/cyan]      查看所有后台进程
+  [cyan]/drop[/cyan]    忽略当前剪贴板图片（不再随消息发送）
 
 直接输入任意内容即进入对话模式。"""
 
@@ -296,7 +297,7 @@ class REPL:
             "  Run [bold]/init[/bold] to create instructions for PatchFlow in your project\n"
             "  Run [bold]/ps[/bold] to see running servers, [bold]/stop <pid>[/bold] to stop them\n"
             "  Run [bold]/memory[/bold] to check memory status\n"
-            "  Screenshots in clipboard are auto-attached to your message\n"
+            "  Screenshots in clipboard are auto-attached. Type [bold]/drop[/bold] to dismiss.\n"
             f"  [dim]{'-' * (inner_w - 4)}[/dim]\n"
             "  [bold]What's new[/bold]\n"
             "  Check the changelog for updates\n"
@@ -308,6 +309,18 @@ class REPL:
 
         while True:
             try:
+                # 每次显示提示符前检查剪贴板，首次检测到图片时提示 /drop
+                try:
+                    from patchflow.core.multimodal import _has_clipboard_image
+                    if _has_clipboard_image():
+                        if not getattr(self, "_clip_hint_shown", False):
+                            self._clip_hint_shown = True
+                            console.print("[dim]检测到剪贴板图片，输入 [bold]/drop[/bold] 可忽略[/dim]")
+                    else:
+                        self._clip_hint_shown = False
+                except ImportError:
+                    pass
+
                 user_input = self._read_input()
                 if user_input is None:
                     self._do_exit()
@@ -340,17 +353,26 @@ class REPL:
                 self._do_exit()
                 return
 
+    def _input_prompt(self) -> str:
+        try:
+            from patchflow.core.multimodal import _has_clipboard_image
+            if _has_clipboard_image():
+                return "\033[36mPatchFlow >>\033[0m \033[33m[img]\033[0m "
+        except ImportError:
+            pass
+        return "\033[36mPatchFlow >>\033[0m "
+
     def _read_input(self) -> str | None:
         try:
             import msvcrt
         except ImportError:
             try:
-                line = input("\033[36mPatchFlow >>\033[0m ")
+                line = input(self._input_prompt())
                 return line
             except (KeyboardInterrupt, EOFError):
                 return None
 
-        prompt_str = "\033[36mPatchFlow >>\033[0m "
+        prompt_str = self._input_prompt()
 
         def _width(s: str) -> int:
             return sum(2 if ord(c) > 0x2e80 else 1 for c in s)
@@ -367,6 +389,7 @@ class REPL:
 
         def _redraw():
             """单次重绘输入行，长文本在光标附近截断显示，换行符显示为 ↵"""
+            nonlocal prompt_str
             raw = "".join(chars)
             text = _visible(raw)
             w = _width(text)
@@ -431,6 +454,15 @@ class REPL:
         last_w = 0
         sys.stdout.write(prompt_str)
         sys.stdout.flush()
+
+        # 提示符显示后短暂延迟，捕获显示前瞬间复制的图片
+        time.sleep(0.15)
+        new_prompt = self._input_prompt()
+        if new_prompt != prompt_str:
+            prompt_str = new_prompt
+            _clear_line()
+            sys.stdout.write(prompt_str)
+            sys.stdout.flush()
 
         def _is_paste_context() -> bool:
             """\r/\n 后短暂等待，判断是否粘贴流中的换行"""
@@ -619,6 +651,10 @@ class REPL:
             self._cmd_stop(arg)
         elif cmd == "/ps":
             self._cmd_ps()
+        elif cmd == "/drop":
+            from patchflow.core.multimodal import _dismiss_clipboard
+            _dismiss_clipboard()
+            console.print("[green]已忽略当前剪贴板图片，新截图会重新检测[/green]")
         else:
             return False, False  # 非已知命令 → 回退为对话输入
 
@@ -995,7 +1031,7 @@ class REPL:
         )
 
         orch = AgentOrchestrator(model=self.model, work_dir=".")
-        success = orch.run(bb)
+        success = orch.run(bb, use_live=True)
 
         if success:
             console.print(f"  [green]  ✅ 多 Agent 修复成功 (共 {orch.turn_count} 步)[/green]")
@@ -1234,7 +1270,7 @@ class REPL:
         try:
             from patchflow.core.agent_orchestrator import AgentOrchestrator
             orch = AgentOrchestrator(model=self.model, work_dir=".")
-            success = orch.run_from_task(task)
+            success = orch.run_from_task(task, use_live=True)
             if success:
                 console.print(f"[green]✓ 多 Agent 协作修复成功 (共 {orch.turn_count} 步)[/green]")
             else:

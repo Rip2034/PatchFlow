@@ -107,29 +107,67 @@ def load_image_file(path: str | Path) -> ImageContent:
 
 # ── 剪贴板 ────────────────────────────────────────────
 
+MIN_CLIPBOARD_PIXELS = 200 * 200  # 跳过小于此尺寸的剪贴板图片（大概率是残留数据）
+
+# 剪贴板去重：同一张图不再重复发送
+_last_clipboard_hash: str | None = None
+# 用户已主动忽略的图片 hash（/drop 命令），直到剪贴板出现新图才清除
+_dismissed_clipboard_hash: str | None = None
+
+
+def _reset_clipboard_cache() -> None:
+    """重置剪贴板缓存（切换对话后调用）"""
+    global _last_clipboard_hash, _dismissed_clipboard_hash
+    _last_clipboard_hash = None
+    _dismissed_clipboard_hash = None
+
+
+def _dismiss_clipboard() -> None:
+    """忽略当前剪贴板图片（/drop 命令），新截图会重新检测"""
+    global _dismissed_clipboard_hash
+    import hashlib
+    from PIL import Image, ImageGrab
+    try:
+        img = ImageGrab.grabclipboard()
+        if isinstance(img, Image.Image):
+            from io import BytesIO
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            _dismissed_clipboard_hash = hashlib.sha256(buf.getvalue()).hexdigest()
+    except Exception as e:
+        logger.debug(f"[multimodal] dismiss clipboard failed: {e}")
+        _dismissed_clipboard_hash = "__drop__"
+
+
 def _has_clipboard_image() -> bool:
-    """快速检查剪贴板是否有图片，不做完整加载"""
+    """检查剪贴板是否有未被忽略的图片"""
     try:
         from PIL import Image, ImageGrab
     except ImportError:
         return False
     try:
         img = ImageGrab.grabclipboard()
-        return isinstance(img, Image.Image)
-    except Exception:
+        if not isinstance(img, Image.Image):
+            return False
+        w, h = img.size
+        if w * h < MIN_CLIPBOARD_PIXELS:
+            return False
+        # 检查是否为用户已忽略的图片
+        global _dismissed_clipboard_hash
+        if _dismissed_clipboard_hash is not None:
+            import hashlib
+            from io import BytesIO
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            cur_hash = hashlib.sha256(buf.getvalue()).hexdigest()
+            if cur_hash == _dismissed_clipboard_hash:
+                return False
+            # 剪贴板内容已变化，清除忽略标记
+            _dismissed_clipboard_hash = None
+        return True
+    except Exception as e:
+        logger.debug(f"[multimodal] _has_clipboard_image failed: {e}")
         return False
-
-
-MIN_CLIPBOARD_PIXELS = 200 * 200  # 跳过小于此尺寸的剪贴板图片（大概率是残留数据）
-
-# 剪贴板去重：同一张图不再重复发送
-_last_clipboard_hash: str | None = None
-
-
-def _reset_clipboard_cache() -> None:
-    """重置剪贴板缓存（切换对话后调用）"""
-    global _last_clipboard_hash
-    _last_clipboard_hash = None
 
 
 def _grab_clipboard_image() -> ImageContent | None:
@@ -142,17 +180,20 @@ def _grab_clipboard_image() -> ImageContent | None:
 
     try:
         img = ImageGrab.grabclipboard()
-    except Exception:
+    except Exception as e:
+        logger.debug(f"[multimodal] grabclipboard() 异常: {e}")
         return None
 
     if img is None:
+        logger.info("[multimodal] 剪贴板无图片数据 (grabclipboard 返回 None)")
         return None
     if not isinstance(img, Image.Image):
+        logger.info(f"[multimodal] 剪贴板内容非图片 ({type(img).__name__})")
         return None
 
     w, h = img.size
     if w * h < MIN_CLIPBOARD_PIXELS:
-        logger.debug(f"[multimodal] 忽略剪贴板小图 ({w}x{h}，< {MIN_CLIPBOARD_PIXELS}px)")
+        logger.info(f"[multimodal] 忽略剪贴板小图 ({w}x{h}px，< {MIN_CLIPBOARD_PIXELS}px)")
         return None
 
     if w * h > MAX_IMAGE_PIXELS:
@@ -172,11 +213,11 @@ def _grab_clipboard_image() -> ImageContent | None:
     import hashlib
     img_hash = hashlib.sha256(data).hexdigest()
     if img_hash == _last_clipboard_hash:
-        logger.debug(f"[multimodal] 剪贴板图片未变化，跳过 ({w}x{h})")
+        logger.info(f"[multimodal] 剪贴板图片未变化，跳过 ({w}x{h}，hash 去重)")
         return None
     _last_clipboard_hash = img_hash
 
-    logger.info(f"[multimodal] 从剪贴板获取图片: {w}x{h}")
+    logger.info(f"[multimodal] 从剪贴板获取图片: {w}x{h}, {len(data) // 1024}KB")
     return ImageContent(data=data, media_type="image/png")
 
 
@@ -210,6 +251,11 @@ def _extract_images(text: str, work_dir: Path) -> tuple[str, list[ImageContent]]
     img = _grab_clipboard_image()
     if img:
         images.append(img)
+
+    if images:
+        logger.info(f"[multimodal] 共加载 {len(images)} 张图片，将附加到输入中")
+    else:
+        logger.info("[multimodal] 未检测到图片")
 
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
     return cleaned, images
@@ -293,7 +339,7 @@ _VISION_MODEL_PATTERNS = [
     "claude-3", "claude-4",
     # OpenAI — 支持 vision 的模型
     "gpt-4o", "gpt-4-turbo", "gpt-4-vision", "gpt-4.1",
-    "o1", "o3", "o4",
+    "gpt-5", "o1", "o3", "o4",
     # Google
     "gemini",
     # 其他已知支持 vision 的

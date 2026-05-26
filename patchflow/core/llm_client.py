@@ -246,7 +246,7 @@ def _call_openai_compat(system_prompt, user_message, model, max_tokens, api_key,
                 model=model,
                 messages=messages,
                 max_tokens=max_tokens,
-                temperature=0.7,
+                temperature=0.1,
             )
         finally:
             done.set()

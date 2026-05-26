@@ -131,7 +131,8 @@ class AgentOrchestrator:
             self._agent_aliases[role] = agents_cfg.get(role)
         return self._agent_aliases[role]
 
-    def run_from_task(self, task: str, work_dir: str | None = None) -> bool:
+    def run_from_task(self, task: str, work_dir: str | None = None,
+                       use_live: bool | None = None) -> bool:
         """便捷方法：从任务描述直接启动多 Agent 修复
 
         自动收集项目上下文、读取代码文件、尝试运行获取错误信息，
@@ -140,6 +141,7 @@ class AgentOrchestrator:
         Args:
             task: 任务描述
             work_dir: 工作目录（默认使用初始化时设置的目录）
+            use_live: True → Live 仪表盘, False → Panel 模式, None → 自动检测
 
         Returns:
             True → 修复通过，False → 修复失败
@@ -195,9 +197,9 @@ class AgentOrchestrator:
 
         # 5. 执行多 Agent 修复
         logger.info(f"[AgentOrch] Blackboard 构建完成: {len(code)} files, error={len(error_text)} chars")
-        return self.run(bb)
+        return self.run(bb, use_live=use_live)
 
-    def run(self, blackboard) -> bool:
+    def run(self, blackboard, use_live: bool | None = None) -> bool:
         """执行完整的多 Agent 修复流程
 
         六个步骤的协作流程：
@@ -210,6 +212,7 @@ class AgentOrchestrator:
 
         Args:
             blackboard: Blackboard 实例（必须包含 task, context, code, error）
+            use_live: True → Live 仪表盘, False → Panel 模式, None → 自动检测
 
         Returns:
             True → 修复通过（verify() 成功）
@@ -230,8 +233,15 @@ class AgentOrchestrator:
         code_files = list(blackboard.get("code", {}).keys())
         files_preview = ", ".join(code_files[:5]) if code_files else "(none)"
 
-        # ── 初始化可视化面板（绑定 Blackboard 以实时显示 Agent 读写活动） ──
-        display = AgentPipelineDisplay(blackboard=blackboard)
+        # ── 初始化可视化面板（根据 use_live 选择 Live 或 Panel 模式）──
+        if use_live is None:
+            from patchflow.utils.live_dashboard import _detect_live_support
+            use_live = _detect_live_support()
+        if use_live:
+            from patchflow.utils.live_dashboard import LivePipelineDashboard
+            display = LivePipelineDashboard(blackboard=blackboard)
+        else:
+            display = AgentPipelineDisplay(blackboard=blackboard, use_rich=True)
         display.add_step("analyzer", analyzer_model,
                          detail=f"Task: {task_text}" if task_text else "")
         display.add_step("fixer", fixer_model,
@@ -543,5 +553,16 @@ class AgentOrchestrator:
                 if len(diff_lines) > 50:
                     diff = "\n".join(diff_lines[:50]) + f"\n... ({len(diff_lines) - 50} more lines)"
                 logger.info(f"[AgentOrch] --- {filepath} ({summary}) ---\n{diff}")
+                try:
+                    from patchflow.utils.diff import print_colored_diff
+                    from rich.console import Console as _RC
+                    import shutil
+                    w = min(shutil.get_terminal_size((80, 24)).columns, 100)
+                    c = _RC(width=w, emoji_variant="text")
+                    from rich.panel import Panel
+                    c.print(Panel(f"[bold]{filepath}[/bold] [dim]({summary})[/dim]", border_style="cyan"))
+                    print_colored_diff(diff_lines[:50])
+                except Exception:
+                    pass
             else:
                 logger.info(f"[AgentOrch] --- {filepath} (no changes) ---")

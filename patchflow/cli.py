@@ -53,6 +53,22 @@ def main(ctx: click.Context, model: str | None):
         start_repl(model=model)
 
 
+# 兼容 REPL 用户的斜杠命令习惯（patchflow /help、patchflow /chat）
+@main.command(name="/help", hidden=True)
+@click.pass_context
+def slash_help(ctx: click.Context):
+    """显示帮助信息（支持 /help 和 patchflow --help）"""
+    click.echo(ctx.parent.get_help())
+
+
+@main.command(name="/chat", hidden=True)
+@click.option("--model", "-m", default=None, help="使用的 LLM 模型")
+def slash_chat(model: str | None):
+    """进入 REPL（支持 /chat）"""
+    from patchflow.core.repl import start_repl
+    start_repl(model=model)
+
+
 # ═══════════════════════════════════════════════════════════
 # chat 命令 — 显式进入 REPL
 # ═══════════════════════════════════════════════════════════
@@ -535,6 +551,59 @@ def model_use(alias: str):
 
     if set_active_model(alias):
         logger.success(f"已切换到模型 [{alias}]")
+    else:
+        logger.error(f"模型 [{alias}] 不存在，先用 model add 添加")
+
+
+@model.command("rename")
+@click.argument("old_alias", type=str)
+@click.argument("new_alias", type=str)
+def model_rename(old_alias: str, new_alias: str):
+    """重命名模型别名
+
+    \b
+    示例:
+      patchflow model rename openai gpt-5.5
+    """
+    from patchflow.core.config import rename_model
+
+    if rename_model(old_alias, new_alias):
+        logger.success(f"已将 [{old_alias}] 重命名为 [{new_alias}]")
+    else:
+        logger.error(f"重命名失败: [{old_alias}] 不存在或 [{new_alias}] 已被占用")
+
+
+@model.command("edit")
+@click.argument("alias", type=str)
+@click.option("--provider", "-p", default="", help="厂商 (openai/anthropic/deepseek)")
+@click.option("--model", "-m", default="", help="模型名")
+@click.option("--key", "-k", default="", help="API Key")
+@click.option("--base", "-b", default="", help="API Base URL")
+def model_edit(alias: str, provider: str, model: str, key: str, base: str):
+    """编辑已有模型配置（只修改指定的字段）
+
+    \b
+    示例:
+      patchflow model edit my-gpt --model gpt-5.5
+      patchflow model edit my-gpt -m gpt-5.5 -p openai -b https://api.openai.com/v1
+    """
+    from patchflow.core.config import edit_model
+
+    if not any([provider, model, key, base]):
+        logger.error("至少指定一个要修改的字段: --provider, --model, --key, --base")
+        return
+
+    if edit_model(alias, provider=provider, model=model,
+                   api_key=key, api_base=base):
+        logger.success(f"已更新模型 [{alias}]")
+        if model:
+            logger.info(f"  模型名: {model}")
+        if provider:
+            logger.info(f"  厂商: {provider}")
+        if key:
+            logger.info(f"  Key:  {key[:10]}...")
+        if base:
+            logger.info(f"  Base: {base}")
     else:
         logger.error(f"模型 [{alias}] 不存在，先用 model add 添加")
 

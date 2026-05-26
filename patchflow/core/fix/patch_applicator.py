@@ -181,14 +181,14 @@ class PatchApplicator:
                         return True
 
                 # Strategy 5: too small to trust
-                if len_ratio < 0.2 and len(patch.new) < 200:
+                if len_ratio < 0.2 and len(patch.new) < 30:
                     logger.warn(f"Patcher 拒绝覆盖 {file_path}: 内容过小 ({len(patch.new)}B)")
                     return False
 
             # Strategy 6: fallback with last patch (safety-checked)
             last = patches[-1]
             final_ratio = len(last.new) / max(len(existing), 1)
-            if final_ratio < 0.2 and len(last.new) < 200:
+            if final_ratio < 0.2 and len(last.new) < 30:
                 logger.error(f"Patcher 拒绝兜底覆盖 {file_path}: 内容过小 ({len(last.new)}B, {final_ratio:.1%})")
                 return False
             if diff_tracker:

@@ -145,6 +145,67 @@ def remove_model(alias: str) -> bool:
     return True
 
 
+def edit_model(alias: str, provider: str = "", model: str = "",
+              api_key: str = "", api_base: str = "") -> bool:
+    """编辑已有模型配置，只更新传入的非空字段
+
+    兼容两种配置格式：
+      1. models dict:  user_cfg["models"][alias]  → 通过 model add 配置
+      2. flat format:  user_cfg["provider/model/api_key/api_base"] → 通过 config set 配置
+    """
+    user_path = _user_config_dir() / "config.json"
+    user_cfg = _load_json(user_path)
+    models = user_cfg.get("models", {})
+
+    if alias in models:
+        # models dict 格式
+        if provider:
+            models[alias]["provider"] = provider
+        if model:
+            models[alias]["model"] = model
+        if api_key:
+            models[alias]["api_key"] = api_key
+        if api_base:
+            models[alias]["api_base"] = api_base
+        user_cfg["models"] = models
+    elif alias == user_cfg.get("active", "") or alias == user_cfg.get("model", ""):
+        # 平铺格式：编辑当前活跃模型的配置项
+        if provider:
+            user_cfg["provider"] = provider
+        if model:
+            user_cfg["model"] = model
+        if api_key:
+            user_cfg["api_key"] = api_key
+        if api_base:
+            user_cfg["api_base"] = api_base
+    else:
+        return False
+
+    _save_json(user_path, user_cfg)
+    return True
+
+
+def rename_model(old_alias: str, new_alias: str) -> bool:
+    """重命名模型别名"""
+    user_path = _user_config_dir() / "config.json"
+    user_cfg = _load_json(user_path)
+    models = user_cfg.get("models", {})
+
+    if old_alias not in models:
+        return False
+    if new_alias in models:
+        return False  # 目标别名已存在
+
+    models[new_alias] = models.pop(old_alias)
+    user_cfg["models"] = models
+
+    if user_cfg.get("active") == old_alias:
+        user_cfg["active"] = new_alias
+
+    _save_json(user_path, user_cfg)
+    return True
+
+
 def set_active_model(alias: str) -> bool:
     """切换当前使用的模型"""
     user_path = _user_config_dir() / "config.json"

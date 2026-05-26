@@ -78,3 +78,25 @@ def format_summary(diff_text: str) -> str:
 def has_changes(old_text: str, new_text: str) -> bool:
     """快速检查是否有变更"""
     return old_text != new_text
+
+
+def print_colored_diff(diff_lines: list[str]):
+    """用 Rich 颜色输出 diff — 高对比度，Windows 终端友好
+
+    绿色新增行，红色删除行，青色 hunk header，灰色上下文。
+    """
+    from rich.console import Console as _RC
+    _rc = _RC()
+    for line in diff_lines:
+        if line.startswith("+") and not line.startswith("+++"):
+            _rc.print(f"  [bold green]■ {line}[/bold green]")
+        elif line.startswith("-") and not line.startswith("---"):
+            _rc.print(f"  [bold red]─ {line}[/bold red]")
+        elif line.startswith("---"):
+            _rc.print(f"  [bold white]{line}[/bold white]")
+        elif line.startswith("+++"):
+            _rc.print(f"  [bold white]{line}[/bold white]")
+        elif line.startswith("@@"):
+            _rc.print(f"  [bold cyan]{line}[/bold cyan]")
+        else:
+            _rc.print(f"  [dim]{line}[/dim]")

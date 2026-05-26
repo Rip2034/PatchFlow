@@ -132,11 +132,13 @@ class LanguageStrategy(ABC):
         return None
 
     def find_entry_file(self, work_dir: Path) -> Path | None:
-        """查找项目入口文件"""
+        """查找项目入口文件（跳过 node_modules 等依赖目录）"""
+        skip_dirs = {"node_modules", ".git", "__pycache__", "venv", ".venv", "dist", "build", ".next", ".nuxt"}
         for name in self.entry_points:
-            candidates = list(work_dir.rglob(name))
-            if candidates:
-                return candidates[0]
+            for candidate in work_dir.rglob(name):
+                if any(skip in candidate.parts for skip in skip_dirs):
+                    continue
+                return candidate
         return None
 
 
@@ -388,8 +390,9 @@ class JavaScriptStrategy(LanguageStrategy):
         # 回退 1：语法检查（node --check，快速且不依赖运行时环境）
         entry = self.find_entry_file(wd)
         if entry is not None:
-            logger.step(f"语法检查: node --check {entry.name}")
-            result = run(f"node --check {shlex.quote(entry.name)}", cwd=str(wd))
+            rel = str(entry.resolve().relative_to(wd.resolve()))
+            logger.step(f"语法检查: node --check {rel}")
+            result = run(f"node --check {shlex.quote(rel)}", cwd=str(wd))
             if result.ok:
                 logger.success("语法检查通过")
                 return ValidationResult(ok=True, language="javascript")
@@ -400,8 +403,9 @@ class JavaScriptStrategy(LanguageStrategy):
         entry = self.find_entry_file(wd)
         if entry is None:
             return ValidationResult(ok=False, error=parse("No entry file found for JavaScript"), language="javascript")
-        logger.step(f"验证入口文件: {entry.name}")
-        result = run(f"node {shlex.quote(entry.name)}", cwd=str(wd))
+        rel = str(entry.resolve().relative_to(wd.resolve()))
+        logger.step(f"验证入口文件: {rel}")
+        result = run(f"node {shlex.quote(rel)}", cwd=str(wd))
         if result.ok:
             logger.success("运行验证通过")
             return ValidationResult(ok=True, language="javascript")
@@ -448,6 +452,7 @@ class JavaScriptStrategy(LanguageStrategy):
 class TypeScriptStrategy(JavaScriptStrategy):
     name = "typescript"
     extensions = {".ts", ".tsx"}
+    project_files = ["tsconfig.json", "package.json"]
     entry_points = ["index.ts", "app.ts", "server.ts", "main.ts"]
     traceback_patterns = [
         re.compile(r'\s*at\s+(?:\w+\s+)?\(?(.+?):(\d+):(\d+)\)?'),
@@ -465,27 +470,50 @@ class TypeScriptStrategy(JavaScriptStrategy):
         from patchflow.utils.runner import run
 
         wd = Path(work_dir)
-        entry = self.find_entry_file(wd)
-        if entry is None:
-            return ValidationResult(ok=False, error=parse("No entry file found for TypeScript"), language="typescript")
-        logger.step(f"验证入口文件: {entry.name}")
+
+        # 优先使用 npm scripts（适用于 Vite/React/Vue 等前端项目）
+        pkg_json = wd / "package.json"
+        if pkg_json.exists():
+            try:
+                pkg = json.loads(pkg_json.read_text(encoding="utf-8", errors="replace"))
+                scripts = pkg.get("scripts", {})
+                candidates = [s for s in ("build", "type-check", "lint", "test") if s in scripts]
+                if candidates:
+                    last_error = None
+                    for script_name in candidates:
+                        logger.step(f"验证: npm run {script_name}")
+                        result = run(f"npm run {script_name}", cwd=str(wd), timeout=120)
+                        if result.ok:
+                            logger.success("运行验证通过")
+                            return ValidationResult(ok=True, language="typescript")
+                        error_text = result.stderr.strip() or result.stdout.strip() or f"exit={result.exit_code}"
+                        logger.warn(f"npm run {script_name} 失败: {error_text[:120]}")
+                        last_error = error_text
+                    logger.warn("所有 npm scripts 验证均失败，回退到 tsc")
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # 回退：tsc 编译检查
         if self.compile_command:
-            result = run(f"{self.compile_command} {shlex.quote(entry.name)}", cwd=str(wd))
-            if not result.ok:
-                error_text = result.stderr.strip() or result.stdout.strip() or "Compilation failed"
-                logger.error("编译验证失败")
-                return ValidationResult(
-                    ok=False, error=parse(error_text, lang_name="typescript"), language="typescript",
-                )
-        if self.run_command:
-            js_entry = entry.stem + ".js"
-            result = run(f"{self.run_command} {shlex.quote(js_entry)}", cwd=str(wd))
+            tsconfig = wd / "tsconfig.json"
+            if tsconfig.exists():
+                result = run(f"npx tsc --noEmit", cwd=str(wd))
+            else:
+                entry = self.find_entry_file(wd)
+                if entry is None:
+                    return ValidationResult(
+                        ok=False, error=parse("No entry file found for TypeScript"), language="typescript"
+                    )
+                rel = str(entry.resolve().relative_to(wd.resolve()))
+                result = run(f"npx tsc --noEmit {shlex.quote(rel)}", cwd=str(wd))
             if result.ok:
-                logger.success("运行验证通过")
+                logger.success("TypeScript 编译验证通过")
                 return ValidationResult(ok=True, language="typescript")
-            error_text = result.stderr.strip() or result.stdout.strip() or f"Runtime error (exit={result.exit_code})"
-            logger.error(f"运行验证失败 (exit={result.exit_code})")
-            return ValidationResult(ok=False, error=parse(error_text, lang_name="typescript"), language="typescript")
+            error_text = result.stderr.strip() or result.stdout.strip() or "Compilation failed"
+            logger.error("编译验证失败")
+            return ValidationResult(
+                ok=False, error=parse(error_text, lang_name="typescript"), language="typescript",
+            )
         return ValidationResult(ok=True, language="typescript")
 
 
@@ -844,11 +872,22 @@ class LanguageFactory:
             fast: 如果为 True，跳过 rglob 递归扫描（仅检查根目录的项目文件）
         """
         wd = Path(work_dir)
-        # 1. 按项目描述文件检测 (pom.xml → java, package.json → js/ts, etc.)
+        # 1. 按项目描述文件检测，收集所有匹配的策略
+        matches: list[tuple[str, int]] = []  # (name, specificity_score)
         for strategy in self._strategies.values():
             for pf in strategy.project_files:
                 if (wd / pf).exists():
-                    return strategy
+                    # specificity: 项目文件越具体（名字越长/越特殊），分数越高
+                    matches.append((strategy.name, len(pf)))
+                    break  # 一个策略只计一次
+        if matches:
+            # 优先 TypeScript 而非 JavaScript（TS 是 JS 的超集）
+            names = {m[0] for m in matches}
+            if "typescript" in names and "javascript" in names:
+                matches = [m for m in matches if m[0] != "javascript"]
+            # 选择最特异的匹配
+            matches.sort(key=lambda x: x[1], reverse=True)
+            return self._strategies.get(matches[0][0])
         if fast:
             return None
         # 2. 按源文件扩展名检测（启发式，可能很慢）
