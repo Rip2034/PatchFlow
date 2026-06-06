@@ -505,6 +505,19 @@ def _is_symbol_referenced(body: str, name: str) -> bool:
     """检查函数体中是否引用了某个符号名
 
     用词边界匹配，避免子串误匹配（如 'foo' 匹配 'foobar'）。
+
+    V0.5 fix: 先移除注释和字符串字面量，减少误报。
     """
+    # 移除字符串字面量（单/双引号，简单处理不处理嵌套转义）
+    cleaned = re.sub(r'"""[\s\S]*?"""', '', body)
+    cleaned = re.sub(r"'''[\s\S]*?'''", '', cleaned)
+    cleaned = re.sub(r'"[^"\n]*"', '""', cleaned)
+    cleaned = re.sub(r"'[^'\n]*'", "''", cleaned)
+    # 移除单行注释
+    cleaned = re.sub(r'#.*$', '', cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r'//.*$', '', cleaned, flags=re.MULTILINE)
+    # 移除块注释 /* ... */
+    cleaned = re.sub(r'/\*[\s\S]*?\*/', '', cleaned)
+
     pattern = rf'\b{re.escape(name)}\b'
-    return bool(re.search(pattern, body))
+    return bool(re.search(pattern, cleaned))

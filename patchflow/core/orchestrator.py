@@ -165,13 +165,38 @@ class Orchestrator:
         while self.breaker.turn < self.max_retries:
 
             # Step 1: 运行代码验证（真正执行，不是静态检查）
-            result = validate(work_dir=self.work_dir)
+            try:
+                result = validate(work_dir=self.work_dir)
+            except Exception as e:
+                logger.error(f"验证步骤异常: {e}")
+                from patchflow.core.fix.validator import ValidationResult
+                result = ValidationResult(
+                    ok=False, status="error",
+                    message=f"Validation raised exception: {e}",
+                )
 
             # 验证通过 → 提交快照、生成 diff 报告、成功结束
             if result.ok:
                 self.snapshot.commit(self.state["snapshot_id"])
                 self._generate_diff_report(original_files)
                 logger.success(f"验证通过！经过 {self.breaker.turn} 轮修复")
+
+                # V0.5: 修复后运行回归测试（仅在至少进行过一轮修复后）
+                if self.breaker.turn > 0:
+                    try:
+                        from patchflow.core.fix.test_runner import run_post_fix_validation
+                        test_result = run_post_fix_validation(
+                            work_dir=self.work_dir,
+                            analysis=analysis_dict,
+                            fixed_file=target_file,
+                            language=analysis.language,
+                        )
+                        logger.info(f"[Orch] 回归测试: {test_result.get('test_summary', '')}")
+                        if not test_result.get("existing_tests_ok", True):
+                            logger.warn("[Orch] 修复通过编译但已有测试失败，可能存在回归")
+                    except Exception as e:
+                        logger.debug(f"[Orch] 回归测试跳过: {e}")
+
                 if self._diff_report:
                     logger.info(f"  变更: {self.diff_summary}")
                 if self._budget:
@@ -209,6 +234,14 @@ class Orchestrator:
             scope_strategies = strategy_sequence(analysis.type)
             current_strategy_scope = self.state.get("strategy_level", 0)
 
+            # V0.5 修复: 错误类型变化时重置策略级别
+            prev_error_type = self.state.get("last_error_type", "")
+            if prev_error_type and prev_error_type != analysis.type:
+                logger.info(f"  错误类型变化 ({prev_error_type} → {analysis.type})，重置策略级别")
+                current_strategy_scope = 0
+                self.state["strategy_level"] = 0
+            self.state["last_error_type"] = analysis.type
+
             # 所有策略都已尝试过 → 放弃修复
             if current_strategy_scope >= len(scope_strategies):
                 logger.error("所有策略都已尝试，放弃修复")
@@ -244,7 +277,8 @@ class Orchestrator:
             logger.info(f"  ScopeCalculator: {scope_result.strategy} ({len(scope_result.files)} 文件)")
 
             # 选择具体的修复策略
-            strategy = select_strategy(analysis.type, impact_file_count=len(scope_result.files))
+            strategy = select_strategy(analysis.type, impact_file_count=len(scope_result.files),
+                                        memory_bank=self.memory_bank)
             strategy_name = f"{preferred_scope}/{strategy['scope']}"
             logger.info(f"  StrategySelector: {strategy['scope']} 范围")
 
@@ -273,13 +307,23 @@ class Orchestrator:
                 memory_context = "Similar past fixes:\n" + "\n".join(parts)
 
             # Step 5: 执行修复（Fixer）
-            # 多文件 scope 则用 fix_multi，否则用 fix（注入项目上下文 + Scope 硬约束）
+            # 多文件 scope 则用 fix_multi，否则用 fix（注入项目上下文 + Scope 硬约束 + 语义上下文 + 历史记忆）
+            # 构建 analysis dict 供 fixer 使用
+            analysis_dict = {
+                "error_type": analysis.type,
+                "root_cause": analysis.root_cause,
+                "impact_files": analysis.impact_files,
+                "language": analysis.language,
+            }
             if len(scope_result.files) > 1:
                 multi_changes = fix_multi(
                     error_text=analysis.raw,
                     scope_files=scope_result.files,
                     model=self.model,
                     project_context=context_prompt + ("\n" + memory_context if memory_context else ""),
+                    code_graph=self.code_graph,
+                    memory_bank=self.memory_bank,
+                    analysis=analysis_dict,
                 )
                 if multi_changes:
                     self.change_set.changes.clear()
@@ -300,9 +344,13 @@ class Orchestrator:
                     model=self.model,
                     scope=scope_result,
                     project_context=context_prompt + ("\n" + memory_context if memory_context else ""),
+                    code_graph=self.code_graph,
+                    memory_bank=self.memory_bank,
+                    analysis=analysis_dict,
                 )
                 if fix_result and apply_fix(fix_result, work_dir=self.work_dir):
                     fix_success = True
+                    # 记录 diff 变更
                     p = Path(target_file)
                     if p.exists():
                         try:
@@ -314,7 +362,30 @@ class Orchestrator:
                         except Exception:
                             pass
                 else:
-                    fix_success = False
+                    # V0.5: 完整文件修复失败 → 尝试 snippet 级修复
+                    logger.info("Fixer: 完整文件修复失败，尝试 snippet 修复...")
+                    from patchflow.core.fix.fixer import fix_snippets
+                    snippet_patches = fix_snippets(
+                        error_text=analysis.raw,
+                        file_path=target_file,
+                        model=self.model,
+                        diff_context=self.diff_tracker.get_diff_context(target_file),
+                        code_graph=self.code_graph,
+                        analysis=analysis_dict,
+                    )
+                    if snippet_patches:
+                        from patchflow.core.fix.patch_applicator import PatchApplicator, SnippetPatch
+                        sp_list = [SnippetPatch(
+                            file=p.get("file", target_file),
+                            old=p.get("old", ""),
+                            new=p.get("new", ""),
+                            reason=p.get("reason", ""),
+                        ) for p in snippet_patches]
+                        s_ok, s_fail = PatchApplicator.apply_all(sp_list, work_dir=self.work_dir,
+                                                                  diff_tracker=self.diff_tracker)
+                        fix_success = s_ok > 0
+                    else:
+                        fix_success = False
 
             # 修复失败 → 升级策略（尝试更广的修复范围）
             if not fix_success:
@@ -328,14 +399,14 @@ class Orchestrator:
                     file_paths=scope_result.files,
                     success=False, strategy_used=strategy_name,
                 )
-                if self.change_set._current_snapshot_id:
+                if self.change_set.is_active:
                     self.change_set.rollback()
                 else:
                     self.snapshot.rollback(self.state["snapshot_id"])
                 self.state["snapshot_id"] = self.snapshot.save(written)
                 continue
 
-            # 本轮修复成功 → 记录 memory，进入下一轮验证
+            # 本轮修复成功 → 记录 memory，提交快照和变更
             self.memory_bank.add(
                 error_type=analysis.type, root_cause=analysis.root_cause,
                 fix_pattern=f"fixed: {analysis.root_cause[:100]}",
@@ -343,7 +414,12 @@ class Orchestrator:
                 success=True, strategy_used=strategy_name,
             )
             self.memory_bank.save()
+            # V0.5 fix: 先提交快照（删除备份），再提交 ChangeSet
+            # 确保崩溃恢复时不会出现 ChangeSet 已提交但快照未提交的不一致
+            self.snapshot.commit(self.state["snapshot_id"])
             self.change_set.commit()
+            # 为下一轮创建新快照
+            self.state["snapshot_id"] = self.snapshot.save(written)
 
             self.state["turn"] += 1
             self.state["transition"] = "next_turn"

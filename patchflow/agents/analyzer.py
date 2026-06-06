@@ -1,21 +1,36 @@
-"""Analyzer Agent — 问题定位
+"""Analyzer Agent — 问题定位（V0.5 语义增强版）
 
 职责：只说问题在哪，不提修复方案。
 职责单一防止思维污染 —— 不知道谁修、怎么修。
 
+V0.5 增强：
+  - CodeGraph 语义上下文注入：调用链、符号信息、类型定义
+  - 更精确的根因定位：从"哪行出错"到"哪个函数、哪个变量、什么条件"
+  - 影响范围更准确：不只是文件列表，还有具体的函数/类
+
 输出格式统一用 schema.py 定义的标准合约。
 """
 
-from patchflow.agents.schema import ANALYZER_PROMPT, validate_analysis
+from patchflow.agents.schema import ANALYZER_PROMPT, ANALYZER_PROMPT_ENHANCED, validate_analysis
 from patchflow.core.llm_client import call_llm
 from patchflow.utils import logger
+
+
+def _build_semantic_analysis_context(blackboard) -> str:
+    """从 CodeGraph 构建语义分析上下文（委托给共享模块）"""
+    code_graph = getattr(blackboard, "code_graph", None)
+    if code_graph is None:
+        return ""
+    error_text = blackboard.get("error", "")
+    from patchflow.core.fix.semantic_context import build_context_from_error
+    return build_context_from_error(code_graph, error_text)
 
 
 def agent_analyze(blackboard, model: str | None = None, model_alias: str | None = None) -> dict:
     """Analyzer Agent：分析错误，定位根因
 
     Args:
-        blackboard: Blackboard 实例（包含 error, context, code）
+        blackboard: Blackboard 实例（包含 error, context, code，可选 code_graph）
         model: LLM 模型
         model_alias: 模型别名（如 "deepseek"、"claude"），指定后覆盖认证配置
 
@@ -40,6 +55,17 @@ def agent_analyze(blackboard, model: str | None = None, model_alias: str | None 
 
     code_context = blackboard.get_callchain_code()[:3000]
 
+    # ── V0.5 增强：CodeGraph 语义上下文 ──
+    semantic_context = ""
+    try:
+        semantic_context = _build_semantic_analysis_context(blackboard)
+        if semantic_context:
+            logger.info(f"[Agent Analyzer] 语义上下文注入 ({len(semantic_context)} 字符)")
+    except Exception as e:
+        logger.debug(f"[Agent Analyzer] 语义上下文构建跳过: {e}")
+
+    system_prompt = ANALYZER_PROMPT_ENHANCED if semantic_context else ANALYZER_PROMPT
+
     user_message = f"""Error Output:
 {blackboard["error"][:2000]}
 
@@ -49,11 +75,13 @@ Project Context:
 Relevant Code:
 {code_context or "(not available)"}
 
+{semantic_context}
+
 Analyze the error. Identify the programming language from the error and code above.
 Output ONLY the JSON."""
 
     result = call_llm(
-        system_prompt=ANALYZER_PROMPT,
+        system_prompt=system_prompt,
         user_message=user_message,
         model=model,
         model_alias=model_alias,

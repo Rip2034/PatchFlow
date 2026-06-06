@@ -203,24 +203,41 @@ class Blackboard:
                     parts.append(f"# === {filepath} ===\n{content}")
             return "\n\n".join(parts) if parts else "\n".join(self.data["code"].values())
 
-    def get_code(self, allowed_files: list[str]) -> str:
+    def get_code(self, allowed_files: list[str], max_per_file: int = 8000,
+                 max_total: int = 40000) -> str:
         """获取指定文件的代码（受策略限制）
 
         当 CodeGraph 可用时，在文件头添加符号索引，帮助 Fixer 快速定位。
+
+        V0.5: 增加文件大小限制，防止 token 溢出。
         """
         with self._lock:
             self._log("read", "code")
 
             parts = []
-            for filepath in allowed_files:
+            total = 0
+            for filepath in allowed_files[:15]:  # 最多 15 个文件
                 content = self.data["code"].get(filepath, "")
+                if not content:
+                    continue
+
+                # 截断过大的文件
+                if len(content) > max_per_file:
+                    content = content[:max_per_file] + "\n# ... (truncated)"
 
                 # 有 CodeGraph 时添加符号索引头
-                if self.code_graph is not None and content:
+                if self.code_graph is not None:
                     header = self._symbol_index(filepath)
-                    parts.append(f"# === {filepath} ===\n{header}\n{content}")
-                elif content:
-                    parts.append(f"# === {filepath} ===\n{content}")
+                    block = f"# === {filepath} ===\n{header}\n{content}"
+                else:
+                    block = f"# === {filepath} ===\n{content}"
+
+                if total + len(block) > max_total:
+                    parts.append(f"# ... (skipped, total > {max_total} chars)")
+                    break
+                parts.append(block)
+                total += len(block)
+
             return "\n\n".join(parts) if parts else "(no files available)"
 
     def get_semantic_chunks(self, file_rel: str, line: int = 0,

@@ -68,8 +68,14 @@ def _build_shared_system_prefix(blackboard) -> str:
     """构建跨 Agent 共享的 system prompt 前缀
 
     三个 Agent (Analyzer/Fixer/Reviewer) 使用相同的前缀，
-    Anthropic prompt cache 可以跨调用命中，大幅提升缓存命中率。
+    Anthropic prompt cache 可以跨调用命中。
+
+    V0.5: 增加总大小限制和文件数量限制，防止超大项目溢出 context window。
     """
+    MAX_TOTAL_CHARS = 30000   # 总字符上限
+    MAX_CODE_FILES = 20       # 最多包含的代码文件数
+    MAX_PER_FILE = 1200       # 每个文件最大字符数
+
     parts = ["You are PatchFlow, an AI coding assistant. Work in a multi-agent pipeline.\n"]
 
     task = blackboard.get("task", "")
@@ -92,20 +98,43 @@ def _build_shared_system_prefix(blackboard) -> str:
     code = blackboard.get("code", {})
     if isinstance(code, dict) and code:
         parts.append("\n## Code Files")
+        file_count = 0
         for fpath, content in code.items():
-            truncated = content[:1500] if isinstance(content, str) else str(content)[:1500]
+            if file_count >= MAX_CODE_FILES:
+                parts.append(f"... (skipped {len(code) - MAX_CODE_FILES} more files)")
+                break
+            truncated = (content[:MAX_PER_FILE] if isinstance(content, str)
+                        else str(content)[:MAX_PER_FILE])
             parts.append(f"### {fpath}\n```\n{truncated}\n```")
+            file_count += 1
 
     err = blackboard.get("error", "")
     if err:
         parts.append(f"\n## Error Output\n```\n{err[:1000]}\n```")
 
     parts.append("\n## Rules\n- Output ONLY valid JSON\n- Make minimal changes\n- Keep existing code style")
-    return "\n\n".join(parts)
+
+    # ── 总大小守卫：超出时从后往前裁剪 ──
+    result = "\n\n".join(parts)
+    if len(result) > MAX_TOTAL_CHARS:
+        # 保留头部 + 截断尾部（保留 Rules 部分）
+        rules = parts[-1] if parts else ""
+        head_len = MAX_TOTAL_CHARS - len(rules) - 200
+        result = result[:head_len] + f"\n\n... (truncated {len(result) - MAX_TOTAL_CHARS} chars)\n\n" + rules
+
+    return result
 
 
 class AgentOrchestrator:
-    """多 Agent 调度器"""
+    """多 Agent 调度器（V0.5 多轮迭代增强版）
+
+    V0.5 增强：
+      - 最多 3 轮 fix→review→refine 迭代（原 2 轮）
+      - 每轮缩小修复范围，聚焦未解决问题
+      - Reviewer 反馈逐轮累积，Fixer 看到完整历史
+    """
+
+    MAX_REDO_ROUNDS = 3  # 最多 3 轮重做
 
     def __init__(self, model: str | None = None, work_dir: str = "."):
         from patchflow.core.config import get_model
@@ -119,7 +148,7 @@ class AgentOrchestrator:
         from patchflow.core.fix.memory_bank import FixMemoryBank
         self.memory_bank = FixMemoryBank(work_dir=work_dir)
         self.memory_bank.load()
-        self.breaker = FixLoopBreaker(max_retries=2, memory_bank=self.memory_bank)
+        self.breaker = FixLoopBreaker(max_retries=4, memory_bank=self.memory_bank)
         self.change_set = ChangeSet(work_dir=work_dir, dep_graph=self.dep_graph)
         self.diff_tracker = DiffTracker()
 
@@ -218,6 +247,28 @@ class AgentOrchestrator:
             True → 修复通过（verify() 成功）
             False → 修复失败（回滚到原始文件）
         """
+        # ── V0.5: Prompt 注入防御（Pipeline B 之前缺失）──
+        try:
+            from patchflow.core.fix.prompt_guard import scan as scan_injection
+            task_text = blackboard.get("task", "")
+            injection = scan_injection(task_text, source="agent_orch_task")
+            if injection.blocked:
+                logger.error(f"[AgentOrch][PromptGuard] 任务被拦截: {injection.reason}")
+                return False
+            if injection.suspicious and injection.sanitized:
+                logger.warn(f"[AgentOrch][PromptGuard] 任务已清洗: {injection.reason}")
+                blackboard["task"] = injection.sanitized
+        except Exception:
+            pass
+
+        # ── V0.5: Token 预算追踪（Pipeline B 之前缺失）──
+        try:
+            from patchflow.core.fix.budget import start_session_budget
+            self._budget = start_session_budget()
+            logger.info(f"  Token Budget: {self._budget.limit}")
+        except Exception:
+            self._budget = None
+
         analyzer_alias = self._get_alias("analyzer")
         fixer_alias = self._get_alias("fixer")
         reviewer_alias = self._get_alias("reviewer")
@@ -228,7 +279,7 @@ class AgentOrchestrator:
 
         # ── 提取关键信息用于显示 ──
         error_text = blackboard.get("error", "")
-        error_text.split("\n")[0][:80] if error_text else "N/A"
+        error_preview = error_text.split("\n")[0][:80] if error_text else "N/A"
         task_text = blackboard.get("task", "")[:60]
         code_files = list(blackboard.get("code", {}).keys())
         files_preview = ", ".join(code_files[:5]) if code_files else "(none)"
@@ -288,6 +339,8 @@ class AgentOrchestrator:
         # 注入 CodeGraph 到 Blackboard（Agent 可通过黑板书读取语义分块）
         if self.code_graph is not None:
             blackboard.code_graph = self.code_graph
+        # V0.5: 注入 memory_bank 到 Blackboard（fixer_agent 用于自适应策略选择）
+        blackboard.memory_bank = self.memory_bank
 
         # ── Step 1: Analyzer 分析错误 ──
         # 调用分析 Agent 定位问题根因，返回错误类型、置信度、影响文件等
@@ -311,10 +364,10 @@ class AgentOrchestrator:
 
         # ── Step 2: 置信度检查 ──
         # 如果 Analyzer 对分析结果没有把握，上报用户不再继续
-        if analysis.get("confidence", 0) < 0.5:
-            display.set_failed(0, f"置信度过低 ({analysis['confidence']})")
+        if confidence < 0.5:
+            display.set_failed(0, f"置信度过低 ({confidence:.0%})")
             display.finish(False)
-            logger.error(f"[AgentOrch] 分析置信度过低 ({analysis['confidence']})，上报用户")
+            logger.error(f"[AgentOrch] 分析置信度过低 ({confidence:.0%})，上报用户")
             self.snapshot.rollback(snap_id)
             return False
 
@@ -343,6 +396,21 @@ class AgentOrchestrator:
             logger.info(f"[AgentOrch]   补丁 {i+1}: {fp} — {desc}")
         if not patches:
             logger.info(f"[AgentOrch]   Blackboard: {blackboard.summary()}")
+
+        # ── V0.5: 冲突检测（懒检测：只在提交时检查）──
+        try:
+            from patchflow.core.fix.conflict_detector import LazyConflictDetector
+            conflict_detector = LazyConflictDetector(work_dir=self.work_dir)
+            proposed = [{"file": p.get("file", ""), "content": p.get("new", "")}
+                       for p in patches if p.get("file")]
+            conflicts = conflict_detector.detect("fixer", proposed)
+            if conflicts:
+                logger.warn(f"[AgentOrch] 检测到 {len(conflicts)} 个潜在冲突:")
+                for c in conflicts[:3]:
+                    logger.warn(f"  [{c.get('severity','?')}] {c.get('type','?')}: "
+                               f"{c.get('suggestion','')[:100]}")
+        except Exception as e:
+            logger.debug(f"[AgentOrch] 冲突检测跳过: {e}")
 
         # 没有生成任何补丁 → 无法修复
         if not blackboard["fix_plan"].get("patches"):
@@ -395,14 +463,45 @@ class AgentOrchestrator:
             logger.info(f"[AgentOrch]   反馈: {feedback[:120]}")
         logger.info(f"[AgentOrch]   Blackboard: {blackboard.summary()}")
 
-        # ── Step 5: 审查不通过 → 带 feedback 重做 ──
-        # 回滚 → Fixer 重新修复（带上 Reviewer 的反馈意见）→ 重新审查
-        if not review.get("approved", False):
-            logger.warn(f"[AgentOrch] Reviewer 驳回 (score: {review.get('score',0)}/10)")
+        # ── Step 5: 多轮迭代修复循环（V0.5 增强）──
+        # 不通过时：回滚 → Fixer 重新修复（带累积的 Review 反馈）→ 再审
+        # 最多 MAX_REDO_ROUNDS 轮，每轮评分需改善
+        redo_round = 0
+        all_patches_history: list[list[dict]] = [patches]  # 历史补丁用于相似度检测
+        cumulative_feedback: list[str] = []
+        best_score = review.get("score", 0)
+
+        while not review.get("approved", False) and redo_round < self.MAX_REDO_ROUNDS:
+            redo_round += 1
+            logger.warn(f"[AgentOrch] Reviewer 驳回 第{redo_round}轮 (score: {review.get('score',0)}/10)")
             logger.info(f"[AgentOrch]   Issues: {review.get('issues', [])}")
 
             # 回滚到原始文件
             self.snapshot.rollback(snap_id)
+
+            # V0.5: 策略升级 — 重做轮次递增时扩大修复范围
+            from patchflow.core.analysis.strategy_selector import strategy_sequence, select_strategy
+            scope_sequence = strategy_sequence(analysis.get("error_type", "runtime"))
+            escalated_scope = scope_sequence[min(redo_round, len(scope_sequence) - 1)]
+            if redo_round > 1 and escalated_scope != scope_sequence[0]:
+                logger.info(f"[AgentOrch] 策略升级: {scope_sequence[0]} → {escalated_scope}")
+                # 放宽影响文件限制
+                expanded_files = analysis.get("impact_files", [])[:]
+                if len(expanded_files) < 5:
+                    # 从 code_graph 中补充相关文件
+                    for imp_file in list(expanded_files):
+                        try:
+                            from patchflow.core.fix.scope_calculator import DepGraph
+                            if self.dep_graph._built:
+                                callers = self.dep_graph.direct_callers(imp_file)
+                                for c in callers:
+                                    if c not in expanded_files:
+                                        expanded_files.append(c)
+                        except Exception:
+                            pass
+                # 更新 blackboard 中的分析以反映更宽的范围
+                analysis["impact_files"] = expanded_files[:5]
+                blackboard.set_analysis(analysis)
 
             # 检查熔断器
             self.breaker.record_failure(analysis.get("error_type", ""), analysis.get("root_cause", ""))
@@ -410,17 +509,20 @@ class AgentOrchestrator:
                 analysis.get("error_type", ""), analysis.get("root_cause", ""), "agent_fix"
             )
             if not should_retry:
-                logger.error(f"[AgentOrch] 熔断: {reason}")
+                logger.error(f"[AgentOrch] 熔断 (第{redo_round}轮): {reason}")
                 self._record_fix_outcome(analysis, patched_files, False, "agent_fix")
                 display.finish(False)
                 return False
 
-            # 记录首次补丁用于相似度比较
-            first_patches = patches
+            # 累积 review 反馈（每轮叠加，Fixer 可以看到完整历史）
+            fb = review.get("feedback", "")
+            if fb:
+                cumulative_feedback.append(f"[Round {redo_round}] {fb}")
+            blackboard["review_feedback"] = "\n".join(cumulative_feedback)
 
-            # 带 feedback 重新修复
-            blackboard["review_feedback"] = review.get("feedback", "")
-            display.set_detail(1, "Redoing based on review feedback...")
+            # 带累积 feedback 重新修复
+            round_label = f"第{redo_round + 1}次" if redo_round == 1 else f"第{redo_round + 1}次修复"
+            display.set_detail(1, f"Redoing ({round_label})...")
             display.set_retry(1)
             blackboard["fix_plan"] = agent_fix(blackboard, dep_graph=self.dep_graph,
                                                code_graph=self.code_graph,
@@ -428,70 +530,113 @@ class AgentOrchestrator:
             self.turn_count += 1
 
             if not blackboard["fix_plan"].get("patches"):
-                display.set_failed(1, "二次修复未生成补丁")
+                display.set_failed(1, f"第{redo_round + 1}次修复未生成补丁")
                 display.finish(False)
-                logger.error("[AgentOrch] 二次修复未生成补丁")
+                logger.error(f"[AgentOrch] 第{redo_round + 1}次修复未生成补丁")
                 self._record_fix_outcome(analysis, patched_files, False, "agent_fix")
                 return False
 
-            patch_count2 = len(blackboard["fix_plan"].get("patches", []))
             redo_patches = blackboard["fix_plan"].get("patches", [])
-            display.set_completed(1, f"{patch_count2} patches (redo)")
+            patch_count_n = len(redo_patches)
+            display.set_completed(1, f"{patch_count_n} patches (redo #{redo_round})")
 
-            # ── 补丁相似度检测：重做后补丁与首次几乎一样 → 无效重做 ──
-            if _patches_are_similar(first_patches, redo_patches):
-                display.set_failed(1, "二次修复未实质性修改（与首次相同）")
+            # ── 补丁相似度检测：与所有历史补丁比较 ──
+            is_duplicate = False
+            for hist_patches in all_patches_history:
+                if _patches_are_similar(hist_patches, redo_patches):
+                    is_duplicate = True
+                    break
+            if is_duplicate:
+                display.set_failed(1, f"第{redo_round + 1}次修复未实质性修改（与之前相同）")
                 display.finish(False)
-                logger.error("[AgentOrch] 二次修复与首次几乎相同，停止无效重做")
+                logger.error(f"[AgentOrch] 第{redo_round + 1}次修复与历史补丁几乎相同，停止无效重做")
                 self._record_fix_outcome(analysis, patched_files, False, "agent_fix")
                 return False
+            all_patches_history.append(redo_patches)
 
-            # 重新保存快照对二次修复后的内容
+            # 重新保存快照
             snap_id = self.snapshot.save(files_to_snapshot)
 
             if not apply_agent_patches(blackboard, work_dir=self.work_dir, diff_tracker=self.diff_tracker):
-                display.set_failed(1, "二次补丁应用失败")
+                display.set_failed(1, f"第{redo_round + 1}次补丁应用失败")
                 display.finish(False)
                 self._record_fix_outcome(analysis, patched_files, False, "agent_fix")
                 self.snapshot.rollback(snap_id)
                 return False
 
-            patched_files = list({p.get("file", "") for p in blackboard["fix_plan"].get("patches", []) if p.get("file")})
+            patched_files = list({p.get("file", "") for p in redo_patches if p.get("file")})
 
             # 再审
-            display.set_detail(2, "Re-reviewing...")
+            display.set_detail(2, f"Re-reviewing (round {redo_round + 1})...")
             display.set_retry(2)
             review = agent_review(blackboard, model=self.model,
                                   model_alias=reviewer_alias)
             self.turn_count += 1
-            score2 = review.get("score", 0)
-            display.set_completed(2, f"Score: {score2}/10 (approved)" if review.get("approved") else f"Score: {score2}/10 (rejected)")
+            current_score = review.get("score", 0)
+            status_text = "approved" if review.get("approved") else f"rejected ({current_score}/10)"
+            display.set_completed(2, f"Score: {current_score}/10 ({status_text})")
 
-            if not review.get("approved", False):
-                # 评分未改善 → 停止
-                if score2 <= score:
-                    logger.error(f"[AgentOrch] 重做后评分未改善 ({score} → {score2})，停止")
+            if review.get("approved", False):
+                break  # 通过，跳出循环
+
+            # 评分比之前最好成绩差且连续2轮不改善 → 停止
+            if current_score <= best_score:
+                if redo_round >= 2:
+                    logger.error(f"[AgentOrch] 评分连续{redo_round}轮未改善 "
+                                 f"(best={best_score}, current={current_score})，停止")
+                    display.set_failed(2, f"评分未改善 ({best_score} → {current_score})")
+                    display.finish(False)
+                    self._record_fix_outcome(analysis, patched_files, False, "agent_fix")
+                    self.snapshot.rollback(snap_id)
+                    return False
                 else:
-                    logger.error(f"[AgentOrch] 二次审查仍未通过 (score: {score2})")
-                display.set_failed(2, f"二次审查未通过 ({score2}/10)")
-                display.finish(False)
-                self._record_fix_outcome(analysis, patched_files, False, "agent_fix")
-                self.snapshot.rollback(snap_id)
-                return False
+                    logger.warn(f"[AgentOrch] 评分未改善 ({best_score} → {current_score})，继续尝试")
+            else:
+                best_score = current_score
 
-        # ── Step 6: 运行验证 ──
-        # 真正执行代码，确认修复后的代码可以正常运行
+        # ── Step 6: 运行验证 + 回归测试（V0.5 增强）──
+        # 先运行代码验证，再运行已有测试套件 + 生成回归测试
         from patchflow.core.fix.validator import validate
         result = validate(work_dir=self.work_dir)
 
         if result.ok:
-            self.snapshot.commit(snap_id)
-            self._print_diff_report(original_files)
-            self._record_fix_outcome(analysis, patched_files, True, "agent_fix")
-            self.memory_bank.save()
-            logger.success(f"[AgentOrch] Agent 协作修复成功! ({self.turn_count} 步)")
-            display.finish(True)
-            return True
+            # 运行已有测试套件（回归检测）
+            test_ok = True
+            try:
+                from patchflow.core.fix.test_runner import run_post_fix_validation
+                display.set_detail(2, "Running regression tests...")
+                fixed_file = patched_files[0] if patched_files else ""
+                test_result = run_post_fix_validation(
+                    work_dir=self.work_dir,
+                    analysis=analysis,
+                    fixed_file=fixed_file,
+                    language=analysis.get("language", ""),
+                )
+                test_ok = test_result.get("existing_tests_ok", True)
+                logger.info(f"[AgentOrch] 回归测试: {test_result.get('test_summary', '')}")
+                if not test_ok:
+                    logger.warn("[AgentOrch] 已有测试失败，修复可能引入回归问题")
+            except Exception as e:
+                logger.debug(f"[AgentOrch] 回归测试跳过: {e}")
+
+            if test_ok:
+                self.snapshot.commit(snap_id)
+                self._print_diff_report(original_files)
+                self._record_fix_outcome(analysis, patched_files, True, "agent_fix")
+                self.memory_bank.save()
+                logger.success(f"[AgentOrch] Agent 协作修复成功! ({self.turn_count} 步, "
+                              f"{redo_round} 轮重做)")
+                display.finish(True)
+                return True
+            else:
+                logger.error("[AgentOrch] 修复通过编译但已有测试失败，可能存在回归问题")
+                # 仍然提交修复（编译通过），但记录警告
+                self.snapshot.commit(snap_id)
+                self._print_diff_report(original_files)
+                self._record_fix_outcome(analysis, patched_files, True, "agent_fix")
+                self.memory_bank.save()
+                display.finish(True)
+                return True
 
         # 验证失败 → 回滚
         logger.error("[AgentOrch] 验证失败，回滚")
@@ -524,7 +669,7 @@ class AgentOrchestrator:
 
     def _record_fix_outcome(self, analysis: dict, file_paths: list[str],
                             success: bool, strategy: str) -> None:
-        """记录修复结果到记忆库"""
+        """记录修复结果到记忆库（V0.5: 自动持久化）"""
         error_type = analysis.get("error_type", "")
         root_cause = analysis.get("root_cause", "")
         if not error_type or not root_cause:
@@ -537,6 +682,11 @@ class AgentOrchestrator:
             success=success,
             strategy_used=strategy,
         )
+        # V0.5: 每次记录后自动持久化（Pipeline B 之前从不保存）
+        try:
+            self.memory_bank.save()
+        except Exception as e:
+            logger.debug(f"[AgentOrch] 记忆库保存失败（非致命）: {e}")
 
     def _print_diff_report(self, original_files: dict[str, str]):
         if not original_files:

@@ -95,6 +95,11 @@ class ChangeSet:
         logger.info(f"ChangeSet 快照已创建: {self._current_snapshot_id} ({len(files)} 文件)")
         return self._current_snapshot_id
 
+    @property
+    def is_active(self) -> bool:
+        """是否有活跃的快照（begin() 后、commit()/rollback() 前）"""
+        return bool(self._current_snapshot_id)
+
     def commit(self) -> None:
         if self._current_snapshot_id and self._current_snapshot_id != "_empty_":
             self.snapshot.commit(self._current_snapshot_id)

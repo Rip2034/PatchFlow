@@ -39,26 +39,31 @@ class FixLoopBreaker:
         """
         self.turn += 1
 
-        if self.turn > self.max_retries:
-            return False, f"max_retries_exceeded ({self.max_retries})"
+        try:
+            if self.turn > self.max_retries:
+                return False, f"max_retries_exceeded ({self.max_retries})"
 
-        error_key = f"{error_type}:{root_cause[:80]}"
-        same_count = sum(1 for e in self.error_history if e.get("key") == error_key)
-        if same_count >= self.SIMILAR_FAILURES_THRESHOLD:
-            return False, f"same_error_repeated ({same_count + 1} times)"
+            error_key = f"{error_type}:{root_cause[:80]}"
+            same_count = sum(1 for e in self.error_history if e.get("key") == error_key)
+            if same_count >= self.SIMILAR_FAILURES_THRESHOLD:
+                return False, f"same_error_repeated ({same_count + 1} times)"
 
-        if self.memory_bank:
-            should_skip, reason = self.memory_bank.should_skip(
-                error_type, root_cause, strategy_name or "")
-            if should_skip:
-                return False, f"memory_bank_skip: {reason}"
+            if self.memory_bank:
+                should_skip, reason = self.memory_bank.should_skip(
+                    error_type, root_cause, strategy_name or "")
+                if should_skip:
+                    return False, f"memory_bank_skip: {reason}"
 
-        if strategy_name:
-            self.strategy_failures[strategy_name] = self.strategy_failures.get(strategy_name, 0) + 1
-            if self.strategy_failures[strategy_name] > self.MAX_FAILURES_PER_STRATEGY:
-                return False, f"strategy_failed_too_often ({strategy_name})"
+            if strategy_name:
+                self.strategy_failures[strategy_name] = self.strategy_failures.get(strategy_name, 0) + 1
+                if self.strategy_failures[strategy_name] > self.MAX_FAILURES_PER_STRATEGY:
+                    return False, f"strategy_failed_too_often ({strategy_name})"
 
-        return True, ""
+            return True, ""
+        except Exception:
+            # V0.5: 异常时回退 turn 计数，防止与循环计数偏斜
+            self.turn -= 1
+            raise
 
     def record_failure(self, error_type: str, root_cause: str):
         """记录一次失败"""
@@ -79,13 +84,20 @@ class FixLoopBreaker:
 
     @property
     def is_broken(self) -> bool:
-        """判断熔断器是否已触发（无副作用，不改变内部状态）"""
+        """判断熔断器是否已触发（与 should_retry 一致）
+
+        V0.5 fix: 错误重复计数改用 >= 与 should_retry 对齐。
+        turn 检查保持 > 不变（should_retry 在递增后判断 >，
+        is_broken 不递增，所以 turn >= max_retries 会过早触发）。
+        """
+        # turn 已达上限 → 下一次 should_retry 必然熔断
+        # (保持 > 而非 >=：turn==max_retries 时下一次调用才会超限)
         if self.turn > self.max_retries:
             return True
-        # 检查是否有同一错误重复出现超过阈值
+        # 检查是否有同一错误重复出现（与 should_retry 的 >= 逻辑一致）
         from collections import Counter
         key_counts = Counter(e.get("key") for e in self.error_history)
         for count in key_counts.values():
-            if count > self.SIMILAR_FAILURES_THRESHOLD:
+            if count >= self.SIMILAR_FAILURES_THRESHOLD:
                 return True
         return False

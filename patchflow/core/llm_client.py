@@ -70,11 +70,12 @@ def call_llm(
     # 拼接共享前缀 + 角色指令，使多个 Agent 调用的前缀部分被缓存
     if shared_system_prefix:
         system_prompt = shared_system_prefix + "\n\n---\n\n" + system_prompt
-    # 如果指定了别名，从别名配置读取 provider/api_key/api_base
+    # 如果指定了别名，从已合并的配置读取 provider/api_key/api_base
+    # V0.5 fix: 使用 get_config() 代替直接读 _user_config_dir()，
+    # 确保项目级 .patchflow/config.json 覆盖生效。
     if model_alias:
-        from patchflow.core.config import _load_json, _user_config_dir
-        user_cfg = _load_json(_user_config_dir() / "config.json")
-        alias_cfg = user_cfg.get("models", {}).get(model_alias, {})
+        cfg = get_config()
+        alias_cfg = cfg.get("models", {}).get(model_alias, {})
         provider = alias_cfg.get("provider", "")
         api_key = alias_cfg.get("api_key", "")
         api_base = alias_cfg.get("api_base", "")
@@ -108,9 +109,10 @@ def call_llm(
             logger.error(f"[TokenBudget] 调用被预算拦截: {blocked}")
             return None
 
-    # Prompt 注入防御 — 扫描 user_message
+    # Prompt 注入防御 — 扫描 user_message 和 system_prompt
     try:
         from patchflow.core.fix.prompt_guard import scan as scan_injection
+        # 扫描 user_message
         injection = scan_injection(user_message, source="llm_user_message")
         if injection.blocked:
             logger.error(f"[PromptGuard] 用户消息被拦截: {injection.reason}")
@@ -118,6 +120,14 @@ def call_llm(
         if injection.suspicious and injection.sanitized:
             logger.warn(f"[PromptGuard] 用户消息已清洗: {injection.reason}")
             user_message = injection.sanitized
+        # V0.5: 也扫描 system_prompt（可能包含来自错误输出/代码的不安全内容）
+        sys_injection = scan_injection(system_prompt, source="llm_system_prompt")
+        if sys_injection.blocked:
+            logger.error(f"[PromptGuard] System prompt 被拦截: {sys_injection.reason}")
+            return None
+        if sys_injection.suspicious and sys_injection.sanitized:
+            logger.warn(f"[PromptGuard] System prompt 已清洗: {sys_injection.reason}")
+            system_prompt = sys_injection.sanitized
     except Exception:
         pass
 

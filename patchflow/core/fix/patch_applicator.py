@@ -116,6 +116,13 @@ class PatchApplicator:
     @staticmethod
     def apply(file_path: str, patches: list[SnippetPatch],
               work_dir: str = ".", diff_tracker: DiffTracker | None = None) -> bool:
+        """Apply all patches for a single file sequentially.
+
+        V0.5 fix: previously returned after the first successful patch,
+        silently dropping subsequent patches for the same file.
+        Now applies all patches in order, updating the file content
+        after each successful match so later patches see the latest state.
+        """
         if not patches:
             return False
         from patchflow.core.concurrency import get_file_lock_manager
@@ -138,64 +145,91 @@ class PatchApplicator:
                 except UnicodeDecodeError:
                     pass
 
+            original_content = existing
+            any_applied = False
+
             for patch in patches:
                 if not patch.new:
                     continue
 
+                applied_this = False
+
                 # Strategy 1: new file
                 if not existing:
-                    if diff_tracker:
-                        diff_tracker.record(file_path, "", patch.new)
-                    safe_atomic_write(wd, rel, patch.new)
+                    existing = patch.new
+                    applied_this = True
                     logger.info(f"Patcher 新建: {file_path}")
-                    return True
 
                 # Strategy 2: exact snippet match
-                if patch.old and patch.old in existing:
-                    replaced = existing.replace(patch.old, patch.new, 1)
-                    if diff_tracker:
-                        diff_tracker.record(file_path, existing, replaced)
-                    safe_atomic_write(wd, rel, replaced)
+                elif patch.old and patch.old in existing:
+                    existing = existing.replace(patch.old, patch.new, 1)
+                    applied_this = True
                     logger.info(f"Patcher 精确替换: {file_path}")
-                    return True
+
+                # ── V0.5: Strategy 2b: fuzzy line-based match ──
+                elif patch.old:
+                    fuzzy_result = _fuzzy_line_match(existing, patch.old, patch.new)
+                    if fuzzy_result is not None:
+                        existing = fuzzy_result
+                        applied_this = True
+                        logger.info(f"Patcher 模糊行匹配替换: {file_path}")
+
+                # ── V0.5: Strategy 2c: diff-ratio approximate match ──
+                elif patch.old:
+                    ratio_result = _ratio_guided_match(existing, patch.old, patch.new)
+                    if ratio_result is not None:
+                        existing = ratio_result
+                        applied_this = True
+                        logger.info(f"Patcher 相似度引导替换: {file_path}")
 
                 # Strategy 3: new content close to full file
-                len_ratio = len(patch.new) / max(len(existing), 1)
-                if len_ratio > 0.6:
-                    if diff_tracker:
-                        diff_tracker.record(file_path, existing, patch.new)
-                    safe_atomic_write(wd, rel, patch.new)
-                    logger.info(f"Patcher 全文覆盖: {file_path}")
-                    return True
+                if not applied_this:
+                    len_ratio = len(patch.new) / max(len(existing), 1)
+                    if len_ratio > 0.6:
+                        existing = patch.new
+                        applied_this = True
+                        logger.info(f"Patcher 全文覆盖: {file_path}")
 
                 # Strategy 4: stripped match (preserve original whitespace)
-                if patch.old:
+                if not applied_this and patch.old:
                     old_stripped = patch.old.strip()
                     existing_stripped = existing.strip()
                     if old_stripped and old_stripped in existing_stripped:
-                        replaced = _replace_in_original(existing, old_stripped, patch.new.strip())
-                        if diff_tracker:
-                            diff_tracker.record(file_path, existing, replaced)
-                        safe_atomic_write(wd, rel, replaced)
+                        existing = _replace_in_original(existing, old_stripped, patch.new.strip())
+                        applied_this = True
                         logger.info(f"Patcher 宽松替换: {file_path}")
-                        return True
 
-                # Strategy 5: too small to trust
-                if len_ratio < 0.2 and len(patch.new) < 30:
-                    logger.warn(f"Patcher 拒绝覆盖 {file_path}: 内容过小 ({len(patch.new)}B)")
+                # Strategy 5: too small to trust — skip this patch, continue
+                if not applied_this:
+                    len_ratio = len(patch.new) / max(len(existing), 1)
+                    if len_ratio < 0.2 and len(patch.new) < 30:
+                        logger.warn(f"Patcher 跳过过小补丁 {file_path}: ({len(patch.new)}B)")
+                        continue  # skip this patch, try next
+
+                if applied_this:
+                    any_applied = True
+
+            # Strategy 6: fallback — if nothing matched, use last patch (safety-checked)
+            if not any_applied:
+                last = patches[-1]
+                final_ratio = len(last.new) / max(len(existing), 1)
+                if final_ratio < 0.2 and len(last.new) < 30:
+                    logger.error(f"Patcher 拒绝兜底覆盖 {file_path}: 内容过小 ({len(last.new)}B, {final_ratio:.1%})")
                     return False
+                existing = last.new
+                logger.warn(f"Patcher 兜底覆盖: {file_path} ({len(last.new)}B)")
+                any_applied = True
 
-            # Strategy 6: fallback with last patch (safety-checked)
-            last = patches[-1]
-            final_ratio = len(last.new) / max(len(existing), 1)
-            if final_ratio < 0.2 and len(last.new) < 30:
-                logger.error(f"Patcher 拒绝兜底覆盖 {file_path}: 内容过小 ({len(last.new)}B, {final_ratio:.1%})")
-                return False
-            if diff_tracker:
-                diff_tracker.record(file_path, existing, last.new)
-            safe_atomic_write(wd, rel, last.new)
-            logger.warn(f"Patcher 兜底覆盖: {file_path} ({len(last.new)}B)")
-            return True
+            # Write final result once (V0.5: single write for all patches)
+            if any_applied and existing != original_content:
+                if diff_tracker:
+                    diff_tracker.record(file_path, original_content, existing)
+                safe_atomic_write(wd, rel, existing)
+                logger.info(f"Patcher 应用 {file_path}: {len(patches)} patches, "
+                           f"{len(original_content)}→{len(existing)} chars")
+                return True
+
+            return False
 
     @staticmethod
     def apply_all(patches: list[SnippetPatch], work_dir: str = ".",
@@ -254,6 +288,125 @@ def _replace_in_original(original: str, old_stripped: str, new_stripped: str) ->
             return "\n".join(lines)
 
     return original
+
+
+def _fuzzy_line_match(existing: str, old_snippet: str, new_snippet: str) -> str | None:
+    """V0.5: 模糊行匹配 — 逐行比对，容忍空白/缩进差异
+
+    当精确匹配失败时，尝试：
+      1. 将 old_snippet 按行拆分
+      2. 在 existing 中找每个 old 行的最佳匹配（用 SequenceMatcher）
+      3. 如果所有行都能匹配（ratio > 0.8），执行替换
+    """
+    import difflib
+
+    old_lines = old_snippet.strip().split("\n")
+    new_lines = new_snippet.strip().split("\n")
+    existing_lines = existing.split("\n")
+
+    if len(old_lines) > len(existing_lines):
+        return None
+
+    # 用 SequenceMatcher 找最佳匹配区域
+    # 将 old 视为查询，在 existing 中找最相似的连续块
+    existing_flat = existing.strip()
+    old_flat = old_snippet.strip()
+
+    sm = difflib.SequenceMatcher(None, existing_flat, old_flat)
+    # 找到最长匹配块
+    matching_blocks = sm.get_matching_blocks()
+    if not matching_blocks or matching_blocks[0].size < len(old_flat) * 0.5:
+        return None
+
+    # 用逐行匹配
+    best_start = -1
+    best_end = -1
+    best_ratio = 0.0
+
+    for i in range(len(existing_lines) - len(old_lines) + 1):
+        window = "\n".join(existing_lines[i:i + len(old_lines)])
+        ratio = difflib.SequenceMatcher(None, old_snippet.strip(), window.strip()).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_start = i
+            best_end = i + len(old_lines)
+
+    # 阈值：0.75 相似度
+    if best_ratio >= 0.75 and best_start >= 0:
+        # 保留原缩进
+        orig_indent = ""
+        if existing_lines[best_start]:
+            orig_indent = existing_lines[best_start][:len(existing_lines[best_start]) - len(existing_lines[best_start].lstrip())]
+        indented_new = []
+        for line in new_lines:
+            if line.strip():
+                indented_new.append(orig_indent + line.strip())
+            else:
+                indented_new.append("")
+        result_lines = existing_lines[:best_start] + indented_new + existing_lines[best_end:]
+        logger.info(f"Patcher 模糊行匹配: ratio={best_ratio:.2f}, lines {best_start}-{best_end}")
+        return "\n".join(result_lines)
+
+    return None
+
+
+def _ratio_guided_match(existing: str, old_snippet: str, new_snippet: str) -> str | None:
+    """V0.5: 相似度引导匹配 — 用内部行匹配（适合 old/new 行数不同）
+
+    当 LLM 输出的 old 和 new 行数不同时（如 old=3行, new=5行），
+    用最佳行匹配找到替换位置。
+    """
+    import difflib
+
+    old_lines = old_snippet.strip().split("\n")
+    new_lines = new_snippet.strip().split("\n")
+    existing_lines = existing.split("\n")
+
+    if len(old_lines) > len(existing_lines):
+        return None
+
+    # 找 best anchor line（old 的第一行非空行）
+    anchor = old_lines[0].strip()
+    for line in old_lines:
+        if line.strip():
+            anchor = line.strip()
+            break
+
+    # 在 existing 中找 anchor line 的最佳匹配
+    best_i = -1
+    best_r = 0.0
+    for i, eline in enumerate(existing_lines):
+        r = difflib.SequenceMatcher(None, anchor, eline.strip()).ratio()
+        if r > best_r and r > 0.6:
+            best_r = r
+            best_i = i
+
+    if best_i < 0:
+        return None
+
+    # 找到 anchor 后，对比周围行
+    search_end = min(best_i + len(old_lines), len(existing_lines))
+    window = existing_lines[best_i:search_end]
+    window_str = "\n".join(w for w in window)
+    old_str = "\n".join(l.strip() for l in old_lines[:len(window)])
+
+    ratio = difflib.SequenceMatcher(None, old_str, window_str.strip()).ratio()
+    if ratio >= 0.7:
+        # 保留原缩进
+        orig_indent = ""
+        if existing_lines[best_i]:
+            orig_indent = existing_lines[best_i][:len(existing_lines[best_i]) - len(existing_lines[best_i].lstrip())]
+        indented_new = []
+        for line in new_lines:
+            if line.strip():
+                indented_new.append(orig_indent + line.strip())
+            else:
+                indented_new.append("")
+        result_lines = existing_lines[:best_i] + indented_new + existing_lines[search_end:]
+        logger.info(f"Patcher 相似度引导匹配: ratio={ratio:.2f}, anchor_line={best_i}")
+        return "\n".join(result_lines)
+
+    return None
 
 
 def _compute_line_changes(old: str, new: str, file: str) -> list[LineChange]:

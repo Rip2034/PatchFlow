@@ -6,7 +6,7 @@
 输出格式统一用 schema.py 定义的标准合约。
 """
 
-from patchflow.agents.schema import FIXER_PROMPT, validate_fix_plan
+from patchflow.agents.schema import FIXER_PROMPT, FIXER_PROMPT_ENHANCED, validate_fix_plan
 from patchflow.core.analysis.error_analyzer import ErrorAnalysis
 from patchflow.core.analysis.strategy_selector import select_strategy
 from patchflow.core.fix.scope_calculator import calculate as calculate_scope
@@ -40,6 +40,7 @@ def agent_fix(blackboard, dep_graph=None, code_graph=None,
     strategy = select_strategy(
         analysis.get("error_type", "runtime"),
         impact_file_count=len(analysis.get("impact_files", [])),
+        memory_bank=getattr(blackboard, "memory_bank", None),
     )
     logger.info(f"[Agent Fixer] 策略: {strategy['scope']} 范围 | 改写: {strategy['rewrite']}")
 
@@ -64,6 +65,20 @@ def agent_fix(blackboard, dep_graph=None, code_graph=None,
 
     review_feedback = blackboard.get("review_feedback", "")
 
+    # ── V0.5: 注入记忆上下文（Pipeline B 之前写入但未读取）──
+    memory_context = blackboard.get("memory_context", "")
+
+    # ── V0.5: 构建语义上下文 ──
+    semantic_block = ""
+    if code_graph is not None and allowed_files:
+        try:
+            from patchflow.core.fix.semantic_context import build_context_from_files
+            semantic_block = build_context_from_files(code_graph, allowed_files)
+            if semantic_block:
+                logger.info(f"[Agent Fixer] 语义上下文注入 ({len(semantic_block)} 字符)")
+        except Exception as e:
+            logger.debug(f"[Agent Fixer] 语义上下文跳过: {e}")
+
     context_str = ""
     if isinstance(context, dict):
         ctx_parts = []
@@ -79,6 +94,9 @@ def agent_fix(blackboard, dep_graph=None, code_graph=None,
             elif isinstance(v, str):
                 ctx_parts.append(f"{k}: {v[:100]}")
         context_str = "\n".join(ctx_parts[:8])
+
+    # 选择增强 prompt（有语义上下文时）
+    system_prompt = FIXER_PROMPT_ENHANCED if semantic_block else FIXER_PROMPT
 
     user_message = f"""Project Context:
 {context_str or "(not available)"}
@@ -96,6 +114,8 @@ Scope: {strategy['scope']}
 Max Files: {strategy['files']}
 Rewrite Allowed: {strategy['rewrite']}
 
+{semantic_block}
+{memory_context}
 Review Feedback from previous round:
 {review_feedback or "N/A (first attempt)"}
 
@@ -105,7 +125,7 @@ FILES YOU CAN MODIFY:
 Fix the code. Output ONLY the JSON with the patches."""
 
     result = call_llm(
-        system_prompt=FIXER_PROMPT,
+        system_prompt=system_prompt,
         user_message=user_message,
         model=model,
         model_alias=model_alias,
