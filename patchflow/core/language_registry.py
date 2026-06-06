@@ -23,6 +23,9 @@ class LanguageDescriptor:
         self.comment_syntax = strategy.comment_syntax
         self.run_command = strategy.run_command
         self.compile_command = strategy.compile_command
+        # V0.5: 传递自定义 traceback 解析器（Java 等需要自定义 group 映射的语言）
+        if hasattr(strategy, "traceback_parser"):
+            self.traceback_parser = strategy.traceback_parser
         self.type_search_patterns = strategy.type_search_patterns
         self._strategy = strategy
 
@@ -31,17 +34,26 @@ class LanguageDescriptor:
         return ext in self.extensions
 
     def parse_traceback(self, error_text: str) -> list[dict] | None:
-        """用本语言的 traceback 模式解析错误文本，返回栈帧列表"""
+        """用本语言的 traceback 模式解析错误文本，返回栈帧列表
+
+        V0.5 fix: 不再硬编码 group(1)=file, group(2)=line, group(3)=function。
+        改为从 traceback_parser 回调获取，无回调时按默认映射。
+        修复 Java traceback 解析失败（Java 有 4 个捕获组，行号在 group 4）。
+        """
+        parser = getattr(self, "traceback_parser", None)
         for pattern in self.traceback_patterns:
             frames = []
             for line in error_text.split("\n"):
                 m = pattern.search(line)
                 if m:
-                    frames.append({
-                        "file": m.group(1),
-                        "line": int(m.group(2)),
-                        "function": m.group(3) if m.lastindex and m.lastindex >= 3 else "",
-                    })
+                    if parser:
+                        frames.append(parser(m))
+                    else:
+                        frames.append({
+                            "file": m.group(1),
+                            "line": int(m.group(2)),
+                            "function": m.group(3) if m.lastindex and m.lastindex >= 3 else "",
+                        })
             if frames:
                 return frames
         return None

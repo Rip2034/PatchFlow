@@ -454,14 +454,23 @@ class TypeScriptStrategy(JavaScriptStrategy):
     extensions = {".ts", ".tsx"}
     project_files = ["tsconfig.json", "package.json"]
     entry_points = ["index.ts", "app.ts", "server.ts", "main.ts"]
-    traceback_patterns = [
-        re.compile(r'\s*at\s+(?:\w+\s+)?\(?(.+?):(\d+):(\d+)\)?'),
-    ]
-    error_classifiers = {
-        "TS2304": "dependency", "TS2339": "runtime", "TS2345": "runtime",
-    }
+    # V0.5 fix: 不再重复定义 traceback_patterns（继承 JS 的 V8 格式）
+    # V0.5 fix: error_classifiers 扩展 JS 的而非替换
+    # 通过 __init__ 在运行时合并父类分类器
     run_command = "node"
     compile_command = "tsc"
+
+    def __init__(self):
+        super().__init__()
+        # 继承 JS 的 error_classifiers，追加 TS 特有错误码
+        self.error_classifiers = dict(getattr(JavaScriptStrategy, 'error_classifiers', {}))
+        self.error_classifiers.update({
+            "TS2304": "dependency", "TS2339": "runtime", "TS2345": "runtime",
+            "TS2554": "runtime", "TS2769": "runtime", "TS18046": "runtime",
+            "TS18047": "runtime", "TS2322": "type", "TS2741": "type",
+        })
+        # 继承 JS 的 traceback_patterns
+        self.traceback_patterns = list(getattr(JavaScriptStrategy, 'traceback_patterns', []))
 
     def validate(self, work_dir: str) -> ValidationResult:
         from patchflow.core.analysis.error_parser import parse
@@ -535,6 +544,16 @@ class JavaStrategy(LanguageStrategy):
     traceback_patterns = [
         re.compile(r'\s*at\s+(\S+)\.(\S+)\((\S+)\.java:(\d+)\)'),
     ]
+    # V0.5: Java traceback 有 4 个捕获组 (pkg, method, file, line)
+    # 需要自定义解析器，不能用默认的 (group1=file, group2=line) 映射
+    @staticmethod
+    def traceback_parser(match: re.Match) -> dict:
+        return {
+            "file": f"{match.group(3)}.java",
+            "line": int(match.group(4)),
+            "function": f"{match.group(1)}.{match.group(2)}",
+        }
+
     error_classifiers = {
         "NullPointerException": "runtime", "ClassCastException": "runtime",
         "ArrayIndexOutOfBoundsException": "runtime", "IllegalArgumentException": "runtime",
@@ -609,8 +628,12 @@ class JavaStrategy(LanguageStrategy):
 
         # 无构建工具，用 javac/java
         if entry is None:
-            logger.info("无 Maven/Gradle 且无入口文件，跳过验证")
-            return ValidationResult(ok=True, message="无构建工具，跳过验证", language="java")
+            logger.warn("无 Maven/Gradle 且无入口文件，无法验证")
+            return ValidationResult(
+                ok=False, status="skipped",
+                message="No build tool (Maven/Gradle) and no entry file found for Java",
+                language="java",
+            )
 
         entry_rel = str(entry.relative_to(wd))
         logger.step(f"验证入口文件: {entry_rel}")
@@ -642,6 +665,28 @@ class JavaStrategy(LanguageStrategy):
         elif (work_dir / "build.gradle").exists():
             meta["package_manager"] = "gradle"
         return meta
+
+    def parse_dependencies(self, work_dir: Path) -> list[str]:
+        """V0.5: 从 pom.xml 或 build.gradle 解析依赖"""
+        deps = []
+        pom = work_dir / "pom.xml"
+        if pom.exists():
+            content = pom.read_text(encoding="utf-8", errors="replace")
+            # Maven: <groupId>:<artifactId>
+            for m in re.finditer(r'<artifactId>([^<]+)</artifactId>', content):
+                deps.append(m.group(1))
+        gradle = work_dir / "build.gradle"
+        if gradle.exists():
+            content = gradle.read_text(encoding="utf-8", errors="replace")
+            # Gradle: implementation 'group:name:version'
+            for m in re.finditer(r"""implementation\s+['"]([^'"]+)['"]""", content):
+                parts = m.group(1).split(":")
+                if len(parts) >= 2:
+                    deps.append(parts[1])
+        return sorted(set(deps))
+
+    def get_linter_command(self) -> str | None:
+        return None  # Java linter 依赖项目配置（checkstyle/spotbugs），运行时检测
 
 
 # ── Go ───────────────────────────────────────────────────────
@@ -696,13 +741,23 @@ class GoStrategy(LanguageStrategy):
         from patchflow.utils.runner import run
 
         wd = Path(work_dir)
+        # Step 1: 编译检查
         if self.compile_command:
             result = run(self.compile_command, cwd=str(wd))
             if not result.ok:
                 error_text = result.stderr.strip() or result.stdout.strip() or "Compilation failed"
                 logger.error("编译验证失败")
                 return ValidationResult(ok=False, error=parse(error_text, lang_name="go"), language="go")
-        logger.success("Go build 验证通过")
+        # V0.5: Step 2: 编译成功后也运行（检测运行时错误）
+        if self.run_command:
+            entry = self.find_entry_file(wd)
+            if entry and entry.name == "main.go":
+                result = run(f"{self.run_command} .", cwd=str(wd))
+                if not result.ok:
+                    error_text = result.stderr.strip() or result.stdout.strip() or "Runtime error"
+                    logger.error("运行验证失败")
+                    return ValidationResult(ok=False, error=parse(error_text, lang_name="go"), language="go")
+        logger.success("Go 验证通过")
         return ValidationResult(ok=True, language="go")
 
     def parse_project_meta(self, work_dir: Path) -> dict:
@@ -721,6 +776,20 @@ class GoStrategy(LanguageStrategy):
             if kw in str(deps).lower():
                 return {"name": fw, "language": self.name}
         return None
+
+    def parse_dependencies(self, work_dir: Path) -> list[str]:
+        """V0.5: 从 go.mod 解析依赖"""
+        go_mod = work_dir / "go.mod"
+        if not go_mod.exists():
+            return []
+        deps = []
+        content = go_mod.read_text(encoding="utf-8", errors="replace")
+        for m in re.finditer(r'^\s+(\S+)\s+v[\d.]+', content, re.MULTILINE):
+            deps.append(m.group(1))
+        return sorted(set(deps))
+
+    def get_linter_command(self) -> str | None:
+        return "go vet ./..."
 
 
 # ── Rust ─────────────────────────────────────────────────────
@@ -829,6 +898,9 @@ class RustStrategy(LanguageStrategy):
 
     def detect_naming_convention(self, work_dir: Path) -> str:
         return "snake_case"
+
+    def get_linter_command(self) -> str | None:
+        return "cargo clippy"
 
 
 # ── factory ──────────────────────────────────────────────────
