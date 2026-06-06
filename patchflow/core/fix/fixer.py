@@ -214,9 +214,14 @@ Fix the error. Output ONLY the JSON with the fixed file content."""
     fixed_file = result["file"]
 
     if scope_files:
-        # V0.5: 路径归一化后再比较（处理 ./ 前缀、反斜杠等差异）
-        normalized_fixed = fixed_file.replace("\\", "/").lstrip("./")
-        normalized_scope = [f.replace("\\", "/").lstrip("./") for f in scope_files]
+        # V0.5: 路径归一化后再比较
+        # 使用 re.sub 去除 ./ 前缀（避免 lstrip 把 .patchflow 变成 patchflow）
+        import re as _re
+        def _norm(p: str) -> str:
+            p = p.replace("\\", "/")
+            return _re.sub(r'^(\./)+', '', p)
+        normalized_fixed = _norm(fixed_file)
+        normalized_scope = [_norm(f) for f in scope_files]
         if normalized_fixed not in normalized_scope:
             logger.error(f"Fixer: LLM 尝试修改不在范围内的文件: {fixed_file}")
             logger.error(f"  允许范围: {scope_files}")

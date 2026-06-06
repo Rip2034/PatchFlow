@@ -163,11 +163,12 @@ class PythonStrategy(LanguageStrategy):
     ]
     error_classifiers = {
         "SyntaxError": "syntax", "IndentationError": "syntax",
-        "ImportError": "dependency", "ModuleNotFoundError": "dependency",
-        "NameError": "runtime", "TypeError": "runtime", "ValueError": "runtime",
-        "AttributeError": "runtime", "KeyError": "runtime", "IndexError": "runtime",
-        "ZeroDivisionError": "runtime", "FileNotFoundError": "runtime",
-        "PermissionError": "runtime", "RuntimeError": "runtime",
+        "ImportError": "import", "ModuleNotFoundError": "import",
+        "NameError": "name", "TypeError": "type", "ValueError": "value_error",
+        "AttributeError": "attribute", "KeyError": "key_error",
+        "IndexError": "index_error", "ZeroDivisionError": "runtime",
+        "FileNotFoundError": "file_error", "PermissionError": "file_error",
+        "RuntimeError": "runtime",
     }
     run_command = "python"
     compile_command = None

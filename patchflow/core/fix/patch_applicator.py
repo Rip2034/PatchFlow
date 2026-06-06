@@ -166,21 +166,21 @@ class PatchApplicator:
                     applied_this = True
                     logger.info(f"Patcher 精确替换: {file_path}")
 
-                # ── V0.5: Strategy 2b: fuzzy line-based match ──
+                # ── V0.5: Strategy 2b+2c: fuzzy match, then ratio-guided ──
                 elif patch.old:
+                    # 2b: fuzzy line-based match
                     fuzzy_result = _fuzzy_line_match(existing, patch.old, patch.new)
                     if fuzzy_result is not None:
                         existing = fuzzy_result
                         applied_this = True
                         logger.info(f"Patcher 模糊行匹配替换: {file_path}")
-
-                # ── V0.5: Strategy 2c: diff-ratio approximate match ──
-                elif patch.old:
-                    ratio_result = _ratio_guided_match(existing, patch.old, patch.new)
-                    if ratio_result is not None:
-                        existing = ratio_result
-                        applied_this = True
-                        logger.info(f"Patcher 相似度引导替换: {file_path}")
+                    else:
+                        # 2c: diff-ratio approximate match (fallback)
+                        ratio_result = _ratio_guided_match(existing, patch.old, patch.new)
+                        if ratio_result is not None:
+                            existing = ratio_result
+                            applied_this = True
+                            logger.info(f"Patcher 相似度引导替换: {file_path}")
 
                 # Strategy 3: new content close to full file
                 if not applied_this:

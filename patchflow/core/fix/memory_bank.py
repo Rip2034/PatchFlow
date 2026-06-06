@@ -299,7 +299,8 @@ class FixMemoryBank:
                 self._entries = []
 
     def save(self) -> None:
-        # 先快照数据，再写文件（减少锁持有时间）
+        """V0.5 fix: 锁覆盖整个序列化+写入过程，防止并发写入导致数据不一致"""
+        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             data = []
             for m in self._entries:
@@ -316,8 +317,7 @@ class FixMemoryBank:
                     "access_count": m.access_count,
                     "score": m.score,
                 })
-        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
-        self.storage_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.storage_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _evict_lru(self) -> None:
         """V0.5 fix: 失败记录优先清除，同状态内按时间排序（旧的先删）"""
