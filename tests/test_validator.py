@@ -1,7 +1,8 @@
 """Tests for validator — language detection and entry file finding."""
+from pathlib import Path
+
 from patchflow.core.fix.validator import (
     ValidationResult,
-    _find_entry,
     detect_project_type,
     validate,
 )
@@ -22,58 +23,84 @@ class TestValidationResult:
         vr = ValidationResult(ok=True, language="rust")
         assert "rust" in repr(vr)
 
+    def test_skip_result(self):
+        vr = ValidationResult(status="skipped", language="unknown")
+        assert not vr.ok
+        assert vr.status == "skipped"
+
 
 class TestFindEntry:
+    """Test entry file finding via LanguageStrategy.find_entry_file()."""
+
+    def _find(self, work_dir, lang_name: str):
+        from patchflow.core.language_strategy import LanguageFactory
+        factory = LanguageFactory()
+        # Directly instantiate the right strategy
+        name_to_cls = {
+            "python": "PythonStrategy",
+            "javascript": "JavaScriptStrategy",
+            "typescript": "TypeScriptStrategy",
+            "java": "JavaStrategy",
+            "go": "GoStrategy",
+            "rust": "RustStrategy",
+        }
+        cls_name = name_to_cls.get(lang_name, "PythonStrategy")
+        strategy = getattr(
+            __import__("patchflow.core.language_strategy", fromlist=[cls_name]),
+            cls_name,
+        )()
+        return strategy.find_entry_file(Path(work_dir))
+
     def test_python_entry(self, tmp_path):
         (tmp_path / "main.py").write_text("print('hello')")
-        entry = _find_entry(tmp_path, "python")
+        entry = self._find(tmp_path, "python")
         assert entry is not None
         assert entry.name == "main.py"
 
     def test_python_app_py_priority(self, tmp_path):
         (tmp_path / "app.py").write_text("print('app')")
         (tmp_path / "main.py").write_text("print('main')")
-        entry = _find_entry(tmp_path, "python")
-        assert entry.name == "app.py"  # app.py checked first
+        entry = self._find(tmp_path, "python")
+        assert entry.name == "app.py"
 
     def test_javascript_entry(self, tmp_path):
         (tmp_path / "index.js").write_text("console.log('hi')")
-        entry = _find_entry(tmp_path, "javascript")
+        entry = self._find(tmp_path, "javascript")
         assert entry is not None
         assert entry.name == "index.js"
 
     def test_typescript_entry(self, tmp_path):
         (tmp_path / "app.ts").write_text("const x = 1")
-        entry = _find_entry(tmp_path, "typescript")
+        entry = self._find(tmp_path, "typescript")
         assert entry is not None
         assert entry.name == "app.ts"
 
     def test_java_entry(self, tmp_path):
         (tmp_path / "Main.java").write_text("class Main {}")
-        entry = _find_entry(tmp_path, "java")
+        entry = self._find(tmp_path, "java")
         assert entry is not None
         assert entry.name == "Main.java"
 
     def test_go_entry(self, tmp_path):
         (tmp_path / "main.go").write_text("package main")
-        entry = _find_entry(tmp_path, "go")
+        entry = self._find(tmp_path, "go")
         assert entry is not None
         assert entry.name == "main.go"
 
     def test_rust_entry(self, tmp_path):
         (tmp_path / "src").mkdir()
         (tmp_path / "src" / "main.rs").write_text("fn main() {}")
-        entry = _find_entry(tmp_path, "rust")
+        entry = self._find(tmp_path, "rust")
         assert entry is not None
         assert entry.name == "main.rs"
 
     def test_no_entry_returns_none(self, tmp_path):
-        entry = _find_entry(tmp_path, "python")
+        entry = self._find(tmp_path, "python")
         assert entry is None
 
     def test_unknown_lang_falls_back_to_python(self, tmp_path):
         (tmp_path / "main.py").write_text("print('hi')")
-        entry = _find_entry(tmp_path, "unknown_lang")
+        entry = self._find(tmp_path, "unknown_lang")
         assert entry is not None
         assert entry.name == "main.py"
 
@@ -117,5 +144,5 @@ class TestValidatePython:
 
     def test_unknown_project_skips(self, tmp_path):
         result = validate(str(tmp_path))
-        assert result.ok  # skips validation, returns ok
-        assert "unknown" in result.language
+        # unknown project types return unsupported status
+        assert "unsupported" in result.status or "unknown" in result.language

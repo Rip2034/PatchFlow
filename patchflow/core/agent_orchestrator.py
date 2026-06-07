@@ -206,12 +206,16 @@ class AgentOrchestrator:
             if entry and strategy.run_command:
                 from patchflow.utils.runner import run
                 cmd = f"{strategy.run_command} {entry.name}"
-                result = run(cmd, cwd=wd, timeout=30)
-                if result.exit_code != 0:
-                    error_text = result.stderr.strip() or result.stdout.strip()
+                try:
+                    result = run(cmd, cwd=wd, timeout=30)
+                    if result.exit_code != 0:
+                        error_text = result.stderr.strip() or result.stdout.strip()
+                except Exception as e:
+                    logger.warn(f"[AgentOrch] 无法运行命令 '{cmd}': {e}")
+                    error_text = f"(command failed: {e})"
             if not error_text:
                 lang_name = strategy.name
-                error_text = f"(no entry point found for {lang_name}, repair based on error output)"
+                error_text = f"(no runtime error detected for {lang_name}, repair based on code analysis)"
         else:
             error_text = "(no language detected, repair based on task description)"
 
@@ -224,7 +228,36 @@ class AgentOrchestrator:
             error=error_text,
         )
 
-        # 5. 执行多 Agent 修复
+        # 5. 注入 Web 搜索上下文（增强修复能力）
+        web_context = ""
+        try:
+            from patchflow.core.web.web_search import search_for_fix, format_search_context
+            logger.info("[AgentOrch] 搜索相关文档...")
+            search_results = search_for_fix(
+                error_type="runtime",
+                error_message=error_text,
+                language=strategy.name if strategy else "",
+                limit=4,
+            )
+            if search_results:
+                web_context = format_search_context(search_results, max_chars=2000)
+                bb["web_context"] = web_context
+                logger.info(f"[AgentOrch] Web 上下文注入: {len(search_results)} 条结果")
+        except Exception as e:
+            logger.debug(f"[AgentOrch] Web 搜索跳过: {e}")
+
+        # 6. 注入记忆上下文
+        try:
+            from patchflow.core.memory import MemoryStore
+            memory = MemoryStore(str(wd))
+            mem_context = memory.compile_context(task, max_chars=1500)
+            if mem_context:
+                bb["memory_context_ext"] = mem_context
+                logger.debug(f"[AgentOrch] Memory 上下文注入")
+        except Exception as e:
+            logger.debug(f"[AgentOrch] Memory 加载跳过: {e}")
+
+        # 7. 执行多 Agent 修复
         logger.info(f"[AgentOrch] Blackboard 构建完成: {len(code)} files, error={len(error_text)} chars")
         return self.run(bb, use_live=use_live)
 

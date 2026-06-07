@@ -91,7 +91,7 @@ class Orchestrator:
     def diff_summary(self) -> str:
         return "; ".join(self._diff_report) if self._diff_report else "no changes"
 
-    def run(self, task: str) -> bool:
+    def run(self, task: str, web_context: str = "") -> bool:
         """执行完整的"项目感知 → 生成 → 验证 → 修复"闭环
 
         这就是 Orchestrator 的核心流程：
@@ -99,6 +99,7 @@ class Orchestrator:
         Phase 1: 项目感知 + 代码生成
           - 收集项目上下文（技术栈、依赖、代码风格）
           - 调用 LLM Generator 生成初始代码
+          - 可选注入 Web 搜索上下文
 
         Phase 2: 快照保存
           - 记录原始文件内容，用于 diff 和回滚
@@ -108,6 +109,10 @@ class Orchestrator:
             a) 代码通过验证 → 成功
             b) 熔断器触发 → 回滚失败
             c) 所有策略用完 → 回滚失败
+
+        Args:
+            task: 任务描述
+            web_context: 可选的 Web 搜索上下文（Markdown 格式）
         """
         logger.info("=" * 50)
         logger.info("PatchFlow Orchestrator V0.4 启动")
@@ -141,7 +146,8 @@ class Orchestrator:
         logger.info(f"  Context: {self.work_dir}")
 
         # ── Phase 1: 生成代码（注入项目上下文，让 AI 了解技术栈和代码风格）──
-        files = generate(task, model=self.model, project_context=context_prompt)
+        files = generate(task, model=self.model, project_context=context_prompt,
+                         web_context=web_context)
         if files is None:
             logger.error("代码生成失败，终止")
             return False
@@ -313,6 +319,8 @@ class Orchestrator:
                 "error_type": analysis.type,
                 "root_cause": analysis.root_cause,
                 "impact_files": analysis.impact_files,
+                "impact_symbols": [s.get("name", "") for s in scope_result.symbols] if scope_result.symbols else [],
+                "call_chain": analysis.call_chain,
                 "language": analysis.language,
             }
             if len(scope_result.files) > 1:

@@ -68,6 +68,10 @@ def agent_fix(blackboard, dep_graph=None, code_graph=None,
     # ── V0.5: 注入记忆上下文（Pipeline B 之前写入但未读取）──
     memory_context = blackboard.get("memory_context", "")
 
+    # ── V1.0: 注入 Web 搜索上下文 ──
+    web_context = blackboard.get("web_context", "")
+    memory_ext = blackboard.get("memory_context_ext", "")
+
     # ── V0.5: 构建语义上下文 ──
     semantic_block = ""
     if code_graph is not None and allowed_files:
@@ -116,6 +120,8 @@ Rewrite Allowed: {strategy['rewrite']}
 
 {semantic_block}
 {memory_context}
+{web_context}
+{memory_ext}
 Review Feedback from previous round:
 {review_feedback or "N/A (first attempt)"}
 

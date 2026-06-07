@@ -84,19 +84,6 @@ def build_context_from_error(code_graph, error_text: str) -> str:
     return "\n".join(parts)
 
 
-def build_context_for_symbol(code_graph, symbol_uid: str,
-                              include_chunks: bool = True) -> str:
-    """Build semantic context for a known symbol UID."""
-    if code_graph is None:
-        return ""
-    crash_symbol = code_graph.get_symbol(symbol_uid)
-    if not crash_symbol:
-        return ""
-    return "\n".join(_format_symbol_context(
-        code_graph, crash_symbol, include_chunks=include_chunks
-    ))
-
-
 # ── Internal helpers ──────────────────────────────────────────
 
 

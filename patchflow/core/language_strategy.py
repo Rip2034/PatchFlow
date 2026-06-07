@@ -954,10 +954,22 @@ class LanguageFactory:
                     matches.append((strategy.name, len(pf)))
                     break  # 一个策略只计一次
         if matches:
-            # 优先 TypeScript 而非 JavaScript（TS 是 JS 的超集）
+            # V0.5 fix: 只在项目中确实有 .ts/.tsx 文件时才优先 TypeScript
             names = {m[0] for m in matches}
             if "typescript" in names and "javascript" in names:
-                matches = [m for m in matches if m[0] != "javascript"]
+                # 检查是否有 TS 标志：tsconfig.json 或 src 下的 .ts 文件（快速扫描）
+                has_ts_files = (wd / "tsconfig.json").exists()
+                if not has_ts_files:
+                    # 快速扫描前 2 层目录（不递归全项目）
+                    for ext in (".ts", ".tsx"):
+                        if has_ts_files:
+                            break
+                        for p in wd.glob(f"*{ext}"):
+                            has_ts_files = True; break
+                        for p in wd.glob(f"src/*{ext}"):
+                            has_ts_files = True; break
+                if has_ts_files:
+                    matches = [m for m in matches if m[0] != "javascript"]
             # 选择最特异的匹配
             matches.sort(key=lambda x: x[1], reverse=True)
             return self._strategies.get(matches[0][0])

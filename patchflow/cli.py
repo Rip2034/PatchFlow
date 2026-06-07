@@ -22,7 +22,7 @@ from patchflow.utils import logger
 
 
 @click.group(invoke_without_command=True)
-@click.version_option(version="0.1.0", prog_name="patchflow")
+@click.version_option(version="0.2.0", prog_name="patchflow")
 @click.option(
     "--model", "-m",
     default=None,
@@ -116,13 +116,19 @@ def chat(model: str | None):
     default=".",
     help="工作目录",
 )
-def build(task: str, model: str | None, max_retries: int | None, work_dir: str):
+@click.option(
+    "--research/--no-research",
+    default=True,
+    help="是否在生成前搜索网络文档（默认开启）",
+)
+def build(task: str, model: str | None, max_retries: int | None, work_dir: str, research: bool):
     """从任务描述生成可运行的代码（一次性模式）
 
     \b
     示例:
       patchflow build "创建一个 FastAPI 登录 API"
       patchflow build "写一个 Python 爬虫抓取网页标题" -m claude-sonnet-4-20250514
+      patchflow build "实现快速排序" --no-research
     """
     from patchflow.core.config import get_config
     from patchflow.core.orchestrator import Orchestrator
@@ -137,8 +143,21 @@ def build(task: str, model: str | None, max_retries: int | None, work_dir: str):
     logger.info(f"任务: {task}")
     logger.info(f"模型: {model}")
 
+    # Web 搜索增强
+    web_ctx = ""
+    if research:
+        try:
+            from patchflow.core.web.web_search import web_search, format_search_context
+            logger.info("搜索相关文档...")
+            results = web_search(task, limit=5)
+            if results:
+                web_ctx = format_search_context(results, max_chars=2500)
+                logger.info(f"找到 {len(results)} 条参考结果")
+        except Exception as e:
+            logger.debug(f"Web 搜索跳过: {e}")
+
     orch = Orchestrator(model=model, max_retries=max_retries, work_dir=work_dir)
-    success = orch.run(task)
+    success = orch.run(task, web_context=web_ctx)
 
     if success:
         logger.success("任务完成！")
@@ -753,3 +772,510 @@ def _dir_size(path) -> int:
             if f.is_file():
                 total += f.stat().st_size
     return total
+
+
+# ═══════════════════════════════════════════════════════════
+# search 命令 — Web 搜索
+# ═══════════════════════════════════════════════════════════
+
+@main.command()
+@click.argument("query", type=str)
+@click.option("--limit", "-n", default=5, help="搜索结果数")
+@click.option("--fetch", "-f", is_flag=True, default=False, help="同时抓取页面内容")
+def search(query: str, limit: int, fetch: bool):
+    """搜索网络并显示结果
+
+    \b
+    示例:
+      patchflow search "python asyncio gather"
+      patchflow search "flask sqlalchemy tutorial" -n 3 -f
+    """
+    from patchflow.core.web import web_search, web_fetch
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.text import Text
+    from urllib.parse import urlparse
+
+    results = web_search(query, limit=limit)
+    if not results:
+        click.echo("  未找到结果")
+        return
+
+    console = Console()
+    console.print()
+    console.print(Panel(
+        f"[bold]Search:[/bold] {query}  [dim]({len(results)} results)[/dim]",
+        border_style="cyan",
+    ))
+
+    for i, r in enumerate(results, 1):
+        # 提取域名，让 URL 显示更简洁
+        try:
+            domain = urlparse(r.url).netloc
+        except Exception:
+            domain = r.url[:60]
+
+        # 标题
+        console.print(f"  [bold cyan]{i}.[/bold cyan] [bold white]{r.title}[/bold white]")
+
+        # URL — 截断过长
+        url_display = r.url if len(r.url) <= 90 else r.url[:87] + "..."
+        console.print(f"     [dim green]{url_display}[/dim green]")
+
+        # 摘要 — 智能截断
+        snippet = r.snippet.strip()
+        if snippet:
+            if len(snippet) > 200:
+                snippet = snippet[:197] + "..."
+            console.print(f"     [dim]{snippet}[/dim]")
+
+        console.print()
+
+        # 可选抓取
+        if fetch and i <= 2:
+            with console.status(f"[dim]Fetching {domain}...[/dim]"):
+                fr = web_fetch(r.url)
+            if fr.is_ok and fr.markdown:
+                preview = fr.markdown[:300].replace("\n", " ")
+                console.print(f"     [yellow]Preview:[/yellow] [dim]{preview}...[/dim]")
+                console.print()
+
+
+# ═══════════════════════════════════════════════════════════
+# research 命令 — 深度调研
+# ═══════════════════════════════════════════════════════════
+
+@main.command()
+@click.argument("question", type=str)
+@click.option("--depth", "-d", default=3, help="搜索深度")
+@click.option("--verify/--no-verify", default=True, help="是否交叉验证")
+@click.option("--fast/--full", default=True, help="快速模式（跳过 LLM 合成，默认开启）")
+@click.option("--sources", "-s", default=5, help="最大来源数（快速模式默认 5）")
+@click.option("--output", "-o", default="", help="输出完整报告到文件")
+def research(question: str, depth: int, verify: bool, fast: bool, sources: int, output: str):
+    """深度调研一个问题，生成引用报告
+
+    \b
+    示例:
+      patchflow research "FastAPI vs Flask 性能对比"
+      patchflow research "Python async 最佳实践" --full -o report.md
+      patchflow research "Django ORM 优化" --fast -s 3
+    """
+    from patchflow.core.web import deep_research
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+
+    console = Console()
+
+    # 快速模式参数
+    if fast:
+        max_sources = min(sources, 8)
+        do_verify = False
+        mode_label = "fast"
+    else:
+        max_sources = min(sources, 12)
+        do_verify = verify
+        mode_label = "full"
+
+    console.print(Panel(
+        f"[bold]Research:[/bold] {question}\n"
+        f"[dim]mode={mode_label} | depth={depth} | sources≤{max_sources} | verify={do_verify}[/dim]",
+        border_style="cyan",
+    ))
+
+    report = deep_research(
+        question,
+        search_depth=depth,
+        verify=do_verify,
+        max_sources=max_sources,
+        fast=fast,
+    )
+
+    # 结果面板
+    elapsed = f"{report.elapsed_ms / 1000:.1f}s"
+    console.print()
+    console.print(Panel(
+        f"[bold green]Done![/bold green]  "
+        f"Confidence: [bold]{report.confidence:.0%}[/bold] | "
+        f"Sources: {len(report.sources)} | "
+        f"Time: {elapsed}",
+        border_style="green",
+    ))
+
+    # 摘要
+    if report.summary:
+        console.print(f"\n  [bold]Summary:[/bold] {report.summary}")
+
+    # 关键发现表格
+    if report.findings:
+        console.print()
+        table = Table(title="Key Findings", border_style="dim")
+        table.add_column("#", style="dim", width=3)
+        table.add_column("Claim", style="white")
+        table.add_column("Sources", style="dim", width=10)
+
+        for i, f in enumerate(report.findings[:8], 1):
+            refs = f.get("references", [])
+            ref_str = ", ".join(f"[{r}]" for r in refs) if refs else "—"
+            claim = f.get("claim", "")
+            if len(claim) > 120:
+                claim = claim[:117] + "..."
+            table.add_row(str(i), claim, ref_str)
+
+        console.print(table)
+
+    # 来源列表（紧凑）
+    if report.sources:
+        console.print()
+        console.print(f"  [dim]Sources ({len(report.sources)}):[/dim]")
+        for i, s in enumerate(report.sources[:10], 1):
+            title = s.title[:70]
+            domain = ""
+            try:
+                from urllib.parse import urlparse
+                domain = urlparse(s.url).netloc
+            except Exception:
+                pass
+            console.print(f"  [dim]{i}.[/dim] [bold]{title}[/bold] [dim green]{domain}[/dim green]")
+
+    if output:
+        from pathlib import Path
+        Path(output).write_text(report.to_markdown(), encoding="utf-8")
+        console.print(f"\n  [green]Report saved to: {output}[/green]")
+    elif not fast:
+        console.print(f"\n  [dim]Tip: use --output report.md to save full report[/dim]")
+
+
+# ═══════════════════════════════════════════════════════════
+# cron 命令组 — 定时任务
+# ═══════════════════════════════════════════════════════════
+
+@main.group()
+def cron():
+    """管理定时任务（cron 表达式）"""
+    pass
+
+
+@cron.command("add")
+@click.argument("cron_expr", type=str)
+@click.argument("prompt", type=str)
+@click.option("--once", "-o", is_flag=True, default=False, help="一次性任务")
+@click.option("--durable", "-d", is_flag=True, default=False, help="持久化到磁盘")
+def cron_add(cron_expr: str, prompt: str, once: bool, durable: bool):
+    """添加定时任务
+
+    \b
+    Cron 格式: 分 时 日 月 周
+    示例:
+      patchflow cron add "*/30 * * * *" "analyze"
+      patchflow cron add "0 9 * * 1-5" "analyze" -d
+      patchflow cron add "0 14 15 6 *" "build: release check" -o
+    """
+    from patchflow.core.cron_scheduler import CronScheduler
+
+    sched = CronScheduler()
+    sched.load()
+    task = sched.add(
+        cron_expr, prompt,
+        recurring=not once,
+        durable=durable,
+    )
+    if task:
+        logger.success(f"任务已添加: {task.id}")
+        logger.info(f"  表达式: {task.cron}")
+        logger.info(f"  下次执行: {task.next_run_at}")
+
+
+@cron.command("list")
+def cron_list():
+    """列出所有定时任务"""
+    from patchflow.core.cron_scheduler import CronScheduler
+
+    sched = CronScheduler()
+    sched.load()
+
+    tasks = sched.list_all()
+    if not tasks:
+        click.echo("  没有定时任务")
+        return
+
+    click.echo()
+    for t in tasks:
+        icon = "↻" if t.recurring else "→"
+        enabled = "[green]on[/green]" if t.enabled else "[red]off[/red]"
+        click.echo(
+            f"  {icon} [{t.id}] {t.cron}  {enabled}  "
+            f"(x{t.run_count})  {t.prompt[:60]}"
+        )
+    click.echo()
+
+
+@cron.command("remove")
+@click.argument("task_id", type=str)
+def cron_remove(task_id: str):
+    """删除定时任务"""
+    from patchflow.core.cron_scheduler import CronScheduler
+
+    sched = CronScheduler()
+    sched.load()
+    if sched.remove(task_id):
+        logger.success(f"任务已删除: {task_id}")
+    else:
+        logger.error(f"任务不存在: {task_id}")
+
+
+@cron.command("run")
+def cron_run():
+    """手动触发一次所有待执行的定时任务"""
+    from patchflow.core.cron_scheduler import CronScheduler
+
+    sched = CronScheduler()
+    sched.load()
+    count = sched.run_once()
+    logger.success(f"执行了 {count} 个任务")
+
+
+# ═══════════════════════════════════════════════════════════
+# memory 命令组 — 跨会话记忆
+# ═══════════════════════════════════════════════════════════
+
+@main.group()
+def memory():
+    """管理跨会话记忆"""
+    pass
+
+
+@memory.command("add")
+@click.argument("name", type=str)
+@click.argument("content", type=str)
+@click.option("--type", "-t", "mem_type", default="project",
+              help="类型: user/feedback/project/reference")
+def memory_add(name: str, content: str, mem_type: str):
+    """添加一条记忆
+
+    \b
+    示例:
+      patchflow memory add project-style "使用 snake_case 命名"
+      patchflow memory add user-prefs "优先使用 FastAPI" -t user
+    """
+    from patchflow.core.memory import MemoryStore
+
+    store = MemoryStore()
+    store.remember(name, content, type=mem_type)
+    logger.success(f"记忆已存储: {name}")
+
+
+@memory.command("list")
+@click.option("--type", "-t", "mem_type", default="",
+              help="按类型过滤")
+def memory_list(mem_type: str):
+    """列出所有记忆"""
+    from patchflow.core.memory import MemoryStore
+
+    store = MemoryStore()
+
+    if mem_type:
+        memories = store.list_by_type(mem_type)
+    else:
+        memories = store.recall_all()
+
+    if not memories:
+        click.echo("  没有记忆")
+        return
+
+    click.echo()
+    for m in memories:
+        click.echo(f"  [{m.type}] [bold]{m.name}[/bold]")
+        click.echo(f"  [dim]{m.description}[/dim]")
+        if m.content:
+            click.echo(f"  {m.content[:120]}")
+        click.echo()
+
+
+@memory.command("recall")
+@click.argument("query", type=str)
+def memory_recall(query: str):
+    """搜索记忆"""
+    from patchflow.core.memory import MemoryStore
+
+    store = MemoryStore()
+    results = store.recall(query)
+
+    if not results:
+        click.echo(f"  未找到匹配 '{query}' 的记忆")
+        return
+
+    click.echo()
+    for m in results:
+        click.echo(f"  [{m.type}] [bold]{m.name}[/bold]")
+        click.echo(f"  [dim]{m.description}[/dim]")
+        click.echo(f"  {m.content[:150]}")
+        click.echo()
+
+
+@memory.command("forget")
+@click.argument("name", type=str)
+def memory_forget(name: str):
+    """删除记忆"""
+    from patchflow.core.memory import MemoryStore
+
+    store = MemoryStore()
+    if store.forget(name):
+        logger.success(f"记忆已删除: {name}")
+    else:
+        logger.error(f"记忆不存在: {name}")
+
+
+# ═══════════════════════════════════════════════════════════
+# workflow 命令组 — 高级编排模式
+# ═══════════════════════════════════════════════════════════
+
+@main.group()
+def workflow():
+    """高级多 Agent 编排模式"""
+    pass
+
+
+@workflow.command("judge-panel")
+@click.argument("task", type=str)
+@click.option("--generators", "-g", default=3, help="方案生成者数量")
+@click.option("--judges", "-j", default=2, help="每个方案的评审人数")
+@click.option("--work-dir", "-w", default=".", help="工作目录")
+def workflow_judge_panel(task: str, generators: int, judges: int, work_dir: str):
+    """Judge Panel: 多个 Fixer 独立生成方案 → 多个 Judge 评分 → 选最优
+
+    \b
+    示例:
+      patchflow workflow judge-panel "修复 app.py 中的性能问题"
+      patchflow workflow judge-panel "重构 auth 模块" -g 5 -j 3
+    """
+    from patchflow.agents.blackboard import Blackboard
+    from patchflow.core.agent_orchestrator import AgentOrchestrator
+    from patchflow.core.config import get_config
+    from patchflow.core.project.context_collector import ContextCollector
+    from patchflow.core.workflow import Workflow
+
+    cfg = get_config()
+    model = cfg["model"]
+
+    # 构建 Blackboard
+    from pathlib import Path
+    wd = Path(work_dir)
+
+    collector = ContextCollector(str(wd))
+    ctx = collector.collect(use_cache=True)
+
+    code = {}
+    from patchflow.core.language_strategy import LanguageFactory
+    factory = LanguageFactory()
+    strategy = factory.detect(str(wd))
+    exts = strategy.extensions if strategy else factory.all_extensions
+    for ext in exts:
+        for f in wd.rglob(f"*{ext}"):
+            rel = str(f.relative_to(wd))
+            if any(rel.startswith(p) for p in (".patchflow/", ".venv/", "node_modules/", "venv/", "__pycache__/")):
+                continue
+            try:
+                code[rel] = f.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+
+    bb = Blackboard(task=task, context=ctx.to_dict(), code=code)
+
+    logger.info(f"Judge Panel: {generators} generators × {judges} judges")
+    best = Workflow.judge_panel(task, bb, generators=generators, judges=judges, model=model)
+
+    if best:
+        logger.success(f"最优方案: {best.get('summary', '')}")
+        patches = best.get("patches", [])
+        logger.info(f"共 {len(patches)} 个补丁")
+        for p in patches:
+            logger.info(f"  {p.get('file', '?')}: {p.get('description', p.get('reason', ''))[:80]}")
+    else:
+        logger.error("未能生成有效方案")
+
+
+@workflow.command("verify-claim")
+@click.argument("claim", type=str)
+@click.option("--skeptics", "-s", default=3, help="质疑者数量")
+@click.option("--threshold", "-t", default=2, help="反驳阈值（≥N人反驳=不通过）")
+def workflow_verify_claim(claim: str, skeptics: int, threshold: int):
+    """Adversarial Verify: 用多个独立质疑者验证一个结论
+
+    \b
+    示例:
+      patchflow workflow verify-claim "auth.py 的登录逻辑是安全的"
+      patchflow workflow verify-claim "修复后不会有性能问题" -s 5 -t 3
+    """
+    from patchflow.agents.blackboard import Blackboard
+    from patchflow.core.config import get_config
+    from patchflow.core.workflow import Workflow
+
+    cfg = get_config()
+    model = cfg["model"]
+
+    bb = Blackboard()
+    result = Workflow.adversarial_verify(
+        claim, bb, skeptics=skeptics,
+        refute_threshold=threshold, model=model,
+    )
+
+    if result["survives"]:
+        logger.success(f"结论经得起质疑: {result['refute_count']}/{result['total_skeptics']} 人反驳")
+    else:
+        logger.error(f"结论被推翻: {result['refute_count']}/{result['total_skeptics']} 人反驳")
+
+    for v in result["votes"]:
+        icon = "[red]REFUTED[/red]" if v.get("refuted") else "[green]ACCEPTED[/green]"
+        logger.info(f"  质疑者 #{v['index']}: {icon} — {v.get('reason', '')[:100]}")
+
+
+@workflow.command("multi-sweep")
+@click.argument("task", type=str)
+@click.option("--work-dir", "-w", default=".", help="工作目录")
+def workflow_multi_sweep(task: str, work_dir: str):
+    """Multi-Modal Sweep: 从正确性/性能/安全/可维护性四个角度同时分析
+
+    \b
+    示例:
+      patchflow workflow multi-sweep "审查 app.py"
+    """
+    from pathlib import Path
+
+    from patchflow.agents.blackboard import Blackboard
+    from patchflow.core.config import get_config
+    from patchflow.core.project.context_collector import ContextCollector
+    from patchflow.core.workflow import Workflow
+
+    cfg = get_config()
+    model = cfg["model"]
+
+    wd = Path(work_dir)
+    collector = ContextCollector(str(wd))
+    ctx = collector.collect(use_cache=True)
+
+    code = {}
+    from patchflow.core.language_strategy import LanguageFactory
+    factory = LanguageFactory()
+    strategy = factory.detect(str(wd))
+    exts = strategy.extensions if strategy else factory.all_extensions
+    for ext in exts:
+        for f in wd.rglob(f"*{ext}"):
+            rel = str(f.relative_to(wd))
+            if any(rel.startswith(p) for p in (".patchflow/", ".venv/", "node_modules/", "venv/", "__pycache__/")):
+                continue
+            try:
+                code[rel] = f.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+
+    bb = Blackboard(task=task, context=ctx.to_dict(), code=code)
+
+    result = Workflow.multi_modal_sweep(task, bb, model=model)
+
+    logger.success(f"发现 {result['unique_count']} 个独特问题 (共 {result['total_count']} 个)")
+    for lens, findings in result["per_lens"].items():
+        logger.info(f"  [{lens}]: {len(findings)} 个发现")
+    for f in result["findings"][:10]:
+        logger.info(f"  - [{f['lens']}] {f.get('root_cause', '')[:100]}")

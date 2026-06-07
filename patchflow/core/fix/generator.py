@@ -36,22 +36,28 @@ OUTPUT FORMAT:
 
 
 def generate(task: str, model: str | None = None,
-             project_context: str | None = None) -> list[dict] | None:
+             project_context: str | None = None,
+             web_context: str = "") -> list[dict] | None:
     """根据任务描述生成代码文件列表
 
     Args:
         task: 用户的自然语言需求
         model: 使用的 LLM 模型
         project_context: 项目上下文文本（Phase 3）
+        web_context: Web 搜索上下文（Markdown 格式）
 
     Returns:
         list[dict] 或 None
     """
     logger.step("Generator: 正在生成代码...")
 
-    context_block = ""
+    context_parts = []
     if project_context:
-        context_block = f"{project_context}\n"
+        context_parts.append(project_context)
+    if web_context:
+        context_parts.append(web_context)
+
+    context_block = "\n\n".join(context_parts) + "\n" if context_parts else ""
 
     user_message = f"{context_block}Task: {task}\n\nGenerate the code now."
 

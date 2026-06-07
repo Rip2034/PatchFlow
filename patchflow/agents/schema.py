@@ -280,6 +280,8 @@ def validate_review(data: dict) -> dict:
   V0.5 fix: 维度拒绝阈值从 < 5 改为 < 6，与 prompt 中
   "ALL dimensions score >= 6" 的约定对齐。
   """
+  # V0.5 fix: 预先初始化，防止 dimensions dict 存在但无有效键时 NameError
+  calibrated_score = _safe_int(data.get("score"), 5)
   dimensions = data.get("dimensions", {})
   # 如果提供了多维度评分，用维度平均分校准总分
   if dimensions and isinstance(dimensions, dict):
@@ -297,11 +299,14 @@ def validate_review(data: dict) -> dict:
       calibrated_score = min(10, max(1, round((raw_score + dim_avg) / 2)))
       # 任一维度 < 6 则自动拒绝（与 prompt 的 "ALL dimensions >= 6" 对齐）
       if any(s < 6 for s in dim_scores):
-        data["approved"] = False
-        if not any("dimension" in str(i).lower() for i in (data.get("issues") or [])):
-          low_dims = [d for d, v in dimensions.items() if isinstance(v, dict) and v.get("score", 5) < 6]
-          if low_dims:
-            data.setdefault("issues", []).insert(0, f"Low dimension score(s): {', '.join(low_dims)}")
+        # V0.5 fix: 在 result dict 上操作，不修改调用者的 data dict
+        low_dims = [d for d, v in dimensions.items() if isinstance(v, dict) and v.get("score", 5) < 6]
+        if low_dims:
+          issues = list(data.get("issues") or [])
+          issues.insert(0, f"Low dimension score(s): {', '.join(low_dims)}")
+          data = {**data, "approved": False, "issues": issues}
+        else:
+          data = {**data, "approved": False}
   else:
     calibrated_score = _safe_int(data.get("score"), 5)
 

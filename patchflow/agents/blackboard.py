@@ -184,7 +184,8 @@ class Blackboard:
         with self._lock:
             self._log("read", "code")
             analysis = self.data.get("analysis")
-            if not analysis or not analysis.get("impact_files") and not analysis.get("call_chain"):
+            if (not analysis
+                    or (not analysis.get("impact_files") and not analysis.get("call_chain"))):
                 return "\n".join(self.data["code"].values())
 
             impact = analysis.get("impact_files") or []
